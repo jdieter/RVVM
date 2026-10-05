@@ -29,6 +29,7 @@ PUSH_OPTIMIZATION_SIZE
 #include <errno.h>  // For errno
 #include <fcntl.h>  // For struct flock, open(), fcntl(), posix_fallocate(), fallocate(), fspacectl(), fdiscard()
 #include <unistd.h> // For close(), lseek(), pread(), pwrite(), fdatasync(), ftruncate()
+#include <sys/stat.h>
 
 #if defined(HOST_TARGET_NETBSD)
 #include <sys/param.h> // For __NetBSD_Version__
@@ -159,6 +160,7 @@ struct blk_io_rvfile {
     uint64_t pos;
 #if defined(POSIX_FILE_IMPL)
     int fd;
+    bool borrowed;
 #elif defined(WIN32_FILE_IMPL)
     HANDLE     handle;
     spinlock_t lock;
@@ -411,7 +413,7 @@ void rvclose(rvfile_t* file)
     if (likely(file)) {
         rvfsync(file);
 #if defined(POSIX_FILE_IMPL)
-        close(file->fd);
+        if (!file->borrowed) close(file->fd);
 #elif defined(WIN32_FILE_IMPL)
         CloseHandle(file->handle);
 #else
@@ -427,6 +429,22 @@ uint64_t rvfilesize(rvfile_t* file)
         return atomic_load_uint64(&file->size);
     }
     return 0;
+}
+
+rvfile_t* rvfile_borrow_posix_fd(int fd)
+{
+#if defined(POSIX_FILE_IMPL)
+    struct stat st;
+    if (fstat(fd, &st) || !S_ISREG(st.st_mode)) return NULL;
+    rvfile_t* file = safe_new_obj(rvfile_t);
+    file->fd = fd;
+    file->size = st.st_size;
+    file->borrowed = true;
+    return file;
+#else
+    UNUSED(fd);
+    return NULL;
+#endif
 }
 
 // Return value of -1 means "Try again", 0 means "IO error / EOF"

@@ -73,6 +73,9 @@ bool rvfsync(rvfile_t* file);
 // Get native POSIX file descriptor, returns -1 on failure
 int rvfile_get_posix_fd(rvfile_t* file);
 
+// Borrow a readable regular-file descriptor without duplicating or closing it.
+rvfile_t* rvfile_borrow_posix_fd(int fd);
+
 // Get native Win32 file handle, returns NULL on failure
 void* rvfile_get_win32_handle(rvfile_t* file);
 

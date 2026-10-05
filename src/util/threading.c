@@ -71,7 +71,7 @@ PUSH_OPTIMIZATION_SIZE
 #if !defined(__NR_futex_time64) && defined(__NR_futex)
 #define __NR_futex_time64 __NR_futex
 #endif
-#if defined(__NR_epoll_create) && CHECK_INCLUDE(linux/futex.h, 1)
+#if CHECK_INCLUDE(linux/futex.h, 1)
 #include <linux/futex.h> // For FUTEX_WAIT_PRIVATE, FUTEX_WAKE_PRIVATE
 #endif
 #if defined(__NR_futex_time64) && defined(FUTEX_WAIT_PRIVATE) && defined(FUTEX_WAKE_PRIVATE)

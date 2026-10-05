@@ -68,10 +68,13 @@ bool elf_load_file(rvfile_t* file, elf_desc_t* elf)
     elf->interp_path = NULL;
     elf->phdr        = 0;
     elf->phnum       = elf_phnum;
+    elf->phdr_data   = NULL;
+    elf->phentsize   = elf_phnsz;
 
     // Determine lowest / highest virtual address, PHDR address
     uint64_t elf_loaddr = (uint64_t)-1;
     uint64_t elf_hiaddr = 0;
+    bool have_phdr = false;
     for (size_t i = 0; i < elf_phnum; ++i) {
         uint64_t elf_phent_off = elf_phoff + (elf_phnsz * i);
         WRAP_ERR(rvread(file, tmp, elf_phnsz, elf_phent_off) == elf_phnsz, "Failed to read ELF phent");
@@ -88,6 +91,16 @@ bool elf_load_file(rvfile_t* file, elf_desc_t* elf)
         }
         if (p_type == ELF_PT_PHDR) {
             elf->phdr = p_vaddr;
+            have_phdr = true;
+        } else if (p_type == ELF_PT_LOAD && !have_phdr) {
+            // PT_PHDR is optional: the table can reside inside a LOAD segment.
+            uint64_t offset = class64 ? read_uint64_le_m(tmp + 8) : read_uint32_le_m(tmp + 4);
+            uint64_t filesz = class64 ? read_uint64_le_m(tmp + 32) : read_uint32_le_m(tmp + 16);
+            if (elf_phoff >= offset && elf_phoff - offset <= filesz
+                && elf_phnum * elf_phnsz <= filesz - (elf_phoff - offset)) {
+                elf->phdr = p_vaddr + (elf_phoff - offset);
+                have_phdr = true;
+            }
         }
     }
     if (elf_loaddr == (uint64_t)-1) {
@@ -99,7 +112,7 @@ bool elf_load_file(rvfile_t* file, elf_desc_t* elf)
         if (elf->entry) {
             elf->entry -= elf_loaddr;
         }
-        if (elf->phdr) {
+        if (have_phdr) {
             elf->phdr -= elf_loaddr;
         }
     } else {
@@ -107,19 +120,20 @@ bool elf_load_file(rvfile_t* file, elf_desc_t* elf)
         elf->buf_size = elf_hiaddr - elf_loaddr;
         if (elf_type == ELF_ET_DYN) {
             // Dynamic (PIC) ELF, relocate it
-            elf->base = vma_alloc(NULL, elf->buf_size, VMA_RDWR);
+            elf->base = elf->map ? elf->map(NULL, elf->buf_size) : vma_alloc(NULL, elf->buf_size, VMA_RDWR);
             WRAP_ERR(elf->base, "Failed to allocate dynamic ELF VMA");
         } else {
             // Non-relocatable ELF at fixed address
             // Extra pages past the image serve as the initial brk heap area,
             // real kernels map them accessible right after the image
-            elf->base = vma_alloc((void*)(size_t)elf_loaddr, elf->buf_size + ELF_USERLAND_HEAP_MARGIN, VMA_RDWR | VMA_FIXED);
+            elf->base = elf->map ? elf->map((void*)(size_t)elf_loaddr, elf->buf_size + ELF_USERLAND_HEAP_MARGIN)
+                : vma_alloc((void*)(size_t)elf_loaddr, elf->buf_size + ELF_USERLAND_HEAP_MARGIN, VMA_RDWR | VMA_FIXED);
             WRAP_ERR(elf->base, "Failed to map fixed ELF VMA, address collision?");
         }
         if (elf->entry) {
             elf->entry += (size_t)elf->base - elf_loaddr;
         }
-        if (elf->phdr) {
+        if (have_phdr) {
             elf->phdr += (size_t)elf->base - elf_loaddr;
         }
     }
@@ -148,6 +162,16 @@ bool elf_load_file(rvfile_t* file, elf_desc_t* elf)
         }
     }
 
+    if (!objcopy) {
+        elf->load_bias = (size_t)elf->base - elf_loaddr;
+        size_t size = elf_phnum * elf_phnsz;
+        void* headers = safe_malloc(size);
+        if (rvread(file, headers, size, elf_phoff) != size) {
+            free(headers);
+            return false;
+        }
+        elf->phdr_data = headers;
+    }
     return true;
 }
 

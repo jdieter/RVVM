@@ -25,6 +25,12 @@ typedef struct {
     char*  interp_path;
     size_t phdr;
     size_t phnum;
+    // Host-owned headers for permission setup, even when not guest-mapped.
+    void* phdr_data;
+    size_t phentsize;
+    size_t load_bias;
+    /* Optional placement policy for user emulation; objcopy is unaffected. */
+    void* (*map)(void* addr, size_t size);
 } elf_desc_t;
 
 bool elf_load_file(rvfile_t* file, elf_desc_t* elf);
