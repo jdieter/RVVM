@@ -200,10 +200,11 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define FPU_LIB_OPTIMAL_BUILTIN_COPYSIGN 1
 #endif
 
-// Fused-multiply-add via __builtin_fma() is optimal on arm64, riscv, powerpc
+// On generic x86-64, libm dispatches FMA at runtime. The compensated-arithmetic
+// fallback is not reliable for directed rounding, overflow, or cancellation.
 #undef FPU_LIB_OPTIMAL_BUILTIN_FMA
 #if !defined(USE_SOFT_FPU_FENV)                                                                       /**/             \
-    && (defined(__aarch64__) || defined(__riscv_d) || defined(__powerpc__) || defined(__powerpc64__)) /**/             \
+    && (defined(__aarch64__) || defined(__x86_64__) || defined(__riscv_d) || defined(__powerpc__) || defined(__powerpc64__)) \
     && GNU_BUILTIN(__builtin_fmaf) && GNU_BUILTIN(__builtin_fma)
 #define FPU_LIB_OPTIMAL_BUILTIN_FMA 1
 #endif
@@ -925,6 +926,10 @@ static forceinline fpu_f64_t fpu_fsgnjx64(fpu_f64_t a, fpu_f64_t b)
 
 static forceinline fpu_f64_t fpu_fcvt_f32_to_f64(fpu_f32_t f)
 {
+#if defined(USE_SOFT_FPU_FENV)
+    // Widening quiets sNaNs; record invalid before the native cast loses that bit.
+    if (unlikely(fpu_is_snan32_soft(f))) fpu_raise_invalid();
+#endif
     return fpu_wrap_f64((actual_double_t)fpu_raw_f32(f));
 }
 
@@ -1062,7 +1067,6 @@ static forceinline void fpu_fma32_fixup_uf(fpu_f32_t a, fpu_f32_t b, fpu_f32_t c
 static forceinline func_opt_size fpu_f32_t fpu_fma32(fpu_f32_t a, fpu_f32_t b, fpu_f32_t c)
 {
     uint32_t old_exceptions = fpu_get_exceptions();
-    bool invalid = fpu_fma32_invalid_soft(a, b, c);
 
 #if defined(FPU_LIB_OPTIMAL_BUILTIN_FMA)
     fpu_f32_t ret = fpu_wrap_f32(__builtin_fmaf(fpu_raw_f32(a), fpu_raw_f32(b), fpu_raw_f32(c)));
@@ -1082,8 +1086,17 @@ static forceinline func_opt_size fpu_f32_t fpu_fma32(fpu_f32_t a, fpu_f32_t b, f
         fpu_fma32_fixup_uf(a, b, c, old_exceptions);
     }
 
+#if defined(FPU_LIB_OPTIMAL_BUILTIN_FMA)
+    // Finite operands cannot raise invalid in a fused operation, even if the
+    // exact product overflows. Keep boundary underflow repair above this exit.
+    if (likely((fpu_bit_f32_to_u32(a) & FPU_LIB_FP32_POSITIVE_INF) != FPU_LIB_FP32_POSITIVE_INF
+               && (fpu_bit_f32_to_u32(b) & FPU_LIB_FP32_POSITIVE_INF) != FPU_LIB_FP32_POSITIVE_INF
+               && (fpu_bit_f32_to_u32(c) & FPU_LIB_FP32_POSITIVE_INF) != FPU_LIB_FP32_POSITIVE_INF)) {
+        return ret;
+    }
+#endif
     uint32_t exceptions = fpu_get_exceptions();
-    if (invalid) {
+    if (fpu_fma32_invalid_soft(a, b, c)) {
         fpu_raise_invalid();
     } else if ((exceptions & ~old_exceptions) & FPU_LIB_FLAG_NV) {
         fpu_set_exceptions((exceptions & ~FPU_LIB_FLAG_NV) | (old_exceptions & FPU_LIB_FLAG_NV));
@@ -1140,7 +1153,6 @@ static forceinline void fpu_fma64_fixup_uf(fpu_f64_t a, fpu_f64_t b, fpu_f64_t c
 static forceinline fpu_f64_t fpu_fma64(fpu_f64_t a, fpu_f64_t b, fpu_f64_t c)
 {
     uint32_t old_exceptions = fpu_get_exceptions();
-    bool     invalid        = fpu_fma64_invalid_soft(a, b, c);
 
     fpu_f64_t ret = fpu_fma64_raw(a, b, c);
 
@@ -1148,8 +1160,17 @@ static forceinline fpu_f64_t fpu_fma64(fpu_f64_t a, fpu_f64_t b, fpu_f64_t c)
         fpu_fma64_fixup_uf(a, b, c, old_exceptions);
     }
 
+#if defined(FPU_LIB_OPTIMAL_BUILTIN_FMA)
+    // As for f32, finite fused operands need only the underflow repair above;
+    // reserve software invalid detection for infinities and NaNs.
+    if (likely((fpu_bit_f64_to_u64(a) & FPU_LIB_FP64_POSITIVE_INF) != FPU_LIB_FP64_POSITIVE_INF
+               && (fpu_bit_f64_to_u64(b) & FPU_LIB_FP64_POSITIVE_INF) != FPU_LIB_FP64_POSITIVE_INF
+               && (fpu_bit_f64_to_u64(c) & FPU_LIB_FP64_POSITIVE_INF) != FPU_LIB_FP64_POSITIVE_INF)) {
+        return ret;
+    }
+#endif
     uint32_t exceptions = fpu_get_exceptions();
-    if (invalid) {
+    if (fpu_fma64_invalid_soft(a, b, c)) {
         fpu_raise_invalid();
     } else if ((exceptions & ~old_exceptions) & FPU_LIB_FLAG_NV) {
         fpu_set_exceptions((exceptions & ~FPU_LIB_FLAG_NV) | (old_exceptions & FPU_LIB_FLAG_NV));
@@ -1365,7 +1386,9 @@ static forceinline bool fpu_f32_fits_i32(fpu_f32_t f)
 static forceinline bool fpu_f64_fits_i32(fpu_f64_t d)
 {
     uint64_t u = fpu_bit_f64_to_u64(d);
-    return (bit_rotl64(u, 1) ^ 1) <= 0x83C0000000000000ULL; // |d| < 2^31 or d == -2^31
+    // Truncation accepts INT32_MIN - 1 < d < INT32_MAX + 1. The negative
+    // bit-pattern comparison includes the fractional interval below INT32_MIN.
+    return u < 0x41E0000000000000ULL || ((int64_t)u) < ((int64_t)0xC1E0000000200000ULL);
 }
 
 static forceinline bool fpu_f32_fits_u64(fpu_f32_t f)
@@ -1567,6 +1590,9 @@ static forceinline int64_t fpu_fcvt_f64_to_i64(fpu_f64_t d)
 
 /*
  * Floating-point to integer rounding
+ *
+ * Inexact depends on this conversion's range check, not accrued invalid flags
+ * from earlier instructions. Invalid conversions must not also raise inexact.
  */
 
 static forceinline uint32_t fpu_round_f32_to_u32(fpu_f32_t f, uint32_t mode)
@@ -1583,7 +1609,7 @@ static forceinline uint32_t fpu_round_f32_to_u32(fpu_f32_t f, uint32_t mode)
 
     uint32_t ret = fpu_fcvt_f32_to_u32(rounded);
 
-    if (likely(!(fpu_get_exceptions() & FPU_LIB_FLAG_NV))) {
+    if (likely(fpu_f32_fits_u32(rounded))) {
         if (unlikely(!fpu_is_bit_equal32(f, fpu_fcvt_u32_to_f32(ret)))) {
             fpu_raise_inexact();
         }
@@ -1606,7 +1632,7 @@ static forceinline uint32_t fpu_round_f64_to_u32(fpu_f64_t d, uint32_t mode)
 
     uint32_t ret = fpu_fcvt_f64_to_u32(rounded);
 
-    if (likely(!(fpu_get_exceptions() & FPU_LIB_FLAG_NV))) {
+    if (likely(fpu_f64_fits_u32(rounded))) {
         if (unlikely(!fpu_is_bit_equal64(d, fpu_fcvt_u32_to_f64(ret)))) {
             fpu_raise_inexact();
         }
@@ -1629,7 +1655,7 @@ static forceinline int32_t fpu_round_f32_to_i32(fpu_f32_t f, uint32_t mode)
 
     int32_t ret = fpu_fcvt_f32_to_i32(rounded);
 
-    if (likely(!(fpu_get_exceptions() & FPU_LIB_FLAG_NV))) {
+    if (likely(fpu_f32_fits_i32(rounded))) {
         if (unlikely(!fpu_is_bit_equal32(f, fpu_fcvt_i32_to_f32(ret)))) {
             fpu_raise_inexact();
         }
@@ -1652,7 +1678,7 @@ static forceinline int32_t fpu_round_f64_to_i32(fpu_f64_t d, uint32_t mode)
 
     int32_t ret = fpu_fcvt_f64_to_i32(rounded);
 
-    if (likely(!(fpu_get_exceptions() & FPU_LIB_FLAG_NV))) {
+    if (likely(fpu_f64_fits_i32(rounded))) {
         if (unlikely(!fpu_is_bit_equal64(d, fpu_fcvt_i32_to_f64(ret)))) {
             fpu_raise_inexact();
         }
@@ -1675,7 +1701,7 @@ static forceinline uint64_t fpu_round_f32_to_u64(fpu_f32_t f, uint32_t mode)
 
     uint64_t ret = fpu_fcvt_f32_to_u64(rounded);
 
-    if (likely(!(fpu_get_exceptions() & FPU_LIB_FLAG_NV))) {
+    if (likely(fpu_f32_fits_u64(rounded))) {
         if (unlikely(!fpu_is_bit_equal32(f, fpu_fcvt_u64_to_f32(ret)))) {
             fpu_raise_inexact();
         }
@@ -1698,7 +1724,7 @@ static forceinline uint64_t fpu_round_f64_to_u64(fpu_f64_t d, uint32_t mode)
 
     uint64_t ret = fpu_fcvt_f64_to_u64(rounded);
 
-    if (likely(!(fpu_get_exceptions() & FPU_LIB_FLAG_NV))) {
+    if (likely(fpu_f64_fits_u64(rounded))) {
         if (unlikely(!fpu_is_bit_equal64(d, fpu_fcvt_u64_to_f64(ret)))) {
             fpu_raise_inexact();
         }
@@ -1721,7 +1747,7 @@ static forceinline int64_t fpu_round_f32_to_i64(fpu_f32_t f, uint32_t mode)
 
     int64_t ret = fpu_fcvt_f32_to_i64(rounded);
 
-    if (likely(!(fpu_get_exceptions() & FPU_LIB_FLAG_NV))) {
+    if (likely(fpu_f32_fits_i64(rounded))) {
         if (unlikely(!fpu_is_bit_equal32(f, fpu_fcvt_i64_to_f32(ret)))) {
             fpu_raise_inexact();
         }
@@ -1744,7 +1770,7 @@ static forceinline int64_t fpu_round_f64_to_i64(fpu_f64_t d, uint32_t mode)
 
     int64_t ret = fpu_fcvt_f64_to_i64(rounded);
 
-    if (likely(!(fpu_get_exceptions() & FPU_LIB_FLAG_NV))) {
+    if (likely(fpu_f64_fits_i64(rounded))) {
         if (unlikely(!fpu_is_bit_equal64(d, fpu_fcvt_i64_to_f64(ret)))) {
             fpu_raise_inexact();
         }

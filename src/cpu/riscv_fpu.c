@@ -54,46 +54,6 @@ static const uint32_t riscv_fli_table[32] = {
     0x7FC00000UL, // Canonical NaN
 };
 
-static void riscv_prepare_rmm(rvvm_hart_t* vm, const uint32_t insn, const size_t rs1, const size_t rs2)
-{
-    bool neg = false;
-
-    // Decide the sign of the output
-    switch (insn & 0xFE000000UL) {
-        case 0x00000000UL: // fadd.s
-            neg = fpu_signbit32(fpu_add32(riscv_view_s(vm, rs1), riscv_view_s(vm, rs2)));
-            break;;
-        case 0x02000000UL: // fadd.d
-            neg = fpu_signbit64(fpu_add64(riscv_view_d(vm, rs1), riscv_view_d(vm, rs2)));
-            break;
-        case 0x08000000UL: // fsub.s
-            neg = fpu_signbit32(fpu_sub32(riscv_view_s(vm, rs1), riscv_view_s(vm, rs2)));
-            break;
-        case 0x0A000000UL: // fsub.d
-            neg = fpu_signbit64(fpu_sub64(riscv_view_d(vm, rs1), riscv_view_d(vm, rs2)));
-            break;
-        case 0x10000000UL: // fmul.s
-        case 0x18000000UL: // fdiv.s
-            neg = fpu_signbit32(riscv_view_s(vm, rs1)) != fpu_signbit32(riscv_view_s(vm, rs2));
-            break;
-        case 0x12000000UL: // fmul.d
-        case 0x1A000000UL: // fdiv.d
-            neg = fpu_signbit64(riscv_view_d(vm, rs1)) != fpu_signbit64(riscv_view_d(vm, rs2));
-            break;
-        default:
-            // Only add/sub/mul/div need the directed synthesis: sqrt has no exact
-            // ties, and ops taking rm as an argument handle RMM natively
-            return;
-    }
-
-    // Round to positive/negative infinity based on the result sign
-    if (neg) {
-        fpu_set_rounding_mode(FPU_LIB_ROUND_DN);
-    } else {
-        fpu_set_rounding_mode(FPU_LIB_ROUND_UP);
-    }
-}
-
 // funct3 is an rm field only on the rounding-capable OP-FP ops; on
 // fsgnj/fmin/fmax/fcmp/fclass/fmv it encodes the operation itself. "Implicitly"
 // rounding: ops that take rm as an argument (fcvt to integer, fround) consume
@@ -130,11 +90,9 @@ static slow_path void riscv_emulate_f_opc_op_impl(rvvm_hart_t* vm, const uint32_
 
     if (likely(riscv_fpu_is_enabled(vm))) {
 
-        if (unlikely(eff_rm == RM_RMM)) {
-            // Handle RMM rounding in the effective mode: a static rmm field
-            // behaves exactly like frm == RMM
-            riscv_prepare_rmm(vm, insn, rs1, rs2);
-        }
+        // RMM rounds only exact ties away from zero; directed host rounding
+        // would also change non-ties. SoftFloat checks the opcode before handling it.
+        if (riscv_fpu_try_rmm(vm, insn)) return;
 
         switch (insn & 0xFE007000UL) {
             /*
