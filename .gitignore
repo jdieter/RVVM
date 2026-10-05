@@ -22,6 +22,11 @@
 !/include
 !/src
 
+# Track the focused downstream regressions.
+!/tests
+/tests/*
+!/tests/rocky
+
 # Explicitly track build system
 !/Makefile
 !/project.mk

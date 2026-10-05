@@ -1327,7 +1327,8 @@ static void* rvvm_user_thread_wrap(void* arg)
                 case 167: // prctl
                     rvvm_info("sys_prctl(%lx, %lx, %lx, %lx, %lx)", a0, a1, a2, a3, a4);
                     //a0 = errno_ret(prctl(a0, a1, a2, a3, a4));
-                    a0 = 0;
+                    // Guest PR_GET_SECCOMP (21) and PR_SET_SECCOMP (22).
+                    a0 = (a0 == 21 || a0 == 22) ? -UAPI_EINVAL : 0;
                     break;
                 case 172: // getpid
                     a0 = errno_ret(getpid());
@@ -1546,9 +1547,8 @@ static void* rvvm_user_thread_wrap(void* arg)
                     a0 = errno_ret(renameat(a0, wrap_path(path_buf, to_str(a1)),
                                             a2, wrap_path(path_buf1, to_str(a3))));
                     break;
-                case 277: // seccomp - stub
-                    // Hitler SHOT HIMSELF after seeing this...
-                    a0 = 0;
+                case 277: // Guest filters cannot safely constrain the emulator's host syscalls.
+                    a0 = -UAPI_ENOSYS;
                     break;
                 case 278: // getrandom
                     rvvm_randombytes(to_ptr(a0), a1);
