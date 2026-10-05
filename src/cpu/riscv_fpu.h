@@ -38,16 +38,19 @@ static forceinline uint32_t riscv_fpu_host_rm(uint32_t rm)
  * when rm == DYN, or the static rm field applied around the op. Enter returns the
  * mode to restore afterwards via leave, or DYN when nothing was changed.
  */
+static no_inline uint32_t riscv_fpu_static_rm_change(uint32_t rm)
+{
+    const uint32_t prev = fpu_get_rounding_mode();
+    const uint32_t next = riscv_fpu_host_rm(rm);
+    // RMM now uses SoftFloat; no operation changes the host mode itself.
+    if (prev == next) return 0x07;
+    fpu_set_rounding_mode(next);
+    return prev;
+}
+
 static forceinline uint32_t riscv_fpu_static_rm_enter(uint32_t rm)
 {
-    if (unlikely(rm != 0x07)) {
-        // Always report a mode to restore: the op itself may change it further
-        // (the RMM preparation), and leave must undo that too
-        const uint32_t prev = fpu_get_rounding_mode();
-        fpu_set_rounding_mode(riscv_fpu_host_rm(rm));
-        return prev;
-    }
-    return 0x07;
+    return unlikely(rm != 0x07) ? riscv_fpu_static_rm_change(rm) : 0x07;
 }
 
 static forceinline void riscv_fpu_static_rm_leave(uint32_t prev)
@@ -112,6 +115,13 @@ static forceinline void riscv_write_d(rvvm_hart_t* vm, size_t reg, fpu_f64_t val
 }
 
 slow_path void riscv_emulate_f_opc_op(rvvm_hart_t* vm, const uint32_t insn);
+bool riscv_fpu_rmm(rvvm_hart_t* vm, uint32_t insn);
+
+static forceinline bool riscv_fpu_try_rmm(rvvm_hart_t* vm, uint32_t insn)
+{
+    uint32_t rm = (insn >> 12) & 7;
+    return unlikely((rm == 7 ? vm->csr.fcsr >> 5 : rm) == 4) && riscv_fpu_rmm(vm, insn);
+}
 
 #if defined(RISCV32) || defined(RISCV64)
 
@@ -166,6 +176,7 @@ static forceinline void riscv_emulate_f_fmadd(rvvm_hart_t* vm, const uint32_t in
     const size_t   rs3 = insn >> 27;
 
     if (likely(riscv_fpu_is_enabled(vm) && riscv_fpu_rm_is_valid(rm))) {
+        if (riscv_fpu_try_rmm(vm, insn)) return;
         // A static rm field overrides the frm-tracked host mode, as in the OP-FP dispatch
         const uint32_t prev_rm = riscv_fpu_static_rm_enter(rm);
         switch (bit_ext_u32(insn, 25, 2)) {
@@ -199,6 +210,7 @@ static forceinline void riscv_emulate_f_fmsub(rvvm_hart_t* vm, const uint32_t in
     const size_t   rs3 = insn >> 27;
 
     if (likely(riscv_fpu_is_enabled(vm) && riscv_fpu_rm_is_valid(rm))) {
+        if (riscv_fpu_try_rmm(vm, insn)) return;
         // A static rm field overrides the frm-tracked host mode, as in the OP-FP dispatch
         const uint32_t prev_rm = riscv_fpu_static_rm_enter(rm);
         switch (bit_ext_u32(insn, 25, 2)) {
@@ -232,6 +244,7 @@ static forceinline void riscv_emulate_f_fnmsub(rvvm_hart_t* vm, const uint32_t i
     const size_t   rs3 = insn >> 27;
 
     if (likely(riscv_fpu_is_enabled(vm) && riscv_fpu_rm_is_valid(rm))) {
+        if (riscv_fpu_try_rmm(vm, insn)) return;
         // A static rm field overrides the frm-tracked host mode, as in the OP-FP dispatch
         const uint32_t prev_rm = riscv_fpu_static_rm_enter(rm);
         switch (bit_ext_u32(insn, 25, 2)) {
@@ -265,6 +278,7 @@ static forceinline void riscv_emulate_f_fnmadd(rvvm_hart_t* vm, const uint32_t i
     const size_t   rs3 = insn >> 27;
 
     if (likely(riscv_fpu_is_enabled(vm) && riscv_fpu_rm_is_valid(rm))) {
+        if (riscv_fpu_try_rmm(vm, insn)) return;
         // A static rm field overrides the frm-tracked host mode, as in the OP-FP dispatch
         const uint32_t prev_rm = riscv_fpu_static_rm_enter(rm);
         switch (bit_ext_u32(insn, 25, 2)) {
