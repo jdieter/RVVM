@@ -15,6 +15,12 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include "mem_ops.h"
 #include "utils.h"
 #include "vma_ops.h"
+#if defined(RVVM_USER_TEST) && defined(__linux__)
+#include "user_fd_guard.h"
+#else
+static inline void user_fd_lock(void) {}
+static inline void user_fd_unlock(void) {}
+#endif
 
 PUSH_OPTIMIZATION_SIZE
 
@@ -538,11 +544,13 @@ bool vma_multi_mmap(void** rw, void** exec, size_t size)
 {
     size = align_size_up(size, vma_granularity());
 #if defined(VMA_MMAP_IMPL)
+    user_fd_lock();
     int memfd = vma_anon_memfd(size);
-    if (memfd > 0) {
+    if (memfd >= 0) {
         *rw   = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_NOSYNC, memfd, 0);
         *exec = mmap(NULL, size, PROT_READ | PROT_EXEC, MAP_SHARED | MAP_NOSYNC, memfd, 0);
         close(memfd);
+        user_fd_unlock();
         if (*rw != MAP_FAILED && *exec != MAP_FAILED) {
             return true;
         }
@@ -552,7 +560,7 @@ bool vma_multi_mmap(void** rw, void** exec, size_t size)
         if (*exec != MAP_FAILED) {
             munmap(*exec, size);
         }
-    }
+    } else user_fd_unlock();
     *rw   = NULL;
     *exec = NULL;
     return false;

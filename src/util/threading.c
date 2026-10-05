@@ -238,7 +238,7 @@ rvvm_thread_t* rvvm_thread_create_ex(rvvm_thread_func_t func, void* arg, uint32_
     if (result) {
         return thread;
     }
-    rvvm_warn("Failed to spawn thread %p", (void*)func);
+    rvvm_info("Failed to spawn thread %p", (void*)func);
     safe_free(thread);
 #endif
     return NULL;

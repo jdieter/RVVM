@@ -21,5 +21,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 // Just call this like main(), envp may be NULL
 int rvvm_user_linux(int argc, char** argv, char** envp);
+int rvvm_user_linux_binfmt(const char* executable, int argc, char** argv, char** envp);
 
 #endif
