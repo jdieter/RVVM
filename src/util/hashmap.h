@@ -49,6 +49,7 @@ static forceinline size_t hashmap_hash(size_t k)
  */
 
 void hashmap_free(hashmap_t* map);
+void hashmap_reserve(hashmap_t* map, size_t capacity);
 
 static forceinline void hashmap_put_ptr(hashmap_t* map, size_t key, void* val)
 {

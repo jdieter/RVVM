@@ -32,6 +32,15 @@ static void hashmap_resize(hashmap_t* map, size_t size)
     map->count = tmp.count;
 }
 
+void hashmap_reserve(hashmap_t* map, size_t capacity)
+{
+    size_t size = hashmap_capacity(map);
+    if (capacity <= size) return;
+    /* Pass an exact power of two: bit_next_pow2 currently rounds down on GCC. */
+    while (size < capacity) size <<= 1;
+    hashmap_resize(map, size);
+}
+
 static void hashmap_rebalance_internal(hashmap_t* map, size_t index)
 {
     size_t j = index, k;

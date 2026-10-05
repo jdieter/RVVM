@@ -404,8 +404,11 @@ static void rvjit_lookup_block(rvjit_block_t* block)
 #endif
 }
 
-static void rvjit_link_block(rvjit_block_t* block)
+#include "rvjit_entry_reuse.h"
+
+static void rvjit_link_block(rvjit_block_t* block, size_t skip)
 {
+    UNUSED(skip);
 #ifdef RVJIT_NATIVE_LINKER
     rvjit_addr_t next_pc  = block->phys_pc + block->pc_off;
     size_t       exit_ptr = (size_t)(block->heap.data + block->heap.curr + block->size);
@@ -421,7 +424,7 @@ static void rvjit_link_block(rvjit_block_t* block)
 
     if ((next_pc >> 12) == (block->phys_pc >> 12)) {
         if (next_block) {
-            rvjit_tail_bnez(block, VM_PTR_REG, next_block - exit_ptr);
+            rvjit_tail_bnez(block, VM_PTR_REG, next_block + skip - exit_ptr);
             // rvjit_tail_jmp(block, next_block - exit_ptr);
         } else {
             rvjit_patchable_ret(block);
@@ -461,13 +464,15 @@ void rvjit_emit_end(rvjit_block_t* block, uint8_t linkage)
 {
     size_t hreg_mask       = block->hreg_mask;
     size_t abireclaim_mask = block->abireclaim_mask;
+    regmask_t keep = 0;
+    size_t skip = rvjit_entry_reuse(block, linkage, &keep);
 
     // Save allocated native registers into VM context
     for (regid_t i = 0; i < RVJIT_REGISTERS; ++i) {
         rvjit_save_reg(block, i);
     }
 
-    block->hreg_mask = rvjit_native_default_hregmask();
+    block->hreg_mask = rvjit_native_default_hregmask() & ~keep;
     rvjit_update_vm_pc(block);
 
     // Recover clobbered registers
@@ -479,7 +484,7 @@ void rvjit_emit_end(rvjit_block_t* block, uint8_t linkage)
 
     switch (linkage) {
         case LINKAGE_JMP:
-            rvjit_link_block(block);
+            rvjit_link_block(block, skip);
             break;
         case LINKAGE_TAIL:
             rvjit_lookup_block(block);
@@ -1002,9 +1007,13 @@ static inline void rvjit_fault_end(rvjit_block_t* block)
     void rvjit64_##instr(rvjit_block_t* block, regid_t dest, regid_t vaddr, int32_t offset)                            \
     {                                                                                                                  \
         if (block->native_ptrs) {                                                                                      \
+            rvjit_user_fault_sync(block);                                                                            \
             regid_t haddr = rvjit_map_reg(block, vaddr, REG_SRC);                                                      \
+            rvjit_fault_before_dest(block, dest, store);                                                             \
             regid_t hdest = rvjit_map_reg(block, dest, store ? REG_SRC : REG_DST);                                     \
+            rvjit_fault_begin(block);                                                                                \
             rvjit64_native_##instr(block, hdest, haddr, offset);                                                       \
+            rvjit_fault_end(block);                                                                                  \
         } else {                                                                                                       \
             regid_t haddr = rvjit_claim_hreg(block);                                                                   \
             rvjit_tlb_lookup(block, haddr, vaddr, offset, store ? VM_TLB_W : VM_TLB_R, align);                         \

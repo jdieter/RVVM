@@ -155,6 +155,11 @@ typedef struct {
     uint8_t* code;
     size_t   size;
     size_t   space;
+    bool     entry_reuse;
+    bool     reuse_stats;
+    uint64_t reuse_candidates;
+    uint64_t reuse_links;
+    uint64_t reuse_loads;
 
     // Block exit paths
     vector_t(struct {

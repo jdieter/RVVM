@@ -17,6 +17,9 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include "utils.h"
 #include "vector.h"
 #include "vma_ops.h"
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
 
 #if defined(RVJIT_ARM64) && defined(__APPLE__) && __ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__ >= 110000
 /*
@@ -45,6 +48,27 @@ void sys_icache_invalidate(void* start, size_t len);
 #include <windows.h>
 
 #elif defined(RVJIT_ARM64) && defined(GNU_EXTS)
+#ifdef __linux__
+#include <sys/auxv.h>
+#endif
+
+static bool rvjit_neoverse_v3(void)
+{
+#ifdef __linux__
+    static uint32_t detected;
+    uint32_t value = atomic_load_uint32(&detected);
+    if (!value) {
+        uint64_t midr = 0;
+        if (getauxval(AT_HWCAP) & (1UL << 11)) // Linux HWCAP_CPUID
+            __asm__ __volatile__("mrs %0, midr_el1" : "=r"(midr));
+        value = (midr & UINT64_C(0xff00fff0)) == UINT64_C(0x4100d840) ? 2 : 1;
+        atomic_store_uint32(&detected, value);
+    }
+    return value == 2;
+#else
+    return false;
+#endif
+}
 /*
  * Don't rely on GCC's __clear_cache implementation, as it may
  * use incorrect cacheline sizes on buggy big.LITTLE hardware.
@@ -52,6 +76,26 @@ void sys_icache_invalidate(void* start, size_t len);
  */
 static inline void rvjit_arm64_fluch_icache(const void* addr, size_t size)
 {
+    if (rvjit_neoverse_v3()) {
+        // Use architectural coherence on homogeneous Neoverse V3 hosts.
+        uint64_t ctr;
+        __asm__ __volatile__("mrs %0, ctr_el0" : "=r"(ctr));
+        size_t end = (size_t)addr + size;
+        if (!(ctr & (UINT64_C(1) << 28))) {
+            size_t line = 4U << ((ctr >> 16) & 15);
+            for (size_t cl = align_size_down((size_t)addr, line); cl < end; cl += line)
+                __asm__ __volatile__("dc cvau, %0" : : "r"(cl) : "memory");
+        }
+        __asm__ __volatile__("dsb ish" : : : "memory");
+        if (!(ctr & (UINT64_C(1) << 29))) {
+            size_t line = 4U << (ctr & 15);
+            for (size_t cl = align_size_down((size_t)addr, line); cl < end; cl += line)
+                __asm__ __volatile__("ic ivau, %0" : : "r"(cl) : "memory");
+            __asm__ __volatile__("dsb ish" : : : "memory");
+        }
+        __asm__ __volatile__("isb" : : : "memory");
+        return;
+    }
     size_t dsize = 64, isize = 64;
     size_t end = ((size_t)addr) + size;
 
@@ -143,6 +187,10 @@ bool rvjit_ctx_init(rvjit_block_t* block, size_t size)
     block->heap.curr = 0;
 
     block->rv64 = false;
+    const char* reuse = getenv("RVVM_JIT_ENTRY_REUSE");
+    block->entry_reuse = !reuse || strcmp(reuse, "0");
+    block->reuse_stats = getenv("RVVM_JIT_ENTRY_REUSE_STATS") != NULL;
+    block->reuse_candidates = block->reuse_links = block->reuse_loads = 0;
 
     hashmap_init(&block->heap.blocks, 64);
     hashmap_init(&block->heap.block_links, 64);
@@ -178,6 +226,12 @@ static void rvjit_linker_cleanup(rvjit_block_t* block)
 
 void rvjit_ctx_free(rvjit_block_t* block)
 {
+    if (block->reuse_stats) {
+        fprintf(stderr, "JIT entry reuse: candidates=%llu links=%llu loads=%llu\n",
+                (unsigned long long)block->reuse_candidates,
+                (unsigned long long)block->reuse_links,
+                (unsigned long long)block->reuse_loads);
+    }
     vma_free(block->heap.data, block->heap.size);
     if (block->heap.code != block->heap.data) {
         vma_free((void*)block->heap.code, block->heap.size);
@@ -275,6 +329,8 @@ rvjit_func_t rvjit_block_finalize(rvjit_block_t* block)
 #endif
     block->heap.curr += block->size;
 
+    // Bound lookup collision chains without work in the execution path.
+    hashmap_reserve(&block->heap.blocks, (hashmap_size(&block->heap.blocks) + 1) * 2);
     hashmap_put(&block->heap.blocks, block->phys_pc, (size_t)code);
 
 #ifdef RVJIT_NATIVE_LINKER
