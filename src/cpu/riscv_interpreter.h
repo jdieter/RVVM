@@ -41,7 +41,7 @@ TSAN_SUPPRESS void riscv_run_interpreter(rvvm_hart_t* vm)
         const xlen_t insn_addr = vm->registers[RISCV_REG_PC];
         if (likely(insn_addr - insn_page <= 0xFFC)) {
             // Direct instruction fetch by pointer
-            insn = read_uint32_le_m((const void*)(size_t)(insn_ptr + insn_addr));
+            insn = riscv_guest_load32((const void*)(size_t)(insn_ptr + insn_addr));
         } else {
             uint32_t tmp = 0;
             if (likely(riscv_fetch_insn(vm, insn_addr, &tmp))) {

@@ -14,6 +14,26 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include <util/mem_ops.h>
 
 #include <cpu/riscv_csr.h>
+#ifdef USER_FAULT_META
+#include "riscv_user_access.h"
+#define riscv_guest_load8 riscv_user_fault_load8
+#define riscv_guest_load16 riscv_user_fault_load16
+#define riscv_guest_load32 riscv_user_fault_load32
+#define riscv_guest_load64 riscv_user_fault_load64
+#define riscv_guest_store8 riscv_user_fault_store8
+#define riscv_guest_store16 riscv_user_fault_store16
+#define riscv_guest_store32 riscv_user_fault_store32
+#define riscv_guest_store64 riscv_user_fault_store64
+#else
+#define riscv_guest_load8 read_uint8
+#define riscv_guest_load16 read_uint16_le_m
+#define riscv_guest_load32 read_uint32_le_m
+#define riscv_guest_load64 read_uint64_le_m
+#define riscv_guest_store8 write_uint8
+#define riscv_guest_store16 write_uint16_le_m
+#define riscv_guest_store32 write_uint32_le_m
+#define riscv_guest_store64 write_uint64_le_m
+#endif
 
 #if defined(USE_FPU)
 #include <util/fpu_lib.h>
@@ -35,6 +55,10 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define RISCV_PAGE_MASK    0xFFF
 #define RISCV_PAGE_SIZE    0x1000
 #define RISCV_PAGE_PNMASK  (~0xFFFULL)
+
+#ifdef USER_FAULT_META
+extern bool (*riscv_user_exec_check)(rvvm_addr_t);
+#endif
 
 // Init physical memory (be careful to not overlap MMIO regions!)
 bool riscv_init_ram(rvvm_ram_t* mem, rvvm_addr_t base_addr, size_t size);
@@ -120,14 +144,20 @@ static forceinline void riscv_rmw_mmio_commit(rvvm_hart_t* vm, rvvm_addr_t vaddr
 
 static forceinline bool riscv_fetch_insn(rvvm_hart_t* vm, rvvm_addr_t vaddr, uint32_t* insn)
 {
+#ifdef USER_FAULT_META
+    if (unlikely(vaddr & 1)) {
+        riscv_mmu_op_helper(vm, vaddr, NULL, 0, 0, RISCV_MMU_EXEC);
+        return false;
+    }
+#endif
     rvvm_addr_t vpn = vaddr >> RISCV_PAGE_SHIFT;
     if (likely(vm->tlb[vpn & RVVM_TLB_MASK].e == vpn)) {
-        uint32_t tmp = read_uint16_le_m((const void*)(size_t)(vm->tlb[vpn & RVVM_TLB_MASK].ptr + vaddr));
+        uint32_t tmp = riscv_guest_load16((const void*)(size_t)(vm->tlb[vpn & RVVM_TLB_MASK].ptr + vaddr));
         if ((tmp & 0x3) == 0x3) {
             // This is a 4-byte instruction, fetch the next half
             vpn = (vaddr + 2) >> RISCV_PAGE_SHIFT;
             if (likely(vm->tlb[vpn & RVVM_TLB_MASK].e == vpn)) {
-                tmp |= ((uint32_t)read_uint16_le_m((const void*)(size_t)(vm->tlb[vpn & RVVM_TLB_MASK].ptr + vaddr + 2)))
+                tmp |= ((uint32_t)riscv_guest_load16((const void*)(size_t)(vm->tlb[vpn & RVVM_TLB_MASK].ptr + vaddr + 2)))
                     << 16;
                 *insn = tmp;
                 return true;
@@ -192,7 +222,20 @@ static forceinline void riscv_load_u64(rvvm_hart_t* vm, rvvm_addr_t vaddr, regid
     const rvvm_addr_t       vpn   = vaddr >> RISCV_PAGE_SHIFT;
     const rvvm_tlb_entry_t* entry = &vm->tlb[vpn & RVVM_TLB_MASK];
     if (likely(entry->r == vpn && !(vaddr & 7))) {
+#ifdef USER_FAULT_META
+        vm->registers[reg] = riscv_user_fault_load64((const void*)(size_t)(entry->ptr + vaddr));
+#else
+#ifdef USER_FAULT_POC
+        vm->user_fault_pc = vm->registers[RISCV_REG_PC];
+        vm->user_fault_interpreted = 1;
+        __asm__ __volatile__("" ::: "memory");
+#endif
         vm->registers[reg] = read_uint64_le((const void*)(size_t)(entry->ptr + vaddr));
+#ifdef USER_FAULT_POC
+        __asm__ __volatile__("" ::: "memory");
+        vm->user_fault_interpreted = 0;
+#endif
+#endif
     } else {
         uint64_t tmp;
         if (riscv_mmu_op(vm, vaddr, &tmp, sizeof(tmp), RISCV_MMU_READ)) {
@@ -206,7 +249,7 @@ static forceinline void riscv_load_u32(rvvm_hart_t* vm, rvvm_addr_t vaddr, regid
     const rvvm_addr_t       vpn   = vaddr >> RISCV_PAGE_SHIFT;
     const rvvm_tlb_entry_t* entry = &vm->tlb[vpn & RVVM_TLB_MASK];
     if (likely(entry->r == vpn && !(vaddr & 3))) {
-        vm->registers[reg] = read_uint32_le((const void*)(size_t)(entry->ptr + vaddr));
+        vm->registers[reg] = riscv_guest_load32((const void*)(size_t)(entry->ptr + vaddr));
     } else {
         uint32_t tmp;
         if (riscv_mmu_op(vm, vaddr, &tmp, sizeof(tmp), RISCV_MMU_READ)) {
@@ -220,7 +263,7 @@ static forceinline void riscv_load_s32(rvvm_hart_t* vm, rvvm_addr_t vaddr, regid
     const rvvm_addr_t       vpn   = vaddr >> RISCV_PAGE_SHIFT;
     const rvvm_tlb_entry_t* entry = &vm->tlb[vpn & RVVM_TLB_MASK];
     if (likely(entry->r == vpn && !(vaddr & 3))) {
-        vm->registers[reg] = (int32_t)read_uint32_le((const void*)(size_t)(entry->ptr + vaddr));
+        vm->registers[reg] = (int32_t)riscv_guest_load32((const void*)(size_t)(entry->ptr + vaddr));
     } else {
         uint32_t tmp;
         if (riscv_mmu_op(vm, vaddr, &tmp, sizeof(tmp), RISCV_MMU_READ)) {
@@ -234,7 +277,7 @@ static forceinline void riscv_load_u16(rvvm_hart_t* vm, rvvm_addr_t vaddr, regid
     const rvvm_addr_t       vpn   = vaddr >> RISCV_PAGE_SHIFT;
     const rvvm_tlb_entry_t* entry = &vm->tlb[vpn & RVVM_TLB_MASK];
     if (likely(entry->r == vpn && !(vaddr & 1))) {
-        vm->registers[reg] = read_uint16_le((const void*)(size_t)(entry->ptr + vaddr));
+        vm->registers[reg] = riscv_guest_load16((const void*)(size_t)(entry->ptr + vaddr));
     } else {
         uint16_t tmp;
         if (riscv_mmu_op(vm, vaddr, &tmp, sizeof(tmp), RISCV_MMU_READ)) {
@@ -248,7 +291,7 @@ static forceinline void riscv_load_s16(rvvm_hart_t* vm, rvvm_addr_t vaddr, regid
     const rvvm_addr_t       vpn   = vaddr >> RISCV_PAGE_SHIFT;
     const rvvm_tlb_entry_t* entry = &vm->tlb[vpn & RVVM_TLB_MASK];
     if (likely(entry->r == vpn && !(vaddr & 1))) {
-        vm->registers[reg] = (int16_t)read_uint16_le((const void*)(size_t)(entry->ptr + vaddr));
+        vm->registers[reg] = (int16_t)riscv_guest_load16((const void*)(size_t)(entry->ptr + vaddr));
     } else {
         uint16_t tmp;
         if (riscv_mmu_op(vm, vaddr, &tmp, sizeof(tmp), RISCV_MMU_READ)) {
@@ -262,7 +305,7 @@ static forceinline void riscv_load_u8(rvvm_hart_t* vm, rvvm_addr_t vaddr, regid_
     const rvvm_addr_t       vpn   = vaddr >> RISCV_PAGE_SHIFT;
     const rvvm_tlb_entry_t* entry = &vm->tlb[vpn & RVVM_TLB_MASK];
     if (likely(entry->r == vpn)) {
-        vm->registers[reg] = read_uint8((const void*)(size_t)(entry->ptr + vaddr));
+        vm->registers[reg] = riscv_guest_load8((const void*)(size_t)(entry->ptr + vaddr));
     } else {
         uint8_t tmp;
         if (riscv_mmu_op(vm, vaddr, &tmp, sizeof(tmp), RISCV_MMU_READ)) {
@@ -276,7 +319,7 @@ static forceinline void riscv_load_s8(rvvm_hart_t* vm, rvvm_addr_t vaddr, regid_
     const rvvm_addr_t       vpn   = vaddr >> RISCV_PAGE_SHIFT;
     const rvvm_tlb_entry_t* entry = &vm->tlb[vpn & RVVM_TLB_MASK];
     if (likely(entry->r == vpn)) {
-        vm->registers[reg] = (int8_t)read_uint8((const void*)(size_t)(entry->ptr + vaddr));
+        vm->registers[reg] = (int8_t)riscv_guest_load8((const void*)(size_t)(entry->ptr + vaddr));
     } else {
         uint8_t tmp;
         if (riscv_mmu_op(vm, vaddr, &tmp, sizeof(tmp), RISCV_MMU_READ)) {
@@ -292,7 +335,20 @@ static forceinline void riscv_store_u64(rvvm_hart_t* vm, rvvm_addr_t vaddr, regi
     const rvvm_addr_t       vpn   = vaddr >> RISCV_PAGE_SHIFT;
     const rvvm_tlb_entry_t* entry = &vm->tlb[vpn & RVVM_TLB_MASK];
     if (likely(entry->w == vpn && !(vaddr & 7))) {
+#ifdef USER_FAULT_META
+        riscv_user_fault_store64((void*)(size_t)(entry->ptr + vaddr), vm->registers[reg]);
+#else
+#ifdef USER_FAULT_POC
+        vm->user_fault_pc = vm->registers[RISCV_REG_PC];
+        vm->user_fault_interpreted = 1;
+        __asm__ __volatile__("" ::: "memory");
+#endif
         write_uint64_le((void*)(size_t)(entry->ptr + vaddr), vm->registers[reg]);
+#ifdef USER_FAULT_POC
+        __asm__ __volatile__("" ::: "memory");
+        vm->user_fault_interpreted = 0;
+#endif
+#endif
     } else {
         uint64_t tmp;
         write_uint64_le_m(&tmp, vm->registers[reg]);
@@ -305,7 +361,7 @@ static forceinline void riscv_store_u32(rvvm_hart_t* vm, rvvm_addr_t vaddr, regi
     const rvvm_addr_t       vpn   = vaddr >> RISCV_PAGE_SHIFT;
     const rvvm_tlb_entry_t* entry = &vm->tlb[vpn & RVVM_TLB_MASK];
     if (likely(entry->w == vpn && !(vaddr & 3))) {
-        write_uint32_le((void*)(size_t)(entry->ptr + vaddr), vm->registers[reg]);
+        riscv_guest_store32((void*)(size_t)(entry->ptr + vaddr), vm->registers[reg]);
     } else {
         uint32_t tmp;
         write_uint32_le_m(&tmp, vm->registers[reg]);
@@ -318,7 +374,7 @@ static forceinline void riscv_store_u16(rvvm_hart_t* vm, rvvm_addr_t vaddr, regi
     const rvvm_addr_t       vpn   = vaddr >> RISCV_PAGE_SHIFT;
     const rvvm_tlb_entry_t* entry = &vm->tlb[vpn & RVVM_TLB_MASK];
     if (likely(entry->w == vpn && !(vaddr & 1))) {
-        write_uint16_le((void*)(size_t)(entry->ptr + vaddr), vm->registers[reg]);
+        riscv_guest_store16((void*)(size_t)(entry->ptr + vaddr), vm->registers[reg]);
     } else {
         uint16_t tmp;
         write_uint16_le_m(&tmp, vm->registers[reg]);
@@ -331,7 +387,7 @@ static forceinline void riscv_store_u8(rvvm_hart_t* vm, rvvm_addr_t vaddr, regid
     const rvvm_addr_t       vpn   = vaddr >> RISCV_PAGE_SHIFT;
     const rvvm_tlb_entry_t* entry = &vm->tlb[vpn & RVVM_TLB_MASK];
     if (likely(entry->w == vpn)) {
-        write_uint8((void*)(size_t)(entry->ptr + vaddr), vm->registers[reg]);
+        riscv_guest_store8((void*)(size_t)(entry->ptr + vaddr), vm->registers[reg]);
     } else {
         uint8_t tmp = vm->registers[reg];
         riscv_mmu_op(vm, vaddr, &tmp, sizeof(tmp), RISCV_MMU_WRITE);
@@ -347,7 +403,8 @@ static forceinline void riscv_load_double(rvvm_hart_t* vm, rvvm_addr_t vaddr, re
     const rvvm_addr_t       vpn   = vaddr >> RISCV_PAGE_SHIFT;
     const rvvm_tlb_entry_t* entry = &vm->tlb[vpn & RVVM_TLB_MASK];
     if (likely(entry->r == vpn && !(vaddr & 7))) {
-        vm->fpu_registers[reg] = fpu_load_f64_le((const void*)(size_t)(entry->ptr + vaddr));
+        uint64_t bits = riscv_guest_load64((const void*)(size_t)(entry->ptr + vaddr));
+        vm->fpu_registers[reg] = fpu_bit_u64_to_f64(bits);
         riscv_fpu_set_dirty(vm);
     } else {
         fpu_f64_t tmp;
@@ -363,7 +420,8 @@ static forceinline void riscv_load_float(rvvm_hart_t* vm, rvvm_addr_t vaddr, reg
     const rvvm_addr_t       vpn   = vaddr >> RISCV_PAGE_SHIFT;
     const rvvm_tlb_entry_t* entry = &vm->tlb[vpn & RVVM_TLB_MASK];
     if (likely(entry->r == vpn && !(vaddr & 3))) {
-        vm->fpu_registers[reg] = fpu_nanbox_f32(fpu_load_f32_le((const void*)(size_t)(entry->ptr + vaddr)));
+        uint32_t bits = riscv_guest_load32((const void*)(size_t)(entry->ptr + vaddr));
+        vm->fpu_registers[reg] = fpu_nanbox_f32(fpu_bit_u32_to_f32(bits));
         riscv_fpu_set_dirty(vm);
     } else {
         fpu_f32_t tmp;
@@ -381,7 +439,7 @@ static forceinline void riscv_store_double(rvvm_hart_t* vm, rvvm_addr_t vaddr, r
     const rvvm_addr_t       vpn   = vaddr >> RISCV_PAGE_SHIFT;
     const rvvm_tlb_entry_t* entry = &vm->tlb[vpn & RVVM_TLB_MASK];
     if (likely(entry->w == vpn && !(vaddr & 7))) {
-        fpu_store_f64_le((void*)(size_t)(entry->ptr + vaddr), vm->fpu_registers[reg]);
+        riscv_guest_store64((void*)(size_t)(entry->ptr + vaddr), fpu_bit_f64_to_u64(vm->fpu_registers[reg]));
     } else {
         fpu_f64_t tmp;
         fpu_store_f64_le(&tmp, vm->fpu_registers[reg]);
@@ -394,7 +452,8 @@ static forceinline void riscv_store_float(rvvm_hart_t* vm, rvvm_addr_t vaddr, re
     const rvvm_addr_t       vpn   = vaddr >> RISCV_PAGE_SHIFT;
     const rvvm_tlb_entry_t* entry = &vm->tlb[vpn & RVVM_TLB_MASK];
     if (likely(entry->w == vpn && !(vaddr & 3))) {
-        fpu_store_f32_le((void*)(size_t)(entry->ptr + vaddr), fpu_unpack_f32_from_f64(vm->fpu_registers[reg]));
+        riscv_guest_store32((void*)(size_t)(entry->ptr + vaddr),
+                           fpu_bit_f32_to_u32(fpu_unpack_f32_from_f64(vm->fpu_registers[reg])));
     } else {
         fpu_f32_t tmp;
         fpu_store_f32_le(&tmp, fpu_unpack_f32_from_f64(vm->fpu_registers[reg]));

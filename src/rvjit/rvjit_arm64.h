@@ -1316,13 +1316,40 @@ static inline void rvjit_host_cmp_imm(rvjit_block_t* block, uint32_t insn, uint3
 // Emit load/store instruction with signed imm64 offset
 static inline void rvjit_host_loadstore(rvjit_block_t* block, uint32_t insn, uint32_t rd, uint32_t base, int64_t off)
 {
+#ifdef USER_FAULT_META
+    bool guest = block->fault_active;
+    block->fault_active = false; // Register spills are emulator accesses.
+#endif
+    if (base == RVJIT_HOST_REG_ZERO) {
+        // Memory operands interpret register 31 as SP, not XZR.
+        regid_t tmp = rvjit_claim_hreg(block);
+        rvjit_arm64_load_imm(block, tmp, off);
+#ifdef USER_FAULT_META
+        if (guest) rvjit_fault_record(block, 4);
+#endif
+        rvjit_arm64_insn_ldst(block, insn, rd, tmp, 0);
+        rvjit_free_hreg(block, tmp);
+        return;
+    }
     uint32_t shift = insn >> 30;
     uint32_t off_i = (off >> shift) & 0xFFFU;
     uint32_t off_s = off_i << shift;
     if (!(off - off_s)) {
         // Encode scaled positive offset directly into the instruction
+#ifdef USER_FAULT_META
+        if (guest) rvjit_fault_record(block, 4);
+#endif
         rvjit_arm64_insn_ldst(block, insn, rd, base, off_i);
-    } else if (rvjit_arm64_ldst_is_load(insn) && !rvjit_arm64_ldst_is_fp(insn)) {
+    } else if (off >= -256 && off <= 255) {
+#ifdef USER_FAULT_META
+        if (guest) rvjit_fault_record(block, 4);
+#endif
+        rvjit_arm64_insn_ldst_unscaled(block, rvjit_arm64_ldst_to_unscaled(insn), rd, base, off);
+    } else if (rvjit_arm64_ldst_is_load(insn) && !rvjit_arm64_ldst_is_fp(insn)
+#ifdef USER_FAULT_META
+               && !guest
+#endif
+               && rd != RVJIT_HOST_REG_ZERO) {
         // This is a scalar load with large offset that clobbers rd
         // Lower to adding base with offset into rd, then overwriting rd with the load result
         rvjit_host_addisp(block, rd, base, off - off_s);
@@ -1330,8 +1357,12 @@ static inline void rvjit_host_loadstore(rvjit_block_t* block, uint32_t insn, uin
     } else {
         // This is a load/store with large offset which doesn't clobber rd
         // Lower to adding base with offset into temporary register
+        // XZR cannot hold an address: ADD/SUB immediate would overwrite SP.
         regid_t tmp = rvjit_claim_hreg(block);
         rvjit_host_addisp(block, tmp, base, off - off_s);
+#ifdef USER_FAULT_META
+        if (guest) rvjit_fault_record(block, 4);
+#endif
         rvjit_arm64_insn_ldst(block, insn, rd, tmp, off_i);
         rvjit_free_hreg(block, tmp);
     }

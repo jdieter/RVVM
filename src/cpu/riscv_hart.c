@@ -89,12 +89,29 @@ rvvm_addr_t riscv_hart_run_userland(rvvm_hart_t* vm)
 {
     vm->userland = true;
     atomic_store_uint32_ex(&vm->running, true, ATOMIC_RELAXED);
+#ifdef USER_FAULT_META
+    // Publish running before checking the flush request. The old unconditional
+    // exchange ordered that store; a load alone could lose a concurrent wake.
+    atomic_fence_ex(ATOMIC_SEQ_CST);
+    if (atomic_load_uint32(&vm->user_cache_flush) && atomic_swap_uint32(&vm->user_cache_flush, 0)) {
+        riscv_jit_flush_cache(vm);
+        riscv_tlb_flush(vm);
+    }
+#endif
+    if (atomic_load_uint32(&vm->user_signal_pending)) {
+        riscv_jit_discard(vm);
+        return (rvvm_addr_t)-1;
+    }
     riscv_run_till_event(vm);
     if (vm->trap) {
         vm->registers[RISCV_REG_PC] = vm->trap_pc;
         vm->trap                    = false;
+        return vm->csr.cause[RISCV_PRIV_USER];
     }
-    return vm->csr.cause[RISCV_PRIV_USER];
+    // Signal delivery may redirect PC within this page; do not append the
+    // handler to an interrupted trace of the original guest context.
+    riscv_jit_discard(vm);
+    return (rvvm_addr_t)-1;
 }
 
 void riscv_switch_priv(rvvm_hart_t* vm, uint8_t priv_mode)

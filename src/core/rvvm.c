@@ -1278,10 +1278,36 @@ PUBLIC void rvvm_flush_icache(rvvm_machine_t* machine, rvvm_addr_t addr, size_t 
     if (likely(machine)) {
         scoped_spin_lock (&global_lock) {
             vector_foreach (machine->harts, i) {
+#ifdef USER_FAULT_META
+                rvvm_hart_t* hart = vector_at(machine->harts, i);
+                if (hart->userland) {
+                    atomic_store_uint32(&hart->user_cache_flush, 1);
+                    atomic_store_uint32(&hart->running, 0);
+                    continue;
+                }
+#endif
                 riscv_jit_flush_cache(vector_at(machine->harts, i));
             }
         }
     }
+}
+
+void rvvm_user_fork_lock(void)
+{
+    spin_lock(&global_lock);
+}
+
+void rvvm_user_fork_unlock(void)
+{
+    spin_unlock(&global_lock);
+}
+
+void rvvm_user_fork_child(rvvm_hart_t* thread)
+{
+    // global_lock is held. Other native threads no longer exist in this child;
+    // their copied resources may contain locked state and must not be destroyed.
+    vector_clear(thread->machine->harts);
+    vector_push_back(thread->machine->harts, thread);
 }
 
 PUBLIC rvvm_hart_t* rvvm_create_user_thread(rvvm_machine_t* machine)
@@ -1319,6 +1345,7 @@ PUBLIC rvvm_hart_t* rvvm_create_user_thread(rvvm_machine_t* machine)
                 // This is the main thread, initialize the timer
                 rvtimer_init(&machine->timer, rvvm_get_opt(machine, RVVM_OPT_TIME_FREQ));
             }
+            vector_push_back(machine->harts, thread);
         }
         return thread;
     }

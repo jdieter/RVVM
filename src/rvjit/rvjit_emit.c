@@ -43,6 +43,9 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 void rvjit_emit_init(rvjit_block_t* block)
 {
+#ifdef USER_FAULT_META
+    memset(block->fault_regs, REG_ILL, sizeof(block->fault_regs));
+#endif
     block->hreg_mask       = rvjit_native_default_hregmask();
     block->abireclaim_mask = 0;
     for (regid_t i = 0; i < RVJIT_REGISTERS; ++i) {
@@ -91,6 +94,9 @@ static void rvjit_free_reg(rvjit_block_t* block, regid_t reg)
     if (block->regs[reg].hreg != REG_ILL) {
         rvjit_save_reg(block, reg);
         rvjit_free_hreg(block, block->regs[reg].hreg);
+#ifdef USER_FAULT_META
+        if (reg < 32) block->fault_regs[block->regs[reg].hreg] = REG_ILL;
+#endif
         block->regs[reg].hreg = REG_ILL;
     }
 }
@@ -178,6 +184,9 @@ static regid_t rvjit_map_reg(rvjit_block_t* block, regid_t greg, regflags_t flag
 #endif
 
     if (flags & REG_DST) {
+#ifdef USER_FAULT_META
+        if (greg < 32 && greg) block->fault_regs[block->regs[greg].hreg] = greg;
+#endif
         block->regs[greg].flags |= REG_DIRTY;
         block->regs[greg].flags &= ~REG_AUIPC;
     }
@@ -903,13 +912,82 @@ static void rvjit_tlb_lookup(rvjit_block_t* block, regid_t haddr, regid_t vaddr,
  * Load/store intrinsics
  */
 
+static void rvjit_user_fault_sync(rvjit_block_t* block)
+{
+#if defined(USER_FAULT_POC) && !defined(USER_FAULT_META) && defined(RVJIT_NATIVE_64BIT)
+    for (regid_t i = 0; i < RVJIT_REGISTERS; ++i) {
+        rvjit_save_reg(block, i);
+        if (block->regs[i].flags & REG_DIRTY)
+            block->regs[i].flags = (block->regs[i].flags & ~REG_DIRTY) | REG_LOADED;
+    }
+    regid_t tmp = rvjit_claim_hreg(block);
+    rvjit_native_setregw(block, tmp, block->virt_pc + block->pc_off);
+    rvjit64_native_sd(block, tmp, VM_PTR_REG, offsetof(rvvm_hart_t, user_fault_pc));
+    rvjit_free_hreg(block, tmp);
+#else
+    UNUSED(block);
+#endif
+}
+
+#ifdef USER_FAULT_META
+void rvjit_fault_record(rvjit_block_t* block, size_t length)
+{
+    rvjit_fault_t entry;
+    entry.guest_pc = block->virt_pc + block->pc_off;
+    entry.start = block->size;
+    entry.end = block->size + length;
+    memcpy(entry.regs, block->fault_regs, sizeof(entry.regs));
+    if (block->fault_ignore < 32 && block->regs[block->fault_ignore].hreg != REG_ILL)
+        entry.regs[block->regs[block->fault_ignore].hreg] = REG_ILL;
+    vector_push_back(block->faults, entry);
+}
+#endif
+
+static inline void rvjit_fault_before_dest(rvjit_block_t* block, regid_t dest, bool store)
+{
+#ifdef USER_FAULT_META
+    bool dirty = block->regs[dest].hreg != REG_ILL && (block->regs[dest].flags & REG_DIRTY);
+    block->fault_ignore = !store && !dirty ? dest : REG_ILL;
+#else
+    UNUSED(block); UNUSED(dest); UNUSED(store);
+#endif
+}
+
+static inline void rvjit_fault_begin(rvjit_block_t* block)
+{
+#ifdef USER_FAULT_META
+    block->fault_active = block->rv64;
+#ifdef RVJIT_X86
+    if (block->fault_active) rvjit_fault_record(block, 0);
+#endif
+#else
+    UNUSED(block);
+#endif
+}
+
+static inline void rvjit_fault_end(rvjit_block_t* block)
+{
+#ifdef USER_FAULT_META
+#ifdef RVJIT_X86
+    if (block->fault_active) vector_at(block->faults, vector_size(block->faults) - 1).end = block->size;
+#endif
+    block->fault_active = false;
+#else
+    UNUSED(block);
+#endif
+}
+
 #define RVJIT32_LDST(instr, align, store)                                                                              \
     void rvjit32_##instr(rvjit_block_t* block, regid_t dest, regid_t vaddr, int32_t offset)                            \
     {                                                                                                                  \
         if (block->native_ptrs) {                                                                                      \
+            rvjit_user_fault_sync(block);                                                                            \
             regid_t haddr = rvjit_map_reg(block, vaddr, REG_SRC);                                                      \
+            rvjit_fault_before_dest(block, dest, store);                                                             \
             regid_t hdest = rvjit_map_reg(block, dest, store ? REG_SRC : REG_DST);                                     \
+            rvjit_fault_begin(block);                                                                                \
             rvjit32_native_##instr(block, hdest, haddr, offset);                                                       \
+            rvjit_fault_end(block);                                                                                  \
         } else {                                                                                                       \
             regid_t haddr = rvjit_claim_hreg(block);                                                                   \
             rvjit_tlb_lookup(block, haddr, vaddr, offset, store ? VM_TLB_W : VM_TLB_R, align);                         \

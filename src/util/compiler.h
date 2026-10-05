@@ -10,6 +10,11 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #ifndef RVVM_UTIL_COMPILER_TRICKS_H
 #define RVVM_UTIL_COMPILER_TRICKS_H
 
+/* Metadata recovery uses the basic fault dispatcher in every translation unit. */
+#if defined(USER_FAULT_META) && !defined(USER_FAULT_POC)
+#define USER_FAULT_POC 1
+#endif
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>

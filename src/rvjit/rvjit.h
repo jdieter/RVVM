@@ -113,6 +113,18 @@ typedef size_t   rvjit_addr_t;
 
 #define REG_ILL       0xFF // Register is not allocated
 
+#ifdef USER_FAULT_META
+typedef struct {
+    uint64_t guest_pc;
+    uint32_t start, end;
+#ifdef RVJIT_X86
+    uint8_t regs[16]; // Guest register held by each host register; REG_ILL otherwise.
+#else
+    uint8_t regs[32];
+#endif
+} rvjit_fault_t;
+#endif
+
 typedef struct {
     uint8_t*  data;
     uint8_t*  code;
@@ -120,6 +132,9 @@ typedef struct {
     size_t    size;
     hashmap_t blocks;
     hashmap_t block_links;
+#ifdef USER_FAULT_META
+    vector_t(rvjit_fault_t) faults;
+#endif
 
     // Dirty memory tracking
     uint32_t* jited_pages;
@@ -150,6 +165,12 @@ typedef struct {
     regmask_t       hreg_mask;       // Bitmask of available non-clobbered host registers
     regmask_t       abireclaim_mask; // Bitmask of reclaimed abi-clobbered host registers to restore
     rvjit_reginfo_t regs[RVJIT_REGISTERS];
+#ifdef USER_FAULT_META
+    vector_t(rvjit_fault_t) faults;
+    uint8_t fault_regs[32];
+    uint8_t fault_ignore;
+    bool fault_active;
+#endif
 
 #ifdef RVJIT_NATIVE_FPU
     regmask_t       fpu_reg_mask;
@@ -164,6 +185,11 @@ typedef struct {
     bool    native_ptrs;
     uint8_t linkage;
 } rvjit_block_t;
+
+#ifdef USER_FAULT_META
+void rvjit_fault_record(rvjit_block_t* block, size_t length);
+const rvjit_fault_t* rvjit_fault_lookup(const rvjit_block_t* block, uintptr_t pc);
+#endif
 
 // Creates JIT context, sets upper limit on cache size
 bool rvjit_ctx_init(rvjit_block_t* block, size_t heap_size);

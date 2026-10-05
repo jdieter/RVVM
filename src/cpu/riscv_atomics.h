@@ -35,6 +35,89 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define RISCV_AMO_I64  0x03
 #define RISCV_AMO_I128 0x04
 
+#if defined(USER_FAULT_META) && defined(RISCV64)
+#define USER_AMO(bits) \
+static uint##bits##_t riscv_user_amo##bits(void* ptr, unsigned op, uint##bits##_t val, uint##bits##_t exp) \
+{ \
+    if (op == RISCV_AMO_CAS) return riscv_user_cas##bits(ptr, exp, val); \
+    uint##bits##_t old = riscv_user_fault_load##bits(ptr); \
+    for (;;) { \
+        uint##bits##_t next = val; \
+        switch (op) { \
+            case RISCV_AMO_ADD: next = old + val; break; \
+            case RISCV_AMO_AND: next = old & val; break; \
+            case RISCV_AMO_OR: next = old | val; break; \
+            case RISCV_AMO_XOR: next = old ^ val; break; \
+            case RISCV_AMO_MIN: next = (int##bits##_t)old < (int##bits##_t)val ? old : val; break; \
+            case RISCV_AMO_MAX: next = (int##bits##_t)old > (int##bits##_t)val ? old : val; break; \
+            case RISCV_AMO_MINU: next = old < val ? old : val; break; \
+            case RISCV_AMO_MAXU: next = old > val ? old : val; break; \
+        } \
+        uint##bits##_t found = riscv_user_cas##bits(ptr, old, next); \
+        if (found == old) return old; \
+        old = found; \
+    } \
+}
+USER_AMO(8)
+USER_AMO(16)
+USER_AMO(32)
+USER_AMO(64)
+#undef USER_AMO
+
+static void riscv_user_atomic(rvvm_hart_t* vm, uint32_t insn)
+{
+    unsigned op = insn >> 27, width = (insn >> 12) & 7;
+    unsigned rd = (insn >> 7) & 31, rs1 = (insn >> 15) & 31, rs2 = (insn >> 20) & 31;
+    uint64_t addr = riscv_read_reg(vm, rs1), val = riscv_read_reg(vm, rs2);
+    uint64_t exp = riscv_read_reg(vm, rd), old = 0;
+    if (width > 4 || !(0x1111113FU & (1U << op))
+        || (width < 2 && (op == RISCV_AMO_LR || op == RISCV_AMO_SC))
+        || (op == RISCV_AMO_LR && rs2)
+        || (width == 4 && (op != RISCV_AMO_CAS || ((rd | rs2) & 1)))) {
+        riscv_illegal_insn(vm, insn);
+        return;
+    }
+    if (addr & ((1U << width) - 1)) {
+        riscv_trap(vm, op == RISCV_AMO_LR ? RISCV_TRAP_LOAD_MISALIGN : RISCV_TRAP_STORE_MISALIGN, addr);
+        return;
+    }
+    void* ptr = (void*)(uintptr_t)addr;
+    // Release also orders LR and failed SC, which may execute no host RMW.
+    if (insn & (1U << 25)) __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (op == RISCV_AMO_LR) {
+        old = width == 2 ? riscv_user_fault_load32(ptr) : riscv_user_fault_load64(ptr);
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        vm->lrsc_addr = addr; vm->lrsc_cas = old; vm->lrsc = true;
+    } else if (op == RISCV_AMO_SC) {
+        bool ok = vm->lrsc && vm->lrsc_addr == addr;
+        if (ok) ok = width == 2
+            ? riscv_user_cas32(ptr, vm->lrsc_cas, val) == (uint32_t)vm->lrsc_cas
+            : riscv_user_cas64(ptr, vm->lrsc_cas, val) == vm->lrsc_cas;
+        vm->lrsc = false;
+        if (insn & (1U << 26)) __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        riscv_write_reg(vm, rd, !ok);
+        return;
+    } else if (width == 4) {
+        uint64_t expected[2] = {exp, rd ? riscv_read_reg(vm, rd + 1) : 0};
+        uint64_t value[2] = {val, rs2 ? riscv_read_reg(vm, rs2 + 1) : 0};
+        riscv_user_cas128(ptr, expected, value);
+        if (rd) { riscv_write_reg(vm, rd, expected[0]); riscv_write_reg(vm, rd + 1, expected[1]); }
+        return;
+    } else {
+        switch (width) {
+            case 0: old = riscv_user_amo8(ptr, op, val, exp); break;
+            case 1: old = riscv_user_amo16(ptr, op, val, exp); break;
+            case 2: old = riscv_user_amo32(ptr, op, val, exp); break;
+            case 3: old = riscv_user_amo64(ptr, op, val, exp); break;
+        }
+    }
+    if (width == 0) old = (int8_t)old;
+    if (width == 1) old = (int16_t)old;
+    if (width == 2) old = (int32_t)old;
+    riscv_write_reg(vm, rd, old);
+}
+#endif
+
 static forceinline void riscv_emulate_atomic_b(rvvm_hart_t* vm, const uint32_t insn)
 {
     const uint32_t op    = insn >> 27;
@@ -450,6 +533,12 @@ static forceinline void riscv_emulate_atomic_dwcas(rvvm_hart_t* vm, const uint32
 
 static slow_path func_opt_size void riscv_emulate_a_opc_amo(rvvm_hart_t* vm, const uint32_t insn)
 {
+#if defined(USER_FAULT_META) && defined(RISCV64)
+    if (vm->userland) {
+        riscv_user_atomic(vm, insn);
+        return;
+    }
+#endif
     switch (bit_ext_u32(insn, 12, 3)) {
         case RISCV_AMO_I8: // Zabha
             riscv_emulate_atomic_b(vm, insn);

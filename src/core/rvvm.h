@@ -194,6 +194,7 @@ typedef struct randomize_layout {
 
 struct align_cacheline rvvm_hart_t {
     uint32_t running;
+    uint32_t user_signal_pending;
 
     rvvm_uxlen_t registers[RISCV_REGS_MAX];
 
@@ -268,6 +269,11 @@ struct align_cacheline rvvm_hart_t {
     bool          jit_block_ends;
     bool          jit_skip_exec;
 #endif
+#ifdef USER_FAULT_POC
+    uint64_t user_fault_pc;
+    volatile uint32_t user_fault_interpreted;
+    uint32_t user_cache_flush;
+#endif
 
     // AIA register files for M/S modes
     rvvm_aia_regfile_t* aia;
@@ -316,5 +322,9 @@ struct randomize_layout rvvm_machine_t {
 };
 
 void rvvm_append_isa_string(rvvm_machine_t* machine, const char* str);
+
+void rvvm_user_fork_lock(void);
+void rvvm_user_fork_unlock(void);
+void rvvm_user_fork_child(rvvm_hart_t* thread);
 
 #endif

@@ -147,6 +147,10 @@ bool rvjit_ctx_init(rvjit_block_t* block, size_t size)
     hashmap_init(&block->heap.blocks, 64);
     hashmap_init(&block->heap.block_links, 64);
     vector_init(block->links);
+#ifdef USER_FAULT_META
+    vector_init(block->faults);
+    vector_init(block->heap.faults);
+#endif
     return true;
 }
 
@@ -182,6 +186,10 @@ void rvjit_ctx_free(rvjit_block_t* block)
     hashmap_destroy(&block->heap.blocks);
     hashmap_destroy(&block->heap.block_links);
     vector_free(block->links);
+#ifdef USER_FAULT_META
+    vector_free(block->faults);
+    vector_free(block->heap.faults);
+#endif
     free(block->code);
     free(block->heap.dirty_pages);
     free(block->heap.jited_pages);
@@ -230,6 +238,10 @@ static inline bool rvjit_page_needs_flush(rvjit_block_t* block, rvjit_addr_t add
 
 void rvjit_block_init(rvjit_block_t* block)
 {
+#ifdef USER_FAULT_META
+    vector_clear(block->faults);
+    block->fault_active = false;
+#endif
     block->size    = 0;
     block->linkage = LINKAGE_JMP;
     vector_clear(block->links);
@@ -253,6 +265,14 @@ rvjit_func_t rvjit_block_finalize(rvjit_block_t* block)
 #endif
 
     memcpy(dest, block->code, block->size);
+#ifdef USER_FAULT_META
+    vector_foreach(block->faults, i) {
+        rvjit_fault_t entry = vector_at(block->faults, i);
+        entry.start += block->heap.curr;
+        entry.end += block->heap.curr;
+        vector_push_back(block->heap.faults, entry);
+    }
+#endif
     block->heap.curr += block->size;
 
     hashmap_put(&block->heap.blocks, block->phys_pc, (size_t)code);
@@ -319,6 +339,9 @@ rvjit_func_t rvjit_block_lookup(rvjit_block_t* block, rvjit_addr_t phys_pc)
 
 void rvjit_flush_cache(rvjit_block_t* block)
 {
+#ifdef USER_FAULT_META
+    vector_clear(block->heap.faults);
+#endif
     if (block->heap.curr > 0x10000) {
         // Deallocate the physical memory used for RWX JIT cache
         // This reduces average memory usage since the cache is never full
@@ -338,3 +361,20 @@ void rvjit_flush_cache(rvjit_block_t* block)
 
     rvjit_block_init(block);
 }
+
+#ifdef USER_FAULT_META
+const rvjit_fault_t* rvjit_fault_lookup(const rvjit_block_t* block, uintptr_t pc)
+{
+    uintptr_t offset = pc - (uintptr_t)block->heap.code;
+    if (offset >= block->heap.curr) return NULL;
+    size_t low = 0, high = vector_size(block->heap.faults);
+    while (low < high) {
+        size_t mid = low + (high - low) / 2;
+        const rvjit_fault_t* entry = &vector_at(block->heap.faults, mid);
+        if (offset < entry->start) high = mid;
+        else if (offset >= entry->end) low = mid + 1;
+        else return entry;
+    }
+    return NULL;
+}
+#endif

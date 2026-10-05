@@ -32,6 +32,10 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 #define RISCV_MMU_DEBUG_ACCESS (RISCV_MMU_READ | RISCV_MMU_EXEC | RISCV_MMU_WRITE)
 
+#ifdef USER_FAULT_META
+bool (*riscv_user_exec_check)(rvvm_addr_t);
+#endif
+
 bool riscv_init_ram(rvvm_ram_t* mem, rvvm_addr_t base_addr, size_t size)
 {
     // Memory boundaries should be always aligned to page size
@@ -498,6 +502,45 @@ cold_path void* riscv_mmu_op_internal(rvvm_hart_t* vm, rvvm_addr_t vaddr, void* 
     uint8_t access = attr & 0xFF;
     uint8_t mmu_access = access;
     size_t size = attr >> 16;
+
+#ifdef USER_FAULT_META
+    if (vm->userland && access == RISCV_MMU_EXEC && (vaddr & 1)) {
+        riscv_mmu_misalign(vm, vaddr, attr);
+        return NULL;
+    }
+    if (vm->userland && access == RISCV_MMU_EXEC && riscv_user_exec_check
+        && !riscv_user_exec_check(vaddr)) {
+        riscv_mmu_pagefault(vm, vaddr, attr);
+        return NULL;
+    }
+    if (vm->userland && !(attr & RISCV_MMU_ATTR_PHYS)) {
+        void* ptr = (void*)(uintptr_t)vaddr;
+        if (attr & RISCV_MMU_ATTR_PTR) return ptr;
+        /* Guest unaligned accesses use one native instruction where possible.
+         * A host page fault then precedes the store, including across pages. */
+        if (access == RISCV_MMU_WRITE) {
+            switch (size) {
+                case 1: riscv_guest_store8(ptr, read_uint8(data)); break;
+                case 2: riscv_guest_store16(ptr, read_uint16_le_m(data)); break;
+                case 4: riscv_guest_store32(ptr, read_uint32_le_m(data)); break;
+                case 8: riscv_guest_store64(ptr, read_uint64_le_m(data)); break;
+                default:
+                    for (size_t i = 0; i < size; ++i) riscv_guest_store8((uint8_t*)ptr + i, ((uint8_t*)data)[i]);
+            }
+        } else {
+            switch (size) {
+                case 1: write_uint8(data, riscv_guest_load8(ptr)); break;
+                case 2: write_uint16_le_m(data, riscv_guest_load16(ptr)); break;
+                case 4: write_uint32_le_m(data, riscv_guest_load32(ptr)); break;
+                case 8: write_uint64_le_m(data, riscv_guest_load64(ptr)); break;
+                default:
+                    for (size_t i = 0; i < size; ++i) ((uint8_t*)data)[i] = riscv_guest_load8((uint8_t*)ptr + i);
+            }
+        }
+        riscv_tlb_put(vm, vaddr, ptr, access);
+        return ptr;
+    }
+#endif
 
     if (unlikely(!riscv_block_in_page(vaddr, size))) {
         if (attr & RISCV_MMU_ATTR_PTR) {
