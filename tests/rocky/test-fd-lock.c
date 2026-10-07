@@ -26,6 +26,8 @@ static long errno_ret(long ret) { return ret == -1 ? -errno : ret; }
 static void user_ptrace_set_exe_fd_pointer(uint32_t* fd) { (void)fd; }
 #include "core/rvvm_user_fd_table.h"
 #define user_exe_fd ((int)atomic_load_uint32_relax(&user_fd_table()->exe_fd))
+#define user_vm_fd ((int)atomic_load_uint32_relax(&user_fd_table()->vm_fd))
+static bool user_private_fd(int fd) { return fd >= 0 && (fd == user_exe_fd || fd == user_vm_fd); }
 #define user_exe_fd_value (user_fd_table()->exe_fd)
 #define user_exe_lock (user_fd_table()->lock)
 #define user_exe_descriptor (user_fd_table()->descriptor)

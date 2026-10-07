@@ -21,8 +21,8 @@ _start:
     bne t1, t2, fail
     addi s0, s0, 4
     bne s0, s1, 1b
-    /* Ignored IO/DETACHED flags and vfork use the ordinary fork path. */
-    li a0, 0x80404111
+    /* Ignored IO/DETACHED flags must preserve ordinary fork isolation. */
+    li a0, 0x80400011
     la a1, child_stack_end
     li a2, 0
     li a3, 0

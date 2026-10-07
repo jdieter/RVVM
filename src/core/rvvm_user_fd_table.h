@@ -19,6 +19,8 @@ struct user_fd_relocation {
 
 typedef struct {
     uint32_t exe_fd;
+    uint32_t vm_fd;
+    bool vm_service;
     uint32_t refs;
     user_fd_mutex_t lock;
     user_fd_guard_t* guard;
@@ -27,7 +29,7 @@ typedef struct {
     char descriptor[64];
 } user_fd_table_t;
 
-static user_fd_table_t user_fd_initial = {.exe_fd = UINT32_MAX, .refs = 1};
+static user_fd_table_t user_fd_initial = {.exe_fd = UINT32_MAX, .vm_fd = UINT32_MAX, .refs = 1};
 static __thread user_fd_table_t* user_fd_current;
 
 typedef struct user_fd_owner {
@@ -140,6 +142,8 @@ static long user_fd_table_unshare(unsigned long flags, bool range)
         // Keep the active guard through unshare and its caller's unlock.
         next->guard = user_fd_guard_retain(old->guard);
         next->exe_fd = atomic_load_uint32_relax(&old->exe_fd);
+        next->vm_fd = atomic_load_uint32_relax(&old->vm_fd);
+        next->vm_service = old->vm_service;
         memcpy(next->descriptor, old->descriptor, sizeof(next->descriptor));
     }
     long ret = range ? syscall(SYS_close_range, UINT32_MAX, UINT32_MAX, 2)
@@ -167,16 +171,19 @@ static long user_fd_close_range(unsigned first, unsigned last, unsigned flags)
     long ret = 0;
     if (flags & 2) ret = user_fd_table_unshare(CLONE_FILES, true);
     if (!ret) {
-        unsigned pin = atomic_load_uint32_relax(&user_fd_table()->exe_fd);
+        unsigned pins[2] = {atomic_load_uint32_relax(&user_fd_table()->exe_fd),
+                            atomic_load_uint32_relax(&user_fd_table()->vm_fd)};
+        if (pins[1] < pins[0]) { unsigned swap = pins[0]; pins[0] = pins[1]; pins[1] = swap; }
         flags &= ~2U;
         // The pin is always CLOEXEC, including when the guest asks to mark a
         // range. Do not let guest close_range invalidate proc/exe emulation.
-        if (pin < first || pin > last || pin == UINT32_MAX)
-            ret = errno_ret(syscall(SYS_close_range, first, last, flags));
-        else {
+        for (unsigned i = 0; !ret && i < 2; ++i) {
+            unsigned pin = pins[i];
+            if (pin < first || pin > last || pin == UINT32_MAX) continue;
             if (first < pin) ret = errno_ret(syscall(SYS_close_range, first, pin - 1, flags));
-            if (!ret && pin < last) ret = errno_ret(syscall(SYS_close_range, pin + 1, last, flags));
+            first = pin + 1;
         }
+        if (!ret && first <= last) ret = errno_ret(syscall(SYS_close_range, first, last, flags));
     }
     user_fd_unlock();
     return ret;

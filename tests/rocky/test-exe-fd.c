@@ -17,6 +17,10 @@
 static atomic_int pin_value;
 #define user_exe_fd atomic_load(&pin_value)
 #define user_exe_fd_value pin_value
+static struct { uint32_t vm_fd; } test_table = {.vm_fd = UINT32_MAX};
+#define user_vm_fd ((int)test_table.vm_fd)
+#define user_fd_table() (&test_table)
+static bool user_private_fd(int fd) { return fd >= 0 && (fd == user_exe_fd || fd == user_vm_fd); }
 static char user_exe_descriptor[64];
 struct user_fd_wait { struct user_fd_wait* next; int fd, placeholder; pid_t tid; };
 static struct user_fd_wait* user_exe_waits;
@@ -180,6 +184,23 @@ int main(void)
     assert((long)result == -EBADF && fcntl(moved, F_GETFD) == FD_CLOEXEC);
     paused_fd = -1;
     assert(!close(moved) && !close(original) && !close(source));
+    /* Replacing the guest-visible number must preserve the private VM
+     * completion channel and its CLOEXEC lifetime. */
+    int channel[2];
+    assert(!pipe2(channel, O_CLOEXEC));
+    source = open("/dev/null", O_RDONLY);
+    assert(source >= 0);
+    test_table.vm_fd = channel[0];
+    assert(user_exe_close(channel[0]) == -EBADF);
+    assert(user_exe_dup(channel[0]) == -EBADF);
+    assert(user_exe_fcntl(channel[0], F_GETFD, 0) == -EBADF);
+    assert(user_exe_dup3(source, channel[0], 0) == channel[0]);
+    assert(user_vm_fd != channel[0] && fcntl(user_vm_fd, F_GETFD) == FD_CLOEXEC);
+    assert(write(channel[1], "x", 1) == 1);
+    char byte;
+    assert(read(user_vm_fd, &byte, 1) == 1 && byte == 'x');
+    assert(!close(user_vm_fd) && !close(channel[0]) && !close(channel[1]) && !close(source));
+    test_table.vm_fd = UINT32_MAX;
     test_waiting_file_lock();
     puts("PASS closed dup3 source, concurrent pin close/fcntl and private dup");
 }

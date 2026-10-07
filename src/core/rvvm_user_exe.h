@@ -7,6 +7,8 @@
 #include "rvvm_user_fd_table.h"
 #define user_exe_fd_value (user_fd_table()->exe_fd)
 #define user_exe_fd ((int)atomic_load_uint32_relax(&user_exe_fd_value))
+#define user_vm_fd ((int)atomic_load_uint32_relax(&user_fd_table()->vm_fd))
+static bool user_private_fd(int fd) { return fd >= 0 && (fd == user_exe_fd || fd == user_vm_fd); }
 #define user_exe_descriptor (user_fd_table()->descriptor)
 static struct stat user_host_exe;
 static struct stat user_host_exe_link;
@@ -133,9 +135,10 @@ static long user_exe_getdents(int fd, void* guest, size_t size)
     size = (unsigned int)size; // getdents64's count is 32-bit even on RV64.
     user_fd_table_t* table = user_exe_fd_directory(fd);
     if (!table) return errno_ret(syscall(SYS_getdents64, fd, guest, size));
-    char buffer[4096], hidden[16];
+    char buffer[4096], hidden[16], control[16];
     user_fd_mutex_lock(&table->lock);
     snprintf(hidden, sizeof(hidden), "%d", (int)atomic_load_uint32_relax(&table->exe_fd));
+    snprintf(control, sizeof(control), "%d", (int)atomic_load_uint32_relax(&table->vm_fd));
     long result;
     do {
         result = errno_ret(syscall(SYS_getdents64, fd, buffer, size < sizeof(buffer) ? size : sizeof(buffer)));
@@ -144,7 +147,8 @@ static long user_exe_getdents(int fd, void* guest, size_t size)
         for (size_t pos = 0; pos < (size_t)result;) {
             struct uapi_linux_dirent64* entry = (void*)(buffer + pos);
             size_t length = entry->d_reclen;
-            if (strcmp(entry->d_name, hidden)) {
+            bool dot = entry->d_name[0] == '.';
+            if ((dot || !table->vm_service) && strcmp(entry->d_name, hidden) && strcmp(entry->d_name, control)) {
                 memmove(buffer + kept, entry, length);
                 kept += length;
             }

@@ -31,9 +31,8 @@ _start:
     bne a0, s0, fail
     la t0, status
     lw t1, 0(t0)
-    beqz t1, 2f
-    srli a0, t1, 8
-    j group_exit
+    li t2, 7 << 8
+    bne t1, t2, fail
 2:
     li s5, 3
     la t0, hits
@@ -114,6 +113,27 @@ worker:
     li a1, 0
     li a7, 101
     ecall
+    /* The process leader is gone, but this thread's mm still exists. */
+    li s5, 12
+    li a0, 0x4111
+    la a1, vfork_stack_end
+    li a2, 0
+    li a3, 0
+    li a4, 0
+    li a7, 220
+    ecall
+    beqz a0, spawn_child
+    bltz a0, fail
+    la t0, spawn_error
+    ld t1, 0(t0)
+    li t2, -2
+    bne t1, t2, fail
+    la a1, status
+    li a2, 0
+    li a3, 0
+    li a7, 260
+    ecall
+    bltz a0, fail
     li a0, 10
     la a1, thread_action
     la a2, old_action
@@ -140,6 +160,17 @@ worker:
     lw t1, 0(t0)
     li t2, 10
     bne t1, t2, fail
+    li a0, 7
+    li a7, 93
+    ecall
+spawn_child:
+    la a0, missing
+    la a1, missing_arguments
+    li a2, 0
+    li a7, 221
+    ecall
+    la t0, spawn_error
+    sd a0, 0(t0)
     li a0, 0
     li a7, 93
     ecall
@@ -166,6 +197,9 @@ parent_action: .dword parent_handler, 0, 0
 child_action: .dword child_handler, 0, 0
 thread_action: .dword thread_handler, 0, 0
 delay: .dword 0, 20000000
+spawn_error: .dword 0
+missing_arguments: .dword missing, 0
+missing: .asciz "/rvvm-vfork-definitely-missing"
 .section .bss
 .balign 16
 old_action: .skip 24
@@ -179,3 +213,5 @@ child_stack: .skip 65536
 child_stack_end:
 thread_stack: .skip 65536
 thread_stack_end:
+vfork_stack: .skip 65536
+vfork_stack_end:

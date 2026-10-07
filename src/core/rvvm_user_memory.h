@@ -57,38 +57,52 @@ static bool user_exec_stack(const elf_desc_t* elf)
     return false;
 }
 
-static rvvm_addr_t user_mremap(uintptr_t addr, size_t oldsize, size_t newsize, int flags, uintptr_t newaddr)
+struct user_exec_move {
+    vector_t(struct user_exec_range) ranges;
+    bool executable_tail;
+};
+
+static void user_exec_move_prepare(struct user_exec_move* move, uintptr_t addr, size_t oldsize, size_t newsize)
 {
-    user_fd_lock();
-    spin_lock(&mmap_lock);
-    vector_t(struct user_exec_range) saved = ZERO_INIT;
     size_t span = oldsize ? oldsize : newsize;
-    bool executable_tail = false;
     vector_foreach(user_exec_ranges, i) {
         struct user_exec_range r = vector_at(user_exec_ranges, i);
         if (span && span <= UINTPTR_MAX - addr) {
             uintptr_t end = addr + span;
-            if (end > r.start && end <= r.end) executable_tail = true;
+            if (end > r.start && end <= r.end) move->executable_tail = true;
             if (r.end > addr && r.start < end) {
                 r.start = EVAL_MAX(r.start, addr) - addr;
                 r.end = EVAL_MIN(r.end, end) - addr;
-                vector_push_back(saved, r);
+                vector_push_back(move->ranges, r);
             }
         }
     }
-    rvvm_addr_t ret = errno_ret((uintptr_t)user_vma_remap((void*)addr, oldsize, newsize, flags, (void*)newaddr));
-    if (ret < (rvvm_addr_t)-4095) {
+}
+
+static void user_exec_move_apply(struct user_exec_move* move, uintptr_t addr, size_t oldsize,
+                                  size_t newsize, int flags, uintptr_t ret)
+{
+    size_t span = oldsize ? oldsize : newsize;
         if (!(flags & MREMAP_DONTUNMAP)) user_exec_update(addr, oldsize, false);
         else rvvm_flush_icache(userland, addr, oldsize);
         user_exec_update(ret, newsize, false);
-        vector_foreach(saved, i) {
-            struct user_exec_range r = vector_at(saved, i);
+        vector_foreach(move->ranges, i) {
+            struct user_exec_range r = vector_at(move->ranges, i);
             if (r.start < newsize)
                 user_exec_update(ret + r.start, EVAL_MIN(r.end, newsize) - r.start, true);
         }
-        if (newsize > span && executable_tail) user_exec_update(ret + span, newsize - span, true);
-    }
-    vector_free(saved);
+        if (newsize > span && move->executable_tail) user_exec_update(ret + span, newsize - span, true);
+}
+
+static rvvm_addr_t user_mremap(uintptr_t addr, size_t oldsize, size_t newsize, int flags, uintptr_t newaddr)
+{
+    user_fd_lock();
+    spin_lock(&mmap_lock);
+    struct user_exec_move move = ZERO_INIT;
+    user_exec_move_prepare(&move, addr, oldsize, newsize);
+    rvvm_addr_t ret = errno_ret((uintptr_t)user_vma_remap((void*)addr, oldsize, newsize, flags, (void*)newaddr));
+    if (ret < (rvvm_addr_t)-4095) user_exec_move_apply(&move, addr, oldsize, newsize, flags, ret);
+    vector_free(move.ranges);
     spin_unlock(&mmap_lock);
     user_fd_unlock();
     return ret;

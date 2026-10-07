@@ -181,7 +181,11 @@ static long user_safe_syscall(long nr, long a, long b, long c, long d, long e, l
         else if (nr == SYS_pselect6) { select_mask.set = &host_mask; f = (long)&select_mask; }
         else e = (long)&host_mask;
     }
-    long ret = user_safe_raw(&user_sig.pending, nr, a, b, c, d, e, f);
+    long ret;
+    do {
+        user_vm_private_wake = false;
+        ret = user_safe_raw(&user_sig.pending, nr, a, b, c, d, e, f);
+    } while (ret == -EINTR && user_vm_private_wake && !user_sig.pending);
     if (ret == -512) {
         // No host syscall ran: resume its guest instruction after the handler,
         // regardless of SA_RESTART. Never expose this private result to Linux.

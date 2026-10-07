@@ -276,6 +276,19 @@ void rvvm_thread_join(rvvm_thread_t* thread)
 #endif
 }
 
+bool rvvm_thread_try_join(rvvm_thread_t* thread)
+{
+#if defined(POSIX_THREADS_IMPL) && defined(__linux__)
+    if (thread && !pthread_tryjoin_np(thread->pthread, NULL)) {
+        safe_free(thread);
+        return true;
+    }
+#else
+    UNUSED(thread);
+#endif
+    return false;
+}
+
 void rvvm_thread_detach(rvvm_thread_t* thread)
 {
     if (thread) {

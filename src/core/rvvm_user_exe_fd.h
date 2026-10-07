@@ -104,7 +104,22 @@ static long user_exe_dup3(int oldfd, int newfd, unsigned flags)
     user_fd_lock();
     user_fd_mutex_lock(&user_exe_lock);
     long ret;
-    if (oldfd == user_exe_fd) ret = -EBADF;
+    if (user_private_fd(oldfd)) ret = -EBADF;
+    else if (newfd == user_vm_fd) {
+        struct rlimit limit;
+        if (fcntl(oldfd, F_GETFD) < 0 || getrlimit(RLIMIT_NOFILE, &limit)
+            || (unsigned)newfd >= limit.rlim_cur) {
+            ret = -EBADF;
+            goto out;
+        }
+        int moved = fcntl(user_vm_fd, F_DUPFD_CLOEXEC, 0);
+        if (moved < 0) ret = -errno;
+        else {
+            ret = errno_ret(syscall(SYS_dup3, oldfd, newfd, flags));
+            if (ret < 0) close(moved);
+            else atomic_store_uint32_relax(&user_fd_table()->vm_fd, moved);
+        }
+    }
     else if (newfd != user_exe_fd) ret = errno_ret(syscall(SYS_dup3, oldfd, newfd, flags));
     else {
         struct rlimit limit;
@@ -141,7 +156,7 @@ static long user_exe_fcntl(int fd, int cmd, unsigned long arg)
         wait->placeholder = -1;
         wait->tid = syscall(SYS_gettid);
         user_fd_mutex_lock(&user_exe_lock);
-        if (fd == user_exe_fd || fcntl(fd, F_GETFD) < 0) {
+        if (user_private_fd(fd) || fcntl(fd, F_GETFD) < 0) {
             user_fd_mutex_unlock(&user_exe_lock);
             user_fd_unlock();
             free(wait);
@@ -162,7 +177,7 @@ static long user_exe_fcntl(int fd, int cmd, unsigned long arg)
         free(wait);
         return ret;
     }
-    long ret = fd == user_exe_fd ? -EBADF : errno_ret(USER_SYSCALL(SYS_fcntl, fd, cmd, arg, 0, 0, 0));
+    long ret = user_private_fd(fd) ? -EBADF : errno_ret(USER_SYSCALL(SYS_fcntl, fd, cmd, arg, 0, 0, 0));
     user_fd_unlock();
     return ret;
 }
@@ -170,7 +185,7 @@ static long user_exe_fcntl(int fd, int cmd, unsigned long arg)
 static long user_exe_dup(int fd)
 {
     user_fd_lock();
-    long ret = fd == user_exe_fd ? -EBADF : errno_ret(dup(fd));
+    long ret = user_private_fd(fd) ? -EBADF : errno_ret(dup(fd));
     user_fd_unlock();
     return ret;
 }
@@ -179,7 +194,7 @@ static long user_exe_close(int fd)
 {
     user_fd_lock();
     user_fd_mutex_lock(&user_exe_lock);
-    long ret = fd == user_exe_fd ? -EBADF : (long)errno_ret(close(fd));
+    long ret = user_private_fd(fd) ? -EBADF : (long)errno_ret(close(fd));
     user_fd_mutex_unlock(&user_exe_lock);
     user_fd_unlock();
     return ret;

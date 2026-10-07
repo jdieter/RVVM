@@ -26,6 +26,7 @@ typedef void* (*rvvm_thread_func_t)(void*);
 rvvm_thread_t* rvvm_thread_create_ex(rvvm_thread_func_t func, void* arg, uint32_t stack_size);
 rvvm_thread_t* rvvm_thread_create(rvvm_thread_func_t func, void* arg);
 void           rvvm_thread_join(rvvm_thread_t* thread);
+bool           rvvm_thread_try_join(rvvm_thread_t* thread);
 void           rvvm_thread_detach(rvvm_thread_t* thread);
 
 /*
