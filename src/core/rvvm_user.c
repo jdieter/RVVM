@@ -3165,6 +3165,7 @@ static char* rvvm_user_init_stack(void* stack, exec_desc_t* desc)
     stack = (char*)align_size_down((size_t)stack, 16);
 
     // 3. auxv, then null
+    // Omit optional platform strings: LD_SHOW_AUXV dereferences present entries.
     uapi_size_t auxv[] = {
         // TODO: UAPI_AT_EXECFD
         UAPI_AT_PHDR,          desc->phdr,
@@ -3178,11 +3179,9 @@ static char* rvvm_user_init_stack(void* stack, exec_desc_t* desc)
         UAPI_AT_EUID,          getuid(),
         UAPI_AT_GID,           getgid(),
         UAPI_AT_EGID,          getgid(),
-        UAPI_AT_PLATFORM,      0,
         UAPI_AT_HWCAP,         USER_CPU_HWCAP,
         UAPI_AT_CLKTCK,        100,
         UAPI_AT_SECURE,        0,
-        UAPI_AT_BASE_PLATFORM, 0,
         UAPI_AT_RANDOM,        (size_t)random_bytes,
         UAPI_AT_EXECFN,        (size_t)execfn,
         UAPI_AT_NULL,          0,
