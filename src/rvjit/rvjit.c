@@ -202,6 +202,21 @@ bool rvjit_ctx_init(rvjit_block_t* block, size_t size)
     return true;
 }
 
+void rvjit_set_native_ptrs(rvjit_block_t* block, bool native_ptrs)
+{
+#if defined(USER_FAULT_META) && defined(RVVM_USER_TEST)
+    if (native_ptrs && !block->native_ptrs) {
+        /* Allocate userspace lookup/fault tables before guest limits tighten.
+         * Recycle the code cache instead of growing these tables afterward. */
+        vector_emplace(block->heap.faults, RVJIT_USER_FAULT_CAPACITY - 1);
+        vector_clear(block->heap.faults);
+        hashmap_reserve(&block->heap.blocks, RVJIT_USER_FAULT_CAPACITY * 2);
+        hashmap_reserve(&block->heap.block_links, RVJIT_USER_FAULT_CAPACITY * 2);
+    }
+#endif
+    block->native_ptrs = native_ptrs;
+}
+
 void rvjit_init_memtracking(rvjit_block_t* block, size_t size)
 {
     // Each dirty page is marked in atomic bitmask
@@ -210,6 +225,37 @@ void rvjit_init_memtracking(rvjit_block_t* block, size_t size)
     block->heap.dirty_mask  = bit_next_pow2((size + 0x1FFFF) >> 17) - 1;
     block->heap.dirty_pages = safe_new_arr(uint32_t, block->heap.dirty_mask + 1);
     block->heap.jited_pages = safe_new_arr(uint32_t, block->heap.dirty_mask + 1);
+}
+
+static void rvjit_clear_lookup(rvjit_block_t* block, hashmap_t* map)
+{
+#if defined(USER_FAULT_META) && defined(RVVM_USER_TEST)
+    if (block->native_ptrs) {
+        if (map->data) memset(map->data, 0, hashmap_used_mem(map));
+        map->count = 0;
+        return;
+    }
+#else
+    UNUSED(block);
+#endif
+    hashmap_clear(map);
+}
+
+/* Optional deferred links must remain optional under guest memory limits.
+ * Match the hashmap's probe budget without triggering allocator growth. */
+static bool rvjit_lookup_put(hashmap_t* map, size_t key, size_t value)
+{
+    size_t hash = hashmap_hash(key);
+    for (size_t i = 0; map->data && i < 256 && i <= map->mask; ++i) {
+        hashmap_cell_t* cell = &map->data[(hash + i) & map->mask];
+        if (!cell->val || cell->key == key) {
+            if (!cell->val) map->count++;
+            cell->key = key;
+            cell->val = (void*)value;
+            return true;
+        }
+    }
+    return false;
 }
 
 static void rvjit_linker_cleanup(rvjit_block_t* block)
@@ -221,7 +267,7 @@ static void rvjit_linker_cleanup(rvjit_block_t* block)
         vector_free(*linked_blocks);
         free(linked_blocks);
     }
-    hashmap_clear(&block->heap.block_links);
+    rvjit_clear_lookup(block, &block->heap.block_links);
 }
 
 void rvjit_ctx_free(rvjit_block_t* block)
@@ -313,6 +359,12 @@ rvjit_func_t rvjit_block_finalize(rvjit_block_t* block)
         // The cache is full
         return NULL;
     }
+#if defined(USER_FAULT_META) && defined(RVVM_USER_TEST)
+    if (block->native_ptrs && vector_size(block->faults) > vector_capacity(block->heap.faults) - vector_size(block->heap.faults))
+        return NULL;
+    if (block->native_ptrs && (hashmap_size(&block->heap.blocks) + 1) * 2
+        > hashmap_capacity(&block->heap.blocks)) return NULL;
+#endif
 
 #ifdef RVJIT_APPLE_SILICON
     pthread_jit_write_protect_np(false);
@@ -330,8 +382,15 @@ rvjit_func_t rvjit_block_finalize(rvjit_block_t* block)
     block->heap.curr += block->size;
 
     // Bound lookup collision chains without work in the execution path.
-    hashmap_reserve(&block->heap.blocks, (hashmap_size(&block->heap.blocks) + 1) * 2);
-    hashmap_put(&block->heap.blocks, block->phys_pc, (size_t)code);
+#if defined(USER_FAULT_META) && defined(RVVM_USER_TEST)
+    if (block->native_ptrs) {
+        if (!rvjit_lookup_put(&block->heap.blocks, block->phys_pc, (size_t)code)) return NULL;
+    } else
+#endif
+    {
+        hashmap_reserve(&block->heap.blocks, (hashmap_size(&block->heap.blocks) + 1) * 2);
+        hashmap_put(&block->heap.blocks, block->phys_pc, (size_t)code);
+    }
 
 #ifdef RVJIT_NATIVE_LINKER
     vector_t(uint8_t*)* linked_blocks = NULL;
@@ -339,6 +398,27 @@ rvjit_func_t rvjit_block_finalize(rvjit_block_t* block)
         rvjit_addr_t k = vector_at(block->links, i).dest;
         size_t       v = vector_at(block->links, i).ptr;
         linked_blocks  = (void*)hashmap_get(&block->heap.block_links, k);
+#if defined(USER_FAULT_META) && defined(RVVM_USER_TEST)
+        if (block->native_ptrs) {
+            if (!linked_blocks) {
+                linked_blocks = calloc(1, sizeof(*linked_blocks));
+                if (!linked_blocks) continue;
+                if (!rvjit_lookup_put(&block->heap.block_links, k, (size_t)linked_blocks)) {
+                    free(linked_blocks);
+                    continue;
+                }
+            }
+            if (vector_size(*linked_blocks) == vector_capacity(*linked_blocks)) {
+                size_t capacity = vector_capacity(*linked_blocks) * 2 + 1;
+                void* grown = realloc(linked_blocks->data, capacity * sizeof(*linked_blocks->data));
+                if (!grown) continue;
+                linked_blocks->data = grown;
+                linked_blocks->size = capacity;
+            }
+            vector_push_back(*linked_blocks, (uint8_t*)v);
+            continue;
+        }
+#endif
         if (!linked_blocks) {
             linked_blocks = safe_calloc(1, sizeof(vector_t(uint8_t*)));
             vector_init(*linked_blocks);
@@ -356,9 +436,15 @@ rvjit_func_t rvjit_block_finalize(rvjit_block_t* block)
             rvjit_flush_icache(jptr, 8);
 #endif
         }
-        vector_free(*linked_blocks);
-        free(linked_blocks);
-        hashmap_remove(&block->heap.block_links, block->phys_pc);
+#if defined(USER_FAULT_META) && defined(RVVM_USER_TEST)
+        if (block->native_ptrs) vector_clear(*linked_blocks);
+        else
+#endif
+        {
+            vector_free(*linked_blocks);
+            free(linked_blocks);
+            hashmap_remove(&block->heap.block_links, block->phys_pc);
+        }
     }
 #endif
 
@@ -376,6 +462,14 @@ rvjit_func_t rvjit_block_finalize(rvjit_block_t* block)
 rvjit_func_t rvjit_block_lookup(rvjit_block_t* block, rvjit_addr_t phys_pc)
 {
     if (unlikely(rvjit_page_needs_flush(block, phys_pc))) {
+#if defined(USER_FAULT_META) && defined(RVVM_USER_TEST)
+        /* Per-entry removal may shrink/reallocate the lookup table. Retain
+         * its startup allocation when guest memory limits are exhausted. */
+        if (block->native_ptrs) {
+            rvjit_flush_cache(block);
+            return NULL;
+        }
+#endif
         vector_t(uint8_t*)* linked_blocks;
         phys_pc &= ~0xFFFULL;
 
@@ -404,7 +498,7 @@ void rvjit_flush_cache(rvjit_block_t* block)
         vma_clean(block->heap.data, block->heap.size, true);
     }
 
-    hashmap_clear(&block->heap.blocks);
+    rvjit_clear_lookup(block, &block->heap.blocks);
     block->heap.curr = 0;
 
     rvjit_linker_cleanup(block);

@@ -147,11 +147,22 @@ static void user_vm_serve(struct user_vm* vm, int socket)
             goto reply;
         }
         if (request.nr == 214 && brk_heap.base && a[0] >= brk_heap.base
-            && a[0] - brk_heap.base <= UAPI_BRK_RESERVE) {
+            && a[0] - brk_heap.base <= UAPI_BRK_WINDOW) {
             uintptr_t next = (a[0] + vm->page - 1) & ~(vm->page - 1);
             if (user_vm_split(vm, brk_heap.committed) || user_vm_split(vm, next)) {
-                request.result = -errno;
-                goto reply;
+                request.result = brk_heap.current;
+                goto heap_reply;
+            }
+            if (next > brk_heap.committed) {
+                if (user_vm_region_prepare(vm, &added, next - brk_heap.committed,
+                                           PROT_READ | PROT_WRITE,
+                                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)) {
+                    request.result = brk_heap.current;
+                    goto heap_reply;
+                }
+                void* grown = realloc(vm->regions, (vm->count + 1) * sizeof(*vm->regions));
+                if (!grown) { request.result = brk_heap.current; goto heap_reply; }
+                vm->regions = grown;
             }
         }
         if ((request.nr == 215 || request.nr == 226)
@@ -239,18 +250,24 @@ static void user_vm_serve(struct user_vm* vm, int socket)
             case 214: {
                 uintptr_t old = brk_heap.committed;
                 if (!brk_heap.base) break;
-                request.result = uapi_brk(&brk_heap, a[0]);
-                request.heap[0] = brk_heap.base;
-                request.heap[1] = brk_heap.current;
-                request.heap[2] = brk_heap.committed;
-                request.heap[3] = brk_heap.page_size;
-                if (old < brk_heap.committed)
-                    user_vm_alias_protect(vm, old, brk_heap.committed - old, PROT_READ | PROT_WRITE);
-                else if (old > brk_heap.committed) {
-                    user_vm_alias_protect(vm, brk_heap.committed, old - brk_heap.committed, PROT_NONE);
-                    if (user_vm_discard_pages(vm, brk_heap.committed, old - brk_heap.committed))
-                        rvvm_fatal("Cannot discard shared guest heap");
-                }
+                if (added.original) {
+                    void* address = user_vma_map_raw((void*)old, added.size, added.prot,
+                                                    MAP_SHARED | MAP_FIXED_NOREPLACE,
+                                                    added.backing, 0);
+                    request.result = brk_heap.current;
+                    if (address != MAP_FAILED) {
+                        user_vma_remember(old, added.size);
+                        added.address = old;
+                        vm->regions[vm->count++] = added;
+                        appended = true;
+                        response_fd = added.backing;
+                        brk_heap.committed = old + added.size;
+                        brk_heap.current = a[0];
+                        request.result = a[0];
+                    }
+                } else request.result = uapi_brk(&brk_heap, a[0]);
+                if (old > brk_heap.committed)
+                    user_vm_remove(vm, brk_heap.committed, old - brk_heap.committed);
                 break;
             }
             case 215:
@@ -334,6 +351,13 @@ static void user_vm_serve(struct user_vm* vm, int socket)
 #endif
         spin_unlock(&mmap_lock);
         spin_unlock(&brk_lock);
+heap_reply:
+        if (request.nr == 214) {
+            request.heap[0] = brk_heap.base;
+            request.heap[1] = brk_heap.current;
+            request.heap[2] = brk_heap.committed;
+            request.heap[3] = brk_heap.page_size;
+        }
 reply:
 #ifdef USER_FAULT_META
         vector_free(execution.ranges);
@@ -371,8 +395,10 @@ static long user_vm_rpc(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2,
         switch (nr) {
             case 214: {
                 uintptr_t old = brk_heap.committed, next = request.heap[2];
-                if (old < next) result = mprotect((void*)old, next - old, PROT_READ | PROT_WRITE);
-                else if (old > next) result = mprotect((void*)next, old - next, PROT_NONE);
+                if (old < next)
+                    result = user_vma_map((void*)old, next - old, PROT_READ | PROT_WRITE,
+                                         MAP_SHARED | MAP_FIXED_NOREPLACE, fd, 0) == MAP_FAILED ? -1 : 0;
+                else if (old > next) result = user_vma_unmap((void*)next, old - next);
                 brk_heap = (struct uapi_brk_heap){request.heap[0], request.heap[1], next, request.heap[3]};
                 break;
             }

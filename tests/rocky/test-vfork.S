@@ -6,6 +6,19 @@ _start:
     ld t0, 0(sp)
     li t1, 2
     beq t0, t1, executed
+    li a0, 0
+    li a7, 214
+    ecall
+    la t0, heap_base
+    sd a0, 0(t0)
+    li t1, 8192
+    add a0, a0, t1
+    mv s3, a0
+    ecall
+    bne a0, s3, fail
+    ld t1, 0(t0)
+    li t2, 77
+    sb t2, 0(t1)
     /* A live kernel PI lock cannot survive temporary futex-key migration. */
     la a0, pi_lock
     li a1, 134 /* FUTEX_LOCK_PI_PRIVATE */
@@ -63,6 +76,19 @@ _start:
     beqz a0, child
     bltz a0, fail
     mv s0, a0
+    li a0, 0
+    li a7, 214
+    ecall
+    la t0, heap_base
+    ld t0, 0(t0)
+    li t1, 12288
+    add t1, t0, t1
+    bne a0, t1, fail
+    li t1, 8192
+    add t0, t0, t1
+    lbu t0, 0(t0)
+    li t1, 66
+    bne t0, t1, fail
     la t0, child_tid
     lw t1, 0(t0)
     bnez t1, fail
@@ -96,6 +122,36 @@ _start:
     li a0, 0
     j exit
 child:
+    /* Heap shrink and newly mapped growth must reach the suspended parent. */
+    la t0, heap_base
+    ld t0, 0(t0)
+    addi a0, t0, 1
+    mv s3, a0
+    li a7, 214
+    ecall
+    bne a0, s3, fail
+    la t0, heap_base
+    ld t0, 0(t0)
+    li t1, 12288
+    add a0, t0, t1
+    mv s3, a0
+    ecall
+    bne a0, s3, fail
+    la t0, heap_base
+    ld t0, 0(t0)
+    lbu t1, 0(t0)
+    li t2, 77
+    bne t1, t2, fail
+    li t1, 4096
+    add t1, t0, t1
+    lbu t2, 0(t1)
+    bnez t2, fail
+    li t1, 8192
+    add t0, t0, t1
+    lbu t1, 0(t0)
+    bnez t1, fail
+    li t1, 66
+    sb t1, 0(t0)
     la a0, missing
     la a1, missing_arguments
     li a2, 0
@@ -191,6 +247,7 @@ exit:
 pi_lock: .word 0, 0
 child_tid: .word 111, 0
 shared: .quad 123
+heap_base: .quad 0
 new_mapping: .quad 0
 arguments: .quad 0, 0, 0
 missing_arguments: .quad missing, 0

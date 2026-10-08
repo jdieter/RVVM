@@ -114,6 +114,7 @@ typedef size_t   rvjit_addr_t;
 #define REG_ILL       0xFF // Register is not allocated
 
 #ifdef USER_FAULT_META
+#define RVJIT_USER_FAULT_CAPACITY (1U << 14)
 typedef struct {
     uint64_t guest_pc;
     uint32_t start, end;
@@ -214,10 +215,7 @@ static inline void rvjit_set_rv64(rvjit_block_t* block, bool rv64)
 #endif
 }
 
-static inline void rvjit_set_native_ptrs(rvjit_block_t* block, bool native_ptrs)
-{
-    block->native_ptrs = native_ptrs;
-}
+void rvjit_set_native_ptrs(rvjit_block_t* block, bool native_ptrs);
 
 // Creates a new block, prepares codegen
 void rvjit_block_init(rvjit_block_t* block);

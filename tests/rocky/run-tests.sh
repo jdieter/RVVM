@@ -8,7 +8,7 @@ trap 'rm -rf "$build"' EXIT
 cc=${CC:-cc}
 flags=(-O2 -g -pthread -DRVVM_USER_TEST -ffunction-sections -fdata-sections
        -I"$root/src" -I"$root/src/util" -I"$root/include" -Wl,--gc-sections)
-for name in test-exe-fd test-fd-lock test-process-state test-exec-ranges test-replay test-vm-backing test-vm-runtime; do
+for name in test-exe-fd test-fd-lock test-process-state test-exec-ranges test-replay test-vm-backing test-vm-runtime test-brk; do
     extra=()
     if [[ $name == test-replay ]]; then extra=("$root/src/core/user_ptrace/user_ptrace_replay.c"); fi
     "$cc" "${flags[@]}" "$root/tests/rocky/$name.c" "${extra[@]}" "$root"/src/util/*.c \
@@ -16,7 +16,7 @@ for name in test-exe-fd test-fd-lock test-process-state test-exec-ranges test-re
     timeout 20 "$build/$name"
 done
 if (($#)); then
-    for guest in test-clone-flags test-clone-thread test-thread-exit test-vfork test-openat2 test-seccomp; do
+    for guest in test-clone-flags test-clone-thread test-thread-exit test-vfork test-openat2 test-seccomp test-jit-limits; do
         "${RISCV_CC:-clang}" --target=riscv64-linux-gnu -march=rv64gc -mabi=lp64d \
             -fuse-ld="${RISCV_LD:-lld}" -nostdlib -static -Wl,--build-id=none \
             "$root/tests/rocky/$guest.S" -o "$build/$guest"

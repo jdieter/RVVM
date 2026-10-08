@@ -17,7 +17,7 @@
 
 struct user_vma_layout {
     uintptr_t limit, top, low;
-    size_t brk_reserve;
+    size_t brk_window;
 };
 
 /* Select once, before guest mappings or threads exist. Both modes use the
@@ -204,8 +204,10 @@ static void* user_vma_map_raw(void* addr, size_t size, int prot, int flags, int 
         top = __atomic_load_n(&user_vma_cursor, __ATOMIC_RELAXED);
     }
     if (span <= user_vma_layout.top - UINT64_C(0x10000)) {
-        uintptr_t floor = span <= user_vma_layout.top - user_vma_layout.low
-            ? user_vma_layout.low : UINT64_C(0x10000);
+        /* Keep ordinary allocations above the unmapped heap growth window.
+         * Both remain in the high application range expected by sanitizers. */
+        uintptr_t arena = user_vma_layout.low + user_vma_layout.brk_window * 2;
+        uintptr_t floor = span <= user_vma_layout.top - arena ? arena : UINT64_C(0x10000);
         uintptr_t next;
         do {
             next = top >= floor + span ? top - span : user_vma_layout.top - span;
