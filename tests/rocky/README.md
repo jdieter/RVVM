@@ -63,6 +63,65 @@ limit. This change does not implement separate guest resource budgets.
 
 ## Regression checks
 
+### Linux compatibility backlog probes
+
+`test-linux-compat.c` contains 33 independent behavioral cases for the TODO
+backlog. It requires Linux headers and a libc toolchain for the target.
+Build a static RISC-V binary inside the Rocky buildroot and run that identical
+binary on native RISC-V and through RVVM. The fixture uses private working
+directories and isolates irreversible credential, limit and sandbox changes
+in separate processes. It requires procfs; privileged credential cases need
+root. Core checks deliberately crash a child and inspect a direct core or
+retrieve it through systemd-coredump. They do not change global core settings.
+
+```sh
+gcc -O2 -Wall -Wextra -Werror -static -pthread \
+    tests/rocky/test-linux-compat.c -o /tmp/test-linux-compat
+python3 tests/rocky/run-linux-compat.py /tmp/test-linux-compat \
+    --source tests/rocky/test-linux-compat.c --output /tmp/native-compat.json
+# Run on the emulator host, using the same RISC-V binary and copied reference:
+python3 tests/rocky/run-linux-compat.py /tmp/test-linux-compat \
+    --emulator /usr/local/bin/rvvm-riscv64-static \
+    --reference /tmp/native-compat.json --output /tmp/guest-compat.json
+```
+
+Guest acceptance fails on any known gap as well as unexpected failures or
+unverified cases. `--allow-known-failures` explicitly selects backlog inventory
+mode: known assertion failures/unsupported calls are XFAIL, never PASS.
+Crashes/timeouts remain FAIL; a passing known-gap case is XPASS and requires
+updating the expectation after investigation. Native feature/privilege skips
+are recorded as SKIP. Without a passing native reference, the guest result
+is UNVERIFIED and fails even inventory mode. JSON retains stderr, exit codes,
+reference identity, fixture/source/emulator hashes, host and UID. Existing
+evidence files cannot be overwritten. `--case NAME` selects individual probes.
+
+For unavailable native RISC-V prerequisites, add a supplemental native Linux
+reference with another `--reference`. Different fixture binaries require
+`--allow-cross-architecture-reference` and identical `--source` hashes in
+both reports. RISC-V results remain the preferred reference; supplemental
+ARM64 results are suitable for the shared Linux ABI/credential cases, not
+an oracle for architecture-specific execution. Use matching source/build
+flags and review permissions, kernel features and ABI before comparison.
+
+Coverage includes clone3 fork/pidfd/handler reset/argument size; separate
+process VM/FS/SysVSEM/parent sharing; nested shared-vfork and private/PI futex
+operations; executable stat/statx; thread visibility after pthread_join;
+shared-validate/unknown/populate/locked/grow-down mappings; a fixed memory
+budget; actual filesystem UID/GID permission changes; seccomp through both
+interfaces; Landlock rule creation/enforcement; rseq registration; io_uring
+setup/register/enter/completion; guest syscall tracing and ELF core machine
+type; ioctl/bad-buffer handling, alternate signal stacks and contended atomics.
+
+These are focused backlog reproducers and conformance controls, not exhaustive
+tests of every TODO requirement. Full syscall/ISA matrices, every ioctl family,
+signal stress, fake-root identity, advanced clone3 controls, asynchronous I/O
+lifetime races, rseq critical-section aborts, PI handoff/owner death, complete
+procfs views and core register/mapping notes remain audit/implementation work
+in TODO.txt. The fixed memory-budget probe measures a documented emulator
+accounting difference; it does not claim to isolate every resource limit.
+
+### Existing implementation regressions
+
 Run native tests with `bash tests/rocky/run-tests.sh`. To add guest tests, pass
 one or more emulator binaries; the runner requires Clang and LLD and exercises
 Sv39/Sv48 with JIT enabled and disabled:

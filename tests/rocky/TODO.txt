@@ -1,0 +1,359 @@
+Guest executable metadata through procfs
+--------------------------------------
+stat("/proc/self/exe") currently reports the native emulator's inode, while
+opening that path returns the pinned guest executable. Fix newfstatat and
+statx in src/core/rvvm_user.c using the executable identity and pin handling
+in src/core/rvvm_user_exe.h. Keep metadata retrieval in the host kernel.
+
+Preserve kernel path resolution, flag validation, permissions and error
+returns. AT_SYMLINK_NOFOLLOW must still report the procfs link's metadata.
+Do not depend on reopening the original executable pathname: it may have
+been renamed, replaced or deleted. Hold the appropriate descriptor guard
+while using the pin so concurrent relocation cannot select another file.
+
+Regression coverage: stat/fstatat/statx versus fstat on an opened guest
+executable; procfs aliases and relative directory descriptors; no-follow
+and empty-path behavior; renamed/deleted executables; concurrent pin
+relocation; invalid flags and inaccessible guest buffers. Use independent
+guest-file identity as the oracle, not stat("/proc/self/exe").
+
+Rough estimate: 50-100 lines of emulator code and 100-150 lines of tests,
+with a few hours for implementation and dev validation. Confirm scope
+when implementing; this note does not implement the fix.
+
+Userspace compatibility backlog
+-------------------------------
+The entries below record confirmed omissions and areas requiring an audit.
+An audit entry is not evidence that every listed behavior is broken. Work
+against the current Linux/RV64 ABI and the supported Rocky ARM64 build;
+recheck implementation status before starting each item.
+
+Keep operations and permission checks in the host kernel where semantics
+match. Do not claim support by returning success without implementing the
+behavior. Do not change guest tests or expected failures to hide an emulator
+gap. These notes authorize no implementation or deployment by themselves.
+
+Common acceptance requirements: retain native reference results and exact
+build inputs; exercise guest Sv39/Sv48 with JIT and interpreter; distinguish
+unsupported host features from emulator failures. Namespace-dependent tests
+must run in the RPM/Mock nspawn context with the required privileges and
+/dev/fuse, without an extra enclosing user namespace. A skipped test is not
+coverage. Add small regressions with independent behavioral oracles, rather
+than tests that merely reproduce the implementation's current decisions.
+
+Guest clone3 interface
+----------------------
+Confirmed omission: guest syscall 435 always returns ENOSYS, even though the
+static host-fork backend can use host clone3 internally.
+
+Implement guest clone_args decoding and route supported requests through the
+process/thread creation machinery in src/core/rvvm_user.c and
+src/core/rvvm_user_fork.h. Handle versioned structure sizes, nonzero trailing
+fields, inaccessible buffers, 64-bit flags, stack base/size, separate pidfd
+and parent/child TID pointers, TLS and exit_signal. Do not truncate flags or
+interpret clone3's stack base as legacy clone's stack-top argument.
+
+Cover set_tid/set_tid_size, CLONE_CLEAR_SIGHAND and CLONE_INTO_CGROUP, including
+host support, permissions and incompatible combinations. Delegate kernel
+validation where possible, while retaining native libc fork recovery and
+guest signal/descriptor state. Depend on the sharing work below for modes
+the existing clone implementation cannot represent.
+
+Regression coverage: libc fallback and direct syscall clients; structure
+size boundaries and invalid fields; independent pidfd/TID publication;
+child stack/TLS correctness; requested PIDs and cgroup placement; handler
+reset; namespace combinations; error and cleanup behavior against native
+Linux. Successful host clone3 use alone does not satisfy this entry.
+
+Complete legacy clone sharing and inheritance
+--------------------------------------------
+Confirmed omissions: the CLONE_VM branch requires CLONE_SIGHAND and
+CLONE_THREAD. The process branch rejects CLONE_PARENT, CLONE_FS and
+CLONE_SYSVSEM. The vfork branch accepts a narrower set of combinations and
+requires SIGCHLD. These restrictions reject some combinations Linux permits.
+
+Create an explicit matrix of Linux-valid sharing combinations and their
+current implementation status. Support separate process identities sharing
+an address space without CLONE_VFORK, independent filesystem/descriptor/
+SysV semaphore sharing, and parent relationships. Preserve wait classes,
+exit signals, pidfds, TID publication, TLS, signal dispositions and alternate
+signal-stack inheritance. Audit CLONE_IO, which is currently discarded,
+separately from the obsolete CLONE_DETACHED flag.
+
+Do not use native pthread creation as a substitute for a distinct guest
+process. Shared guest state must not accidentally share emulator libc/JIT
+state. Retain fork lock ordering, robust-list recovery, native TLS recovery
+and kernel namespace validation. Document backend limitations explicitly.
+
+Regression coverage: differential flag matrix, including valid unusual
+combinations; observable sharing of cwd/umask, descriptors and semadj;
+getpid/gettid/getppid and wait behavior; custom exit signals; namespace
+inheritance; allocation failures and concurrent fork/exec. Replace old
+unsupported-flag assertions only after implementing the corresponding mode.
+
+Shared-memory child process and futex completeness
+------------------------------------------------
+Confirmed omissions: rvvm_sys_clone rejects creation from user_vm_child;
+private futexes there return ENOSYS. Priority-inheritance acquisition is
+restricted while user_vm_shared_active is set.
+
+Audit the guest-memory sharing, service and RPC paths in rvvm_user_vm*.h
+and rvvm_user.c. Support nested process/thread creation without losing the
+parent's sharing relationships or exposing internal helpers as guest children.
+Provide the correct guest address-space futex keys despite separate host
+address spaces. Merely clearing FUTEX_PRIVATE_FLAG is not equivalent.
+
+Cover PI ownership, owner death, robust lists, requeue and wake semantics,
+including parent/child interactions and concurrent sibling threads. Define
+service/channel lifetime through nested fork, exec, exit and fatal signals;
+keep primary guest process identity and descriptor limits intact.
+
+Regression coverage: child creates and waits for a grandchild; private
+wait/wake across shared guest memory; timeout/interruption and requeue;
+PI handoff and owner death; parent threads modifying mappings concurrently;
+exec/exit/SIGKILL cleanup. Run blocking scenarios with bounded timeouts and
+verify no orphan helpers, leaked channels or lost wakeups remain.
+
+io_uring support
+----------------
+Confirmed omission: setup, enter and register return ENOSYS.
+
+Audit the RV64 ring/SQE/CQE ABI, opcode-specific buffers, mmap offsets and
+descriptor references before forwarding to host io_uring. Integrate guest
+descriptor validation, internal descriptor protection and guest mapping
+ownership. Account for operations completed asynchronously after a guest
+changes mappings, closes descriptors or exits.
+
+Use kernel execution where layouts and semantics match. Validate host
+feature probes and permissions, registered files/buffers, cancellation,
+polling modes, credentials and completion notification. Retain ENOSYS until
+the advertised interface works; do not advertise unsupported opcodes.
+
+Regression coverage: feature probes, basic file/socket I/O, registered
+resources, short/error completions, cancellation, concurrent close/unmap,
+fork/exec and signal interruption. Compare CQE results and resulting data
+against native execution, including denied host configurations.
+
+Restartable sequences (rseq)
+---------------------------
+Confirmed omission: registration returns ENOSYS.
+
+Implement registration and unregister validation plus guest execution
+integration. Host rseq cannot directly track guest program counters inside
+the JIT/interpreter. Translate or explicitly handle critical-section entry,
+abort signatures and abort destinations at signal, scheduling and CPU
+migration boundaries, including optimized JIT blocks.
+
+Maintain guest CPU IDs and per-thread registration lifetime through clone,
+exec and exit. Preserve Linux handling of malformed descriptors, registration
+sizes/flags and repeated registration. Support only the advertised ABI.
+
+Regression coverage: libc registration/fallback; migration under affinity
+changes; interruption inside/outside critical sections; correct abort PC
+and CPU ID updates; malformed signatures/descriptors; thread teardown.
+Use native RISC-V outcomes rather than host instruction addresses as oracle.
+
+Guest seccomp
+-------------
+Confirmed omission: the seccomp syscall returns ENOSYS; prctl seccomp
+operations return EINVAL in src/core/rvvm_user_extra.h.
+
+Provide filtering over guest syscall numbers, guest audit architecture,
+guest instruction pointer and arguments. Installing the guest filter on
+RVVM's native syscalls would filter the wrong ABI and emulator operations.
+Preserve filter stacking, inheritance, no_new_privs, thread synchronization
+and supported action semantics, including SIGSYS data and debugger events.
+
+Audit kernel-assisted enforcement options and the interception boundary
+before choosing a design. Include strict mode and filter mode. Notification
+support must validate descriptor lifetime, supervisor replies and guest
+memory races; do not advertise actions or flags without enforcing them.
+
+Regression coverage: allow/errno/kill/trap/log actions, architecture checks,
+stacked filters, fork/exec inheritance, TSYNC and threads, prctl probes,
+notification round trips and rejected filters. Verify that guest calls are
+filtered while necessary emulator housekeeping can still finish safely.
+
+Guest Landlock
+--------------
+Confirmed omission: all three Landlock syscalls, including ABI probes,
+return ENOSYS to avoid advertising unsupported sandbox behavior.
+
+Audit host Landlock delegation against internal executable/procfs/memfd
+opens and helper execution. Translate guest rule descriptors and supported
+access masks; preserve no_new_privs, layering, inheritance and ABI version
+negotiation. A helper must not become a route around a guest restriction.
+Keep ABI probes unsupported until every advertised restriction is enforced.
+
+Regression coverage: allowed and denied file operations, relative paths,
+renames/linking and newer ABI rights as applicable; layered rulesets;
+fork/exec/thread inheritance; descriptor closure; denied host configurations.
+Verify restrictions against independent files and through all guest syscall
+paths, rather than only confirming successful ruleset creation.
+
+Filesystem credentials and optional fake-root semantics
+------------------------------------------------------
+Confirmed omission: setfsuid and setfsgid return the current UID/GID without
+applying the requested change. Fake-root handling simplifies real/effective/
+saved identities; that optional mode must not be confused with actual kernel
+credentials.
+
+Implement real setfsuid/setfsgid using kernel credential changes and correct
+guest-width conversion, return-of-previous-ID and failed-change semantics.
+Audit synchronization with guest thread state and any helper performing
+filesystem operations. Preserve per-thread raw syscall semantics, capability
+changes and native libc bookkeeping requirements.
+
+For fake-root mode, inventory every identity-changing/query interface and
+either implement a coherent guest identity model or document its deliberate
+limits. Do not return fabricated successful permission enforcement. Keep
+real-credential behavior independent of optional fake-root behavior.
+
+Regression coverage: filesystem ownership/permission checks before and after
+changes; unprivileged rejected changes and previous-ID returns; saved IDs;
+capabilities, threads, fork/exec and helper-backed operations. Verify actual
+file access, not just getuid/getgid results. Exercise fake-root separately.
+
+Complete guest process introspection
+-----------------------------------
+The known executable stat/fstatat/statx defect is already recorded above;
+do not duplicate that implementation task here.
+
+Audit /proc views, including maps/smaps, status/stat/statm, task listings,
+cmdline, mem and descriptor enumeration, for native emulator paths, mappings,
+helper threads and resource usage. Existing CPU, auxv and executable handling
+does not establish complete virtualization of these interfaces.
+
+Define guest-visible process identity and mapping ownership, then implement
+consistent views across self/thread-self, numeric PIDs, relative directory
+descriptors and procfs aliases. Preserve kernel access checks, namespaces,
+read offsets, file lifetime, flags and errors. Do not query a guest FUSE
+filesystem to classify paths. Address consistency during fork/exec and
+concurrent mapping/descriptor changes, without hiding legitimate guest state.
+
+Regression coverage: an external guest observer and self-observation agree;
+only guest mappings/tasks are exposed where promised; deleted executables,
+exec transitions, permission denial and PID namespaces; partial reads/seeks;
+descriptor relocation and concurrent process exit. Use independently tracked
+guest mappings/processes as oracle. Label remaining host views explicitly.
+
+Debugger and guest core-dump completeness
+---------------------------------------
+Correction after native differential testing: PTRACE_GET_SYSCALL_INFO (0x420e)
+is implemented. The earlier audit confused it with rejected request 0x420f.
+Keep syscall-info conformance coverage; do not implement it a second time.
+Other request numbers are rejected explicitly. The guest-core differential
+probe now confirms that systemd-coredump collects a native ARM64 ELF core
+for a RISC-V guest crash. Implement guest-format cores, not native headers
+with a substituted machine number; register notes and mappings must match.
+
+Inventory supported RV64 ptrace requests, regsets, stop reasons and options
+in src/core/user_ptrace. Translate syscall information, registers and signal
+state from guest execution, never expose native ARM64 state as guest state.
+Cover attach/seize, syscall entry/exit, restart, clone/exec events, group stops,
+single-step, signal injection and concurrent tracer/tracee exit.
+
+Audit current crash/core behavior and implement a guest ELF core path if the
+host currently dumps emulator state. Include RV64 ELF machine type, register
+and signal notes, guest mappings/threads and executable identity; honor core
+limits, dumpability, coredump_filter and the configured collection mechanism.
+Keep unrelated native emulator diagnostics available separately.
+
+Regression coverage: guest strace and GDB inspect the same registers/syscall
+arguments as the guest; traced threads and fork/exec events; faults and injected
+signals; detached/unprivileged access. Load generated cores in RISC-V GDB and
+verify fault PC, thread registers and independently known guest memory.
+
+Complete mmap flag semantics
+---------------------------
+Confirmed gap: rvvm_sys_mmap reconstructs only selected flags. Audit currently
+discarded flags, particularly MAP_GROWSDOWN, MAP_LOCKED, MAP_POPULATE and
+MAP_SHARED_VALIDATE, plus architecture-specific and huge-page flag fields.
+
+Build an explicit guest-to-host flag mapping and validation policy. Preserve
+Linux's distinctions between accepted/ignored flags, invalid combinations,
+and unsupported MAP_SHARED_VALIDATE extensions. Do not equate MAP_SHARED
+and MAP_SHARED_VALIDATE. Check flags whose semantics affect page faults,
+locking, reservation, placement or growable stacks rather than just creation.
+
+Integrate changes with guest VMA ownership, executable/JIT invalidation,
+brk collisions, shared-memory RPC and host page-size constraints. Delegate
+accounting and kernel errors where possible. Audit mprotect, madvise, mremap
+and mincore where their behavior depends on the original mapping flags.
+
+Regression coverage: mapping type and alias visibility; locked-memory limits;
+fault-driven stack growth; populate behavior; huge pages; unknown flag bits;
+fixed-address replacement/collisions; shared-memory child changes; unmap and
+protection transitions. Compare observable effects and errno against native
+Linux, allowing documented host feature differences rather than silently
+dropping flags.
+
+Guest resource accounting boundaries
+-----------------------------------
+Architectural limitation: native kernel accounting includes emulator/JIT
+memory and execution overhead. Incremental brk allocation already lets the
+kernel charge heap growth correctly, but does not separate all guest and
+emulator consumption.
+
+Inventory RLIMIT_AS/DATA/STACK/CPU/NPROC/MEMLOCK/NOFILE behavior, rusage and
+procfs accounting, including helper processes and native threads. Measure
+the differences before proposing compensation. Preserve existing descriptor
+limit correctness and do not assume every resource has the same solution.
+
+Record an explicit compatibility target for each resource. Prefer real
+kernel limits where possible; any proposed guest-only accounting must also
+address native prlimit callers, guest-to-native exec, forks, cgroups and
+enforcement races. Do not silently revive the discarded split/JIT POC or
+introduce a permanent mode knob. Architectural changes need separate scope.
+
+Regression coverage: allocation at soft/hard limit boundaries; lowered limits
+with existing allocations; release/regrowth; concurrent threads/processes;
+native prlimit and exec transitions; fatal signals and helper cleanup.
+Report unavoidable emulator cost separately from incorrectly enforced guest
+limits, with paired native measurements and retained inputs.
+
+ABI, device ioctl and syscall coverage audit
+------------------------------------------
+Audit requirement, not a blanket defect claim: several forwarding paths still
+carry structure-conversion TODOs. Some RV64/ARM64 LP64 layouts already match
+and are checked; verify each remaining layout instead of rewriting it blindly.
+
+Inventory guest syscall dispatch against the selected Linux UAPI version.
+Classify implemented, partially implemented, intentionally unsupported and
+kernel-only interfaces. For ioctl families, verify request numbers, sizes,
+alignment, pointer fields and architecture-specific constants, including
+device/network/terminal interfaces actually used by workloads. Validate
+errno conversion, inaccessible pointers and output-copy behavior as well as
+successful calls. Preserve native permission and flag checks.
+
+Regression coverage: native-versus-emulated fixtures for confirmed mismatches;
+malformed and boundary buffers; device capability/permission failures;
+partial output and interruptions. Do not count a comment or an unsupported
+device on the test host as proof of an emulator bug. Record unsupported
+interfaces explicitly with the applicable ABI and reason.
+
+Signal and instruction conformance audit
+---------------------------------------
+Audit requirement: passing glibc and current regressions does not establish
+all signal or instruction semantics. Preserve the existing fixes rather than
+treating this entry as evidence they regressed.
+
+For signals, compare masking/pending queues, realtime ordering, delivery
+between threads, siginfo/ucontext, alternate stacks, interrupted/restarted
+syscalls, synchronous faults and ptrace interaction. Test fork/exec/exit and
+shared-memory children. Ensure guest addresses/registers and signal numbers
+are represented consistently, without exposing native handler state.
+
+For execution, define the advertised ISA/ABI through auxv, hwprobe and CPU
+views. Validate implemented extensions, illegal instructions, FP rounding and
+exception flags, misalignment, atomics and memory ordering, self-modifying
+code and JIT invalidation. Advertise only supported behavior. Compare against
+native hardware implementing the relevant extensions; distinguish allowed
+implementation choices from actual architecture violations.
+
+Regression coverage: deterministic differential fixtures for discovered
+mismatches in both interpreter/JIT; bounded concurrency stress where needed;
+record seeds and minimized reproducers. Add ISA conformance suites and signal
+stress appropriate to confirmed gaps, and record host hardware/kernel and
+build settings. A native compiler-output comparison supplements these tests;
+it does not prove every runtime behavior equivalent.
