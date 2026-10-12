@@ -5,6 +5,7 @@
 #include <linux/magic.h>
 
 #include "rvvm_user_fd_table.h"
+#include "rvvm_user_fs.h"
 #define user_exe_fd_value (user_fd_table()->exe_fd)
 #define user_exe_fd ((int)atomic_load_uint32_relax(&user_exe_fd_value))
 #define user_vm_fd ((int)atomic_load_uint32_relax(&user_fd_table()->vm_fd))
@@ -113,13 +114,14 @@ static bool user_exe_self(const char* path)
 
 static user_fd_table_t* user_exe_fd_directory(int fd)
 {
-    struct statfs fs;
-    if (fstatfs(fd, &fs) || fs.f_type != PROC_SUPER_MAGIC) return NULL;
     char name[64], path[128];
     snprintf(name, sizeof(name), "/proc/thread-self/fd/%d", fd);
     ssize_t n = readlink(name, path, sizeof(path) - 2);
     if (n < 3 || memcmp(path + n - 3, "/fd", 3)) return NULL;
     path[n] = 0;
+    if (strncmp(path, "/proc/", 6)) return NULL;
+    struct stat st;
+    if (fstat(fd, &st) || user_fs_type(st.st_dev) != PROC_SUPER_MAGIC) return NULL;
     unsigned pid, tid;
     int end = 0;
     if (sscanf(path, "/proc/%u/task/%u/fd%n", &pid, &tid, &end) == 2
@@ -195,16 +197,14 @@ static bool user_proc_resolve(int dirfd, const char* path, char* resolved, size_
 {
     int fd = openat(dirfd, path, O_PATH | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) return false;
-    struct statfs fs;
-    if (fstatfs(fd, &fs) || fs.f_type != PROC_SUPER_MAGIC) {
-        close(fd);
-        return false;
-    }
     char descriptor[64];
     snprintf(descriptor, sizeof(descriptor), "/proc/thread-self/fd/%d", fd);
     ssize_t length = readlink(descriptor, resolved, size - 1);
+    struct stat st;
+    bool proc = length >= 6 && !memcmp(resolved, "/proc/", 6)
+        && !fstat(fd, &st) && user_fs_type(st.st_dev) == PROC_SUPER_MAGIC;
     close(fd);
-    if (length < 0 || length == size - 1) return false;
+    if (!proc || length == size - 1) return false;
     resolved[length] = 0;
     return true;
 }

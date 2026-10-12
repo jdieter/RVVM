@@ -28,11 +28,10 @@ static void user_cpu_init(void)
 {
     // Initialize before guest threads/forks; no lazy-init lock can survive a fork.
     struct stat root;
-    struct statfs fs;
-    if (!stat("/proc", &root) && !statfs("/proc", &fs) && fs.f_type == PROC_SUPER_MAGIC) {
+    if (!stat("/proc", &root) && user_fs_type(root.st_dev) == PROC_SUPER_MAGIC) {
         user_cpu_proc_device = root.st_dev; user_cpu_have_proc = true;
     }
-    if (!stat("/sys", &root) && !statfs("/sys", &fs) && fs.f_type == SYSFS_MAGIC) {
+    if (!stat("/sys", &root) && user_fs_type(root.st_dev) == SYSFS_MAGIC) {
         user_cpu_sys_device = root.st_dev; user_cpu_have_sys = true;
     }
 }
@@ -167,21 +166,17 @@ static bool user_cpu_self_auxv(const char* path)
 // symlinks, dirfd and openat2 resolve flags. Native opens in RVVM itself bypass this.
 static long user_cpu_open_special_inner(long fd, unsigned long flags, dev_t device)
 {
-    long type;
-    if (user_cpu_have_proc && device == user_cpu_proc_device) type = PROC_SUPER_MAGIC;
-    else if (user_cpu_have_sys && device == user_cpu_sys_device) type = SYSFS_MAGIC;
-    else {
-        // Also handle another proc/sysfs mount, rather than trusting pathname prefixes.
-        struct statfs fs;
-        if (fstatfs(fd, &fs)) return fd;
-        type = fs.f_type;
-    }
-    if (type != PROC_SUPER_MAGIC && type != SYSFS_MAGIC) return fd;
     char descriptor[64], path[4096];
     snprintf(descriptor, sizeof(descriptor), "/proc/thread-self/fd/%ld", fd);
     ssize_t length = readlink(descriptor, path, sizeof(path) - 1);
     if (length < 0 || length == sizeof(path) - 1) return fd;
     path[length] = 0;
+    if (!user_cpu_path_below(path, "/proc") && !user_cpu_path_below(path, "/sys")) return fd;
+    long type;
+    if (user_cpu_have_proc && device == user_cpu_proc_device) type = PROC_SUPER_MAGIC;
+    else if (user_cpu_have_sys && device == user_cpu_sys_device) type = SYSFS_MAGIC;
+    else type = user_fs_type(device);
+    if (type != PROC_SUPER_MAGIC && type != SYSFS_MAGIC) return fd;
     const char* cpu = "/sys/devices/system/cpu";
     bool cpu_tree = user_cpu_path_below(path, cpu);
     const char* registers = strstr(path, "/regs");

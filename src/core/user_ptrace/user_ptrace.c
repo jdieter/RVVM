@@ -134,7 +134,16 @@ static uintptr_t bridge_mapping_address(const char* line)
     return start;
 }
 
-static uintptr_t locate(pid_t pid, struct bridge* state)
+/* Proc readers need no debugger attachment. The kernel still enforces read
+ * access to process memory; an attached debugger can use its ptrace fallback. */
+static int remote_read(pid_t pid, uintptr_t addr, void* buffer, size_t size)
+{
+    struct iovec local = {buffer, size}, other = {(void*)addr, size};
+    if (syscall(SYS_process_vm_readv, pid, &local, 1, &other, 1, 0) == (long)size) return 0;
+    return remote(pid, addr, buffer, size, false);
+}
+
+static uintptr_t locate_inner(pid_t pid, struct bridge* state, bool proc)
 {
     char path[64], line[1024];
     snprintf(path, sizeof(path), "/proc/%u/maps", pid);
@@ -145,7 +154,8 @@ static uintptr_t locate(pid_t pid, struct bridge* state)
     while (fgets(line, sizeof(line), maps)) {
         uintptr_t start = bridge_mapping_address(line);
         if (start
-            && !remote(pid, start, state, sizeof(*state), false)
+            && !(proc ? remote_read(pid, start, state, sizeof(*state))
+                      : remote(pid, start, state, sizeof(*state), false))
             && state->magic == BRIDGE_MAGIC && state->tid == (uint32_t)pid) {
             addr = start;
             break;
@@ -156,13 +166,19 @@ static uintptr_t locate(pid_t pid, struct bridge* state)
     if (!addr) {
         struct user_ptrace_stop stop;
         if (user_ptrace_events_get(pid, &stop) && stop.bridge_hint
-            && !remote(pid, stop.bridge_hint, state, sizeof(*state), false)
+            && !(proc ? remote_read(pid, stop.bridge_hint, state, sizeof(*state))
+                      : remote(pid, stop.bridge_hint, state, sizeof(*state), false))
             && state->magic == BRIDGE_MAGIC) {
             addr = stop.bridge_hint;
             if (stop.hart_hint) state->hart = stop.hart_hint;
         }
     }
     return addr;
+}
+
+static uintptr_t locate(pid_t pid, struct bridge* state)
+{
+    return locate_inner(pid, state, false);
 }
 
 /* Proc enumeration precedes debugger attachment. process_vm_readv leaves
@@ -1231,7 +1247,7 @@ long user_ptrace_request(unsigned long request, pid_t pid, uintptr_t addr, uintp
 bool user_ptrace_remote_auxv(pid_t pid, uint64_t buffer[64], size_t* size)
 {
     struct bridge state;
-    if (!locate(pid, &state) || state.auxv_size > sizeof(state.auxv)) return false;
+    if (!locate_inner(pid, &state, true) || state.auxv_size > sizeof(state.auxv)) return false;
     memcpy(buffer, state.auxv, state.auxv_size);
     *size = state.auxv_size;
     return true;
@@ -1241,8 +1257,8 @@ bool user_ptrace_remote_exe_descriptor(pid_t pid, char* buffer, size_t size)
 {
     struct bridge state;
     uint32_t fd;
-    if (!locate(pid, &state)
-        || remote(pid, state.exe_fd_pointer, &fd, sizeof(fd), false) || (int32_t)fd < 0) return false;
+    if (!locate_inner(pid, &state, true)
+        || remote_read(pid, state.exe_fd_pointer, &fd, sizeof(fd)) || (int32_t)fd < 0) return false;
     int len = snprintf(buffer, size, "/proc/%u/fd/%u", pid, fd);
     return len >= 0 && (size_t)len < size;
 }

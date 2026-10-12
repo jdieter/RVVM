@@ -89,6 +89,34 @@ each open starts with an independent file offset. Pin readers holding the outer
 descriptor guard need no nested metadata lock; readlink and wait bookkeeping
 retain their metadata locking.
 
+The proc executable fixture reads and opens a child's guest executable before
+debugger attachment. Proc identity discovery uses kernel-authorized memory
+reads; debugger operations retain their attachment checks. Process namespace
+clone flags are passed to Linux inside the static libc fork recovery path.
+
+Run the six namespace/FUSE glibc regressions on dev against its installed
+interpreter and preserved Mock root:
+
+```sh
+sudo bash tests/rocky/run-glibc-namespace-tests.sh \
+    /srv/rvvm-backups-storage/glibc-suite-801413-20261008/root \
+    /var/tmp/rvvm-glibc-namespace-results
+```
+
+This uses Mock's nspawn launch settings, including `SYSTEMD_SECCOMP=0` and
+`/dev/fuse`, without an enclosing user namespace. Machine registration is
+disabled because these checks do not need host machine-manager integration.
+It archives each target's old results and executes its original Makefile
+recipe, including container wrappers and per-test environment. All six must
+report PASS in Sv39/Sv48 with JIT enabled and disabled; UNSUPPORTED fails
+acceptance. This is a targeted rerun, not a complete RPM build. An optional
+third argument supplies a target list, and a fourth selects one mode such as
+`48:jit` for additional coverage.
+
+Filesystem classification reads kernel mount information instead of issuing
+`fstatfs` on guest files. Such a probe changes the protocol on FUSE and can
+deadlock a guest filesystem server while the descriptor guard is held.
+
 The ARM64 static performance candidate uses this build command (the mandatory
 floating-point flags remain enabled):
 

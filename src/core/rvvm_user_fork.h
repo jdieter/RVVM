@@ -2,6 +2,8 @@
 #ifndef RVVM_USER_FORK_H
 #define RVVM_USER_FORK_H
 
+static __thread unsigned user_fork_namespaces;
+
 #ifdef RVVM_STATIC_GLIBC_FORK
 #include <linux/futex.h>
 #include <linux/sched.h>
@@ -99,7 +101,8 @@ static pid_t user_host_fork(unsigned signal)
 static pid_t user_host_fork_files(unsigned signal, bool shared)
 {
 #ifdef RVVM_STATIC_GLIBC_FORK
-    user_fork_flags = (shared ? CLONE_FILES : 0) | (user_fork_want_pidfd ? CLONE_PIDFD : 0);
+    user_fork_flags = (shared ? CLONE_FILES : 0) | (user_fork_want_pidfd ? CLONE_PIDFD : 0)
+        | user_fork_namespaces;
 #else
     if (shared) { errno = ENOSYS; return -1; }
 #endif
