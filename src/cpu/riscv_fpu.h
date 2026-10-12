@@ -115,12 +115,32 @@ static forceinline void riscv_write_d(rvvm_hart_t* vm, size_t reg, fpu_f64_t val
 }
 
 slow_path void riscv_emulate_f_opc_op(rvvm_hart_t* vm, const uint32_t insn);
-bool riscv_fpu_rmm(rvvm_hart_t* vm, uint32_t insn);
+bool riscv_fpu_softfloat(rvvm_hart_t* vm, uint32_t insn);
 
-static forceinline bool riscv_fpu_try_rmm(rvvm_hart_t* vm, uint32_t insn)
+static forceinline bool riscv_fpu_try_softfloat(rvvm_hart_t* vm, uint32_t insn)
 {
     uint32_t rm = (insn >> 12) & 7;
-    return unlikely((rm == 7 ? vm->csr.fcsr >> 5 : rm) == 4) && riscv_fpu_rmm(vm, insn);
+    if (unlikely((rm == 7 ? vm->csr.fcsr >> 5 : rm) == 4)) return riscv_fpu_softfloat(vm, insn);
+    if ((insn & 0x7f) != 0x53) return false;
+    unsigned rs1 = (insn >> 15) & 31, rs2 = (insn >> 20) & 31;
+    uint64_t x = fpu_bit_f64_to_u64(riscv_view_d(vm, rs1)) & UINT64_C(0x7fffffffffffffff);
+    // Hosts may detect tininess before rounding. Only the boundary where
+    // rounding can produce the minimum normal needs the exact fallback.
+    if ((insn >> 25) == 0x20 && rs2 == 1
+        && x >= UINT64_C(0x380fffffc0000000) && x <= UINT64_C(0x3810000000000000))
+        return riscv_fpu_softfloat(vm, insn);
+    if ((insn >> 25) == 0x09) {
+        uint64_t y = fpu_bit_f64_to_u64(riscv_view_d(vm, rs2)) & UINT64_C(0x7fffffffffffffff);
+        unsigned ex = x >> 52, ey = y >> 52, sum = ex + ey;
+        if (!ex || !ey || (sum >= 1022 && sum <= 1026)) return riscv_fpu_softfloat(vm, insn);
+    }
+    if ((insn >> 25) == 0x08) {
+        uint32_t a = fpu_bit_f32_to_u32(riscv_read_s(vm, rs1)) & UINT32_C(0x7fffffff);
+        uint32_t b = fpu_bit_f32_to_u32(riscv_read_s(vm, rs2)) & UINT32_C(0x7fffffff);
+        unsigned ex = a >> 23, ey = b >> 23, sum = ex + ey;
+        if (!ex || !ey || (sum >= 126 && sum <= 130)) return riscv_fpu_softfloat(vm, insn);
+    }
+    return false;
 }
 
 #if defined(RISCV32) || defined(RISCV64)
@@ -176,7 +196,7 @@ static forceinline void riscv_emulate_f_fmadd(rvvm_hart_t* vm, const uint32_t in
     const size_t   rs3 = insn >> 27;
 
     if (likely(riscv_fpu_is_enabled(vm) && riscv_fpu_rm_is_valid(rm))) {
-        if (riscv_fpu_try_rmm(vm, insn)) return;
+        if (riscv_fpu_try_softfloat(vm, insn)) return;
         // A static rm field overrides the frm-tracked host mode, as in the OP-FP dispatch
         const uint32_t prev_rm = riscv_fpu_static_rm_enter(rm);
         switch (bit_ext_u32(insn, 25, 2)) {
@@ -210,7 +230,7 @@ static forceinline void riscv_emulate_f_fmsub(rvvm_hart_t* vm, const uint32_t in
     const size_t   rs3 = insn >> 27;
 
     if (likely(riscv_fpu_is_enabled(vm) && riscv_fpu_rm_is_valid(rm))) {
-        if (riscv_fpu_try_rmm(vm, insn)) return;
+        if (riscv_fpu_try_softfloat(vm, insn)) return;
         // A static rm field overrides the frm-tracked host mode, as in the OP-FP dispatch
         const uint32_t prev_rm = riscv_fpu_static_rm_enter(rm);
         switch (bit_ext_u32(insn, 25, 2)) {
@@ -244,7 +264,7 @@ static forceinline void riscv_emulate_f_fnmsub(rvvm_hart_t* vm, const uint32_t i
     const size_t   rs3 = insn >> 27;
 
     if (likely(riscv_fpu_is_enabled(vm) && riscv_fpu_rm_is_valid(rm))) {
-        if (riscv_fpu_try_rmm(vm, insn)) return;
+        if (riscv_fpu_try_softfloat(vm, insn)) return;
         // A static rm field overrides the frm-tracked host mode, as in the OP-FP dispatch
         const uint32_t prev_rm = riscv_fpu_static_rm_enter(rm);
         switch (bit_ext_u32(insn, 25, 2)) {
@@ -278,7 +298,7 @@ static forceinline void riscv_emulate_f_fnmadd(rvvm_hart_t* vm, const uint32_t i
     const size_t   rs3 = insn >> 27;
 
     if (likely(riscv_fpu_is_enabled(vm) && riscv_fpu_rm_is_valid(rm))) {
-        if (riscv_fpu_try_rmm(vm, insn)) return;
+        if (riscv_fpu_try_softfloat(vm, insn)) return;
         // A static rm field overrides the frm-tracked host mode, as in the OP-FP dispatch
         const uint32_t prev_rm = riscv_fpu_static_rm_enter(rm);
         switch (bit_ext_u32(insn, 25, 2)) {

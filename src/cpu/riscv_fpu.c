@@ -90,7 +90,7 @@ static slow_path void riscv_emulate_f_opc_op_impl(rvvm_hart_t* vm, const uint32_
 
     if (likely(riscv_fpu_is_enabled(vm))) {
 
-        if (riscv_fpu_try_rmm(vm, insn)) return;
+        if (riscv_fpu_try_softfloat(vm, insn)) return;
 
         switch (insn & 0xFE007000UL) {
             /*

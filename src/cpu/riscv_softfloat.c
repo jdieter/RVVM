@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: MPL-2.0 */
-/* Exact RMM fallback. Other rounding modes retain the native FP fast path. */
+/* Exact RMM and native tininess-boundary fallback. */
 #if defined(USE_FPU)
 #include "riscv_fpu.h"
 #include "softfloat/platform.h"
@@ -58,10 +58,11 @@
 #include "softfloat/ui64_to_f32.inc"
 #include "softfloat/ui64_to_f64.inc"
 
-bool riscv_fpu_rmm(rvvm_hart_t* vm, uint32_t insn)
+bool riscv_fpu_softfloat(rvvm_hart_t* vm, uint32_t insn)
 {
     unsigned rm = (insn >> 12) & 7;
-    if ((rm == 7 ? vm->csr.fcsr >> 5 : rm) != 4) return false;
+    rm = rm == 7 ? vm->csr.fcsr >> 5 : rm;
+    if (rm > 4) return false;
     unsigned rd = (insn >> 7) & 31, rs1 = (insn >> 15) & 31, rs2 = (insn >> 20) & 31;
     unsigned fmt = (insn >> 25) & 3, op = insn & 0x7f;
     if (fmt > 1) return false;
@@ -70,7 +71,7 @@ bool riscv_fpu_rmm(rvvm_hart_t* vm, uint32_t insn)
     float64_t x = {fpu_bit_f64_to_u64(riscv_view_d(vm, rs1))};
     float64_t y = {fpu_bit_f64_to_u64(riscv_view_d(vm, rs2))}, d;
     uint64_t integer = riscv_read_reg(vm, rs1), result;
-    softfloat_roundingMode = softfloat_round_near_maxMag;
+    softfloat_roundingMode = rm;
     softfloat_detectTininess = softfloat_tininess_afterRounding;
     softfloat_exceptionFlags = 0;
     if (op == 0x43 || op == 0x47 || op == 0x4b || op == 0x4f) {
