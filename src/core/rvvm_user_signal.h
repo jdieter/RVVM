@@ -717,7 +717,8 @@ static long user_sigqueue(int tgid, int tid, int signo, void* guest, bool thread
 {
     struct user_siginfo info;
     if (uapi_extra_copy(&info, guest, sizeof(info), false)) return -EFAULT;
-    if (info.code != SI_QUEUE) return -ENOSYS;
+    // glibc AIO queues SI_ASYNCIO with the same sender/value layout.
+    if (info.code != SI_QUEUE && info.code != SI_ASYNCIO && info.code != SI_MESGQ) return -ENOSYS;
     siginfo_t host = {0};
     host.si_signo = info.signo; host.si_errno = info.error; host.si_code = info.code;
     host.si_pid = info.data.sender.pid; host.si_uid = info.data.sender.uid;

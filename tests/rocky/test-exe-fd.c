@@ -17,13 +17,20 @@
 static atomic_int pin_value;
 #define user_exe_fd atomic_load(&pin_value)
 #define user_exe_fd_value pin_value
-static struct { uint32_t vm_fd; } test_table = {.vm_fd = UINT32_MAX};
+static struct { uint32_t vm_fd, exec_owner; int exec_handoff; void* wait_slots; } test_table = {.vm_fd = UINT32_MAX, .exec_handoff = -1};
 #define user_vm_fd ((int)test_table.vm_fd)
 #define user_fd_table() (&test_table)
 static bool user_private_fd(int fd) { return fd >= 0 && (fd == user_exe_fd || fd == user_vm_fd); }
 static char user_exe_descriptor[64];
 struct user_fd_wait { struct user_fd_wait* next; int fd, placeholder; pid_t tid; };
 static struct user_fd_wait* user_exe_waits;
+static struct user_fd_wait* user_fd_wait_alloc(void)
+{
+    test_table.wait_slots = &test_table; // Match the persistent production pool marker.
+    return calloc(1, sizeof(struct user_fd_wait));
+}
+static void user_fd_wait_free(struct user_fd_wait* wait) { free(wait); }
+static void user_fd_waits_reap(void) {}
 static struct { int target, pin; uint32_t recovery_pending, owner; } user_exe_relocation;
 static pthread_mutex_t user_exe_lock = PTHREAD_MUTEX_INITIALIZER;
 #define user_fd_mutex_lock pthread_mutex_lock
@@ -160,9 +167,11 @@ int main(void)
     assert(!close(original));
     original = pin_value;
 
-    // Hold relocation's lock while close starts, then move the pin into its fd.
+    // Use relocation's actual lock order while moving the pin into close's fd.
     paused_fd = hole;
+    user_fd_lock();
     pthread_mutex_lock(&user_exe_lock);
+    atomic_store(&started, 0);
     pthread_t worker;
     assert(!pthread_create(&worker, NULL, closer, &hole));
     while (!atomic_load(&started)) sched_yield();
@@ -179,6 +188,7 @@ int main(void)
     pthread_cond_broadcast(&pause_cond);
     pthread_mutex_unlock(&pause_lock);
     pthread_mutex_unlock(&user_exe_lock);
+    user_fd_unlock();
     void* result;
     assert(!pthread_join(worker, &result));
     assert((long)result == -EBADF && fcntl(moved, F_GETFD) == FD_CLOEXEC);

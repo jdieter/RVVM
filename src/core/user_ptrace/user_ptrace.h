@@ -33,5 +33,6 @@ bool user_ptrace_wait_ready(pid_t, int*, int, void*, long*);
 bool user_ptrace_waitid_ready(int, unsigned, siginfo_t*, int, void*, long*);
 bool user_ptrace_remote_auxv(pid_t, uint64_t[64], size_t*);
 bool user_ptrace_remote_exe_descriptor(pid_t, char*, size_t);
+bool user_ptrace_guest_task(pid_t, pid_t, bool*);
 void user_ptrace_set_exe_fd_pointer(uint32_t*);
 #endif

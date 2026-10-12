@@ -180,10 +180,10 @@ bool rvjit_ctx_init(rvjit_block_t* block, size_t size)
         block->heap.code = exec;
     }
 
-    block->space = 1024;
-    block->code  = safe_malloc(block->space);
-
     block->heap.size = size;
+    block->space = 1024;
+    block->code = malloc(block->space);
+    if (!block->code) { rvjit_ctx_free(block); return false; }
     block->heap.curr = 0;
 
     block->rv64 = false;
@@ -202,19 +202,77 @@ bool rvjit_ctx_init(rvjit_block_t* block, size_t size)
     return true;
 }
 
-void rvjit_set_native_ptrs(rvjit_block_t* block, bool native_ptrs)
+size_t rvjit_ctx_memory_size(const rvjit_block_t* block)
+{
+    size_t size = block->heap.size;
+    if (block->heap.code != block->heap.data) size += block->heap.size;
+    if (block->heap.blocks.data) size += hashmap_used_mem(&block->heap.blocks);
+    if (block->heap.block_links.data) size += hashmap_used_mem(&block->heap.block_links);
+#ifdef USER_FAULT_META
+    size += block->heap.faults.size * sizeof(rvjit_fault_t);
+#endif
+    if (block->heap.dirty_pages) size += (block->heap.dirty_mask + 1) * sizeof(uint32_t);
+    if (block->heap.jited_pages) size += (block->heap.dirty_mask + 1) * sizeof(uint32_t);
+    return size;
+}
+
+#if defined(USER_FAULT_META) && defined(RVVM_USER_TEST)
+static size_t rvjit_user_fault_capacity(void)
+{
+    /* Preserve the capacity of the former vector preallocation: rounding it
+     * down recycles the cache sooner and recompiles otherwise reusable code. */
+    size_t capacity = 2;
+    while (capacity < RVJIT_USER_FAULT_CAPACITY) capacity += capacity / 2;
+    return capacity;
+}
+#endif
+
+size_t rvjit_user_memory_size(size_t heap_size)
+{
+    /* Initialization may need separate writable and executable mappings.
+     * Reserve room for that fallback before committing optional JIT memory. */
+    if (heap_size > SIZE_MAX / 2) return SIZE_MAX;
+    size_t size = heap_size * 2;
+#if defined(USER_FAULT_META) && defined(RVVM_USER_TEST)
+    size_t tables = rvjit_user_fault_capacity() * sizeof(rvjit_fault_t)
+                  + RVJIT_USER_FAULT_CAPACITY * 4 * sizeof(hashmap_cell_t);
+    if (tables > SIZE_MAX - size) return SIZE_MAX;
+    size += tables;
+#endif
+    return size;
+}
+
+bool rvjit_set_native_ptrs(rvjit_block_t* block, bool native_ptrs)
 {
 #if defined(USER_FAULT_META) && defined(RVVM_USER_TEST)
-    if (native_ptrs && !block->native_ptrs) {
+    if (native_ptrs && !block->native_ptrs
+        && block->heap.faults.size < rvjit_user_fault_capacity()) {
         /* Allocate userspace lookup/fault tables before guest limits tighten.
          * Recycle the code cache instead of growing these tables afterward. */
-        vector_emplace(block->heap.faults, RVJIT_USER_FAULT_CAPACITY - 1);
-        vector_clear(block->heap.faults);
-        hashmap_reserve(&block->heap.blocks, RVJIT_USER_FAULT_CAPACITY * 2);
-        hashmap_reserve(&block->heap.block_links, RVJIT_USER_FAULT_CAPACITY * 2);
+        size_t capacity = RVJIT_USER_FAULT_CAPACITY * 2;
+        size_t fault_capacity = rvjit_user_fault_capacity();
+        rvjit_fault_t* faults = calloc(fault_capacity, sizeof(*faults));
+        hashmap_cell_t* blocks = calloc(capacity, sizeof(*blocks));
+        hashmap_cell_t* links = calloc(capacity, sizeof(*links));
+        if (!faults || !blocks || !links) {
+            free(faults); free(blocks); free(links);
+            return false;
+        }
+        free(block->heap.faults.data);
+        free(block->heap.blocks.data);
+        free(block->heap.block_links.data);
+        block->heap.faults.count = 0;
+        block->heap.blocks.count = block->heap.block_links.count = 0;
+        block->heap.faults.data = faults;
+        block->heap.faults.size = fault_capacity;
+        block->heap.blocks.data = blocks;
+        block->heap.blocks.mask = capacity - 1;
+        block->heap.block_links.data = links;
+        block->heap.block_links.mask = capacity - 1;
     }
 #endif
     block->native_ptrs = native_ptrs;
+    return true;
 }
 
 void rvjit_init_memtracking(rvjit_block_t* block, size_t size)
@@ -293,6 +351,7 @@ void rvjit_ctx_free(rvjit_block_t* block)
     free(block->code);
     free(block->heap.dirty_pages);
     free(block->heap.jited_pages);
+    memset(block, 0, sizeof(*block));
 }
 
 static inline void rvjit_mark_jited_page(rvjit_block_t* block, rvjit_addr_t addr)
@@ -341,6 +400,7 @@ void rvjit_block_init(rvjit_block_t* block)
 #ifdef USER_FAULT_META
     vector_clear(block->faults);
     block->fault_active = false;
+    block->fault_failed = false;
 #endif
     block->size    = 0;
     block->linkage = LINKAGE_JMP;
@@ -350,6 +410,10 @@ void rvjit_block_init(rvjit_block_t* block)
 
 rvjit_func_t rvjit_block_finalize(rvjit_block_t* block)
 {
+#ifdef USER_FAULT_META
+    // Never publish code whose fault metadata could not be recorded.
+    if (block->fault_failed) return NULL;
+#endif
     void* dest = block->heap.data + block->heap.curr;
     void* code = block->heap.code + block->heap.curr;
 

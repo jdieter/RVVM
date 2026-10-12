@@ -26,6 +26,14 @@ static struct {
     struct { pid_t tid; uint32_t ready; } threads[USER_VM_MAX_THREADS];
 } user_vm_pause;
 static __thread bool user_vm_private_wake;
+/* A resource service has its own signal/rlimit group, but coordinates the
+ * original guest group's mappings. Ordinary guest processes use getpid(). */
+static __thread pid_t user_vm_service_group;
+
+static pid_t user_vm_pause_group(void)
+{
+    return user_vm_service_group ? user_vm_service_group : getpid();
+}
 /* The reaper blocks guest signals. Its lock excludes kernel writes to guest
  * TIDs during a transition, without delaying joins for an entire vfork. */
 static uint32_t user_vm_reaper_tid, user_vm_initial_tid;
@@ -103,7 +111,7 @@ static void user_vm_pause_end(void)
         while ((state = __atomic_load_n(&user_vm_pause.threads[i].ready, __ATOMIC_ACQUIRE)) < 2) {
             struct timespec timeout = {.tv_sec = 0, .tv_nsec = 10000000};
             syscall(SYS_futex, &user_vm_pause.threads[i].ready, 128, state, &timeout, NULL, 0);
-            if (user_vm_task_gone(getpid(), user_vm_pause.threads[i].tid)) break;
+            if (user_vm_task_gone(user_vm_pause_group(), user_vm_pause.threads[i].tid)) break;
         }
     }
     user_fd_mutex_unlock(&user_vm_reaper_lock);
@@ -112,7 +120,7 @@ static void user_vm_pause_end(void)
 static int user_vm_pause_begin(void)
 {
     user_fd_mutex_lock(&user_vm_reaper_lock);
-    pid_t self = syscall(SYS_gettid), pid = getpid();
+    pid_t self = syscall(SYS_gettid), pid = user_vm_pause_group();
     user_vm_pause.count = 0;
     if (user_vm_pause_collect(self)) goto fail;
     ++user_vm_pause.generation;

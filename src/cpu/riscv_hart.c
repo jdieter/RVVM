@@ -30,7 +30,9 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 rvvm_hart_t* riscv_hart_init(rvvm_machine_t* machine)
 {
     rvvm_hart_t* vm = vma_alloc(NULL, sizeof(rvvm_hart_t), VMA_RDWR);
-    vm->wfi_cond    = condvar_create();
+    if (!vm) return NULL;
+    vm->wfi_cond = calloc(1, sizeof(*vm->wfi_cond));
+    if (!vm->wfi_cond) { vma_free(vm, sizeof(*vm)); return NULL; }
     vm->machine     = machine;
     vm->mem         = machine->mem;
     vm->rv64        = machine->rv64;

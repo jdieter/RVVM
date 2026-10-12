@@ -10,6 +10,9 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include <util/feature_test.h>
 
 #include <stdlib.h>
+#if defined(RVVM_USER_TEST) && defined(__linux__) && defined(USE_JIT)
+#include <sys/resource.h>
+#endif
 
 #include <rvvm/rvvm.h>
 #include <rvvm/rvvm_blk.h>
@@ -584,7 +587,9 @@ PUBLIC rvvm_machine_t* rvvm_create_machine(size_t mem_size, size_t hart_count, c
 #endif
 
     for (size_t i = 0; i < hart_count; ++i) {
-        vector_push_back(machine->harts, riscv_hart_init(machine));
+        rvvm_hart_t* hart = riscv_hart_init(machine);
+        if (!hart) rvvm_fatal("Cannot allocate hardware thread");
+        vector_push_back(machine->harts, hart);
     }
 
 #if defined(USE_FDT)
@@ -1314,7 +1319,7 @@ PUBLIC rvvm_hart_t* rvvm_create_user_thread(rvvm_machine_t* machine)
 {
     if (likely(machine)) {
         rvvm_hart_t* thread = riscv_hart_init(machine);
-        riscv_hart_prepare(thread);
+        if (!thread) return NULL;
 
         // Allow time CSR access from U-mode
         thread->csr.counteren[RISCV_PRIV_MACHINE]    = CSR_COUNTEREN_MASK;
@@ -1333,20 +1338,51 @@ PUBLIC rvvm_hart_t* rvvm_create_user_thread(rvvm_machine_t* machine)
         riscv_csr_op(thread, CSR_MSTATUS, &mstatus, CSR_SETBITS);
 #endif
 
-#if defined(USE_JIT)
-        // Enable pointer optimization
-        rvjit_set_native_ptrs(&thread->jit, true);
-#endif
-
         riscv_switch_priv(thread, RISCV_PRIV_USER);
 
+        bool published = false;
         scoped_spin_lock (&global_lock) {
+            bool prepare = true;
+#if defined(RVVM_USER_TEST) && defined(__linux__) && defined(USE_JIT)
+            struct rlimit limit;
+            if (!getrlimit(RLIMIT_AS, &limit) && limit.rlim_cur != RLIM_INFINITY) {
+                /* Code caches are optional. Bound their aggregate reservation
+                 * under a finite host limit so they cannot exhaust the space
+                 * needed for guest stacks and native thread bookkeeping. */
+                uint64_t budget = limit.rlim_cur / 4;
+                uint64_t cache = rvjit_user_memory_size(rvvm_get_opt(machine, RVVM_OPT_JIT_CACHE));
+                vector_foreach (machine->harts, i) {
+                    uint64_t used = rvjit_ctx_memory_size(&vector_at(machine->harts, i)->jit);
+                    budget = used < budget ? budget - used : 0;
+                }
+                prepare = cache <= budget;
+            }
+#endif
+            if (prepare) riscv_hart_prepare(thread);
+#if defined(USE_JIT)
+            if (thread->jit_enabled && !rvjit_set_native_ptrs(&thread->jit, true)) {
+                rvjit_ctx_free(&thread->jit);
+                thread->jit_enabled = false;
+            }
+#endif
             if (!vector_size(machine->harts)) {
                 // This is the main thread, initialize the timer
                 rvtimer_init(&machine->timer, rvvm_get_opt(machine, RVVM_OPT_TIME_FREQ));
             }
-            vector_push_back(machine->harts, thread);
+            if (vector_size(machine->harts) == vector_capacity(machine->harts)) {
+                size_t capacity = vector_capacity(machine->harts) * 2 + 1;
+                void* grown = realloc(machine->harts.data, capacity * sizeof(*machine->harts.data));
+                if (grown) {
+                    machine->harts.data = grown;
+                    machine->harts.size = capacity;
+                }
+            }
+            if (vector_size(machine->harts) < vector_capacity(machine->harts)) {
+                vector_push_back(machine->harts, thread);
+                published = true;
+            }
         }
+        if (!published) { riscv_hart_free(thread); return NULL; }
         return thread;
     }
     return NULL;
@@ -1358,7 +1394,10 @@ PUBLIC void rvvm_free_user_thread(rvvm_hart_t* thread)
         scoped_spin_lock (&global_lock) {
             vector_foreach (thread->machine->harts, i) {
                 if (vector_at(thread->machine->harts, i) == thread) {
-                    vector_erase(thread->machine->harts, i);
+                    // Retain capacity: cleanup must not allocate under guest limits.
+                    --thread->machine->harts.count;
+                    memmove(thread->machine->harts.data + i, thread->machine->harts.data + i + 1,
+                            (thread->machine->harts.count - i) * sizeof(*thread->machine->harts.data));
                     riscv_hart_free(thread);
                     break;
                 }

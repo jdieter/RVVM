@@ -25,21 +25,23 @@ struct user_vm {
     uintptr_t child_cleartid;
 };
 
-static void user_vm_destroy(struct user_vm* vm)
+static void user_vm_destroy_view(struct user_vm* vm, bool descriptors)
 {
     for (size_t i = 0; i < vm->count; ++i) {
         struct user_vm_region* region = vm->regions + i;
-        if (region->backing >= 0) close(region->backing);
-        if (region->baseline >= 0) close(region->baseline);
+        if (descriptors && region->backing >= 0) close(region->backing);
+        if (descriptors && region->baseline >= 0) close(region->baseline);
         if (region->original) munmap(region->original, region->size);
     }
-    if (vm->memory >= 0) close(vm->memory);
-    if (vm->pagemap >= 0) close(vm->pagemap);
+    if (descriptors && vm->memory >= 0) close(vm->memory);
+    if (descriptors && vm->pagemap >= 0) close(vm->pagemap);
     free(vm->regions);
     free(vm->scratch);
     free(vm->pages);
     free(vm);
 }
+
+static void user_vm_destroy(struct user_vm* vm) { user_vm_destroy_view(vm, true); }
 
 /* The service owns a private host descriptor table. None of its backing or
  * proc descriptors occupies a descriptor in the guest's kernel table. All

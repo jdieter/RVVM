@@ -165,6 +165,34 @@ static uintptr_t locate(pid_t pid, struct bridge* state)
     return addr;
 }
 
+/* Proc enumeration precedes debugger attachment. process_vm_readv leaves
+ * access control with Linux, unlike the attached-only remote() helper. */
+bool user_ptrace_guest_task(pid_t pid, pid_t tid, bool* recognized)
+{
+    *recognized = false;
+    char path[64], line[1024];
+    snprintf(path, sizeof(path), "/proc/%u/maps", pid);
+    FILE* maps = fopen(path, "re");
+    if (!maps) return true;
+    bool found = false;
+    while (fgets(line, sizeof(line), maps)) {
+        uintptr_t address = bridge_mapping_address(line);
+        if (!address) continue;
+        struct bridge state;
+        struct iovec local = {&state, sizeof(state)}, other = {(void*)address, sizeof(state)};
+        if (syscall(SYS_process_vm_readv, pid, &local, 1, &other, 1, 0) != sizeof(state)) {
+            *recognized = false;
+            found = true;
+            break;
+        }
+        if (state.magic != BRIDGE_MAGIC) continue;
+        *recognized = true;
+        if (state.tid == (uint32_t)tid) { found = true; break; }
+    }
+    fclose(maps);
+    return found;
+}
+
 static bool traced(void)
 {
     char path[64], line[256];

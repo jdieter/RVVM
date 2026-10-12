@@ -76,6 +76,31 @@ SysV detach ownership, exec completion and failed-exec visibility, child VMA
 changes, private descriptor relocation, robust cleanup before guest TID
 clearing, and vfork/exit status after process-leader exit.
 
+The fork-cache fixtures check reuse after kernel reaping, rejection of a
+fabricated exit while the child is live or a zombie, and a surviving
+`CLONE_FILES` grandchild after repeated parent forks. Cached mappings are
+bounded to 16 pairs. Further process/helper creation marks a guard as escaped;
+retirement then drops only the parent's mapping, without resetting shared
+state or following pointers allocated in another process.
+
+The descriptor-limit fixture also stresses concurrent executable opens during
+pin relocation. It compares the canonical executable inode and checks that
+each open starts with an independent file offset. Pin readers holding the outer
+descriptor guard need no nested metadata lock; readlink and wait bookkeeping
+retain their metadata locking.
+
+The ARM64 static performance candidate uses this build command (the mandatory
+floating-point flags remain enabled):
+
+```sh
+make -j16 USE_GUI=0 USE_SOUND=0 USE_NO_DLIB=1 \
+    CFLAGS='-O3 -fPIE -DUSER_FAULT_META' LDFLAGS=-static-pie
+```
+
+Compare candidate and installed binaries in the same private binfmt namespace,
+with identical flags, environment and CPU affinity. Record binary hashes and
+paired trials, and check workload output hashes before interpreting timings.
+
 The dev acceptance workload is `rust-sequoia-sq-1.4.0.1-2.el10_2` in the
 preserved Rocky 10.2 buildroot 179561/repository 156250. Test the candidate in
 a private binfmt mount/PID namespace, with no diagnostic preload, leaving the

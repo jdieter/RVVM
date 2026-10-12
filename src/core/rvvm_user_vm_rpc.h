@@ -9,6 +9,7 @@ struct user_vm_message {
     int64_t result;
     uint64_t offset;
 };
+static THREAD_LOCAL bool user_vm_rpc_private_files;
 
 static long user_vm_message(int socket, struct user_vm_message* message, int* fd, bool send_message)
 {
@@ -178,6 +179,13 @@ static void user_vm_serve(struct user_vm* vm, int socket)
                       | (a[3] & UAPI_MAP_FIXED_NOREPLACE ? MAP_FIXED_NOREPLACE : 0)
                       | (a[3] & 0x4000 ? MAP_NORESERVE : 0);
             if (a[3] & UAPI_MAP_ILLEGAL) { request.result = -EINVAL; goto reply; }
+            if (a[3] & 0x40000) flags |= MAP_HUGETLB | (a[3] & (63U << 26));
+            size_t page = user_vma_map_page(flags);
+            if (!page || page >= user_vma_layout.limit || a[1] > user_vma_layout.limit - page) {
+                request.result = -ENOMEM;
+                goto reply;
+            }
+            size = (a[1] + page - 1) & ~(page - 1);
             if ((flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) && a[0] % vm->page) {
                 request.result = -EINVAL;
                 goto reply;
@@ -240,7 +248,9 @@ static void user_vm_serve(struct user_vm* vm, int socket)
 #ifdef USER_FAULT_META
         if (request.nr == 216) user_exec_move_prepare(&execution, a[0], a[1], a[2]);
 #endif
-        if (user_vm_pause_begin()) {
+        bool needs_metadata = request.nr == 222 || request.nr == 216
+                           || (request.nr == 214 && added.original);
+        if ((needs_metadata && !user_vma_reserve(2)) || user_vm_pause_begin()) {
             request.result = -errno;
             spin_unlock(&mmap_lock);
             spin_unlock(&brk_lock);
@@ -373,7 +383,7 @@ reply:
     if (source >= 0) close(source);
 }
 
-static long user_vm_rpc(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2,
+static long user_vm_rpc_impl(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2,
                         uint64_t a3, uint64_t a4, uint64_t a5)
 {
     struct user_vm_message request = {.nr = nr, .args = {a0, a1, a2, a3, a4, a5}};
@@ -388,6 +398,9 @@ static long user_vm_rpc(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2,
         user_fd_unlock();
         return -error;
     }
+    /* The service retained a transmitted source. Release this helper's copy
+     * before receiving the backing, including when fd0 fills a hard limit. */
+    if (user_vm_rpc_private_files && fd >= 0) close(fd);
     fd = -1;
     if (user_vm_message(user_vm_fd, &request, &fd, false) <= 0) rvvm_fatal("Lost guest VM service");
     if (request.result >= 0) {
@@ -433,6 +446,87 @@ static long user_vm_rpc(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2,
     if (fd >= 0) close(fd);
     user_fd_unlock();
     return request.result;
+}
+
+#ifdef RVVM_STATIC_GLIBC_FORK
+struct user_vm_rpc_call {
+    uint64_t nr, args[6];
+    pid_t parent;
+    long result;
+    bool complete;
+};
+
+static int user_vm_rpc_resource(void* opaque)
+{
+    struct user_vm_rpc_call* call = opaque;
+    *user_fork_native_tid = syscall(SYS_gettid);
+    syscall(SYS_set_robust_list, user_fork_native_robust, sizeof(*user_fork_native_robust));
+    syscall(SYS_prctl, PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
+    if (getppid() != call->parent) return 127;
+    if (setsid() < 0) return 127;
+    struct rlimit limit;
+    if (getrlimit(RLIMIT_NOFILE, &limit)) return 127;
+    limit.rlim_cur = limit.rlim_max;
+    if (setrlimit(RLIMIT_NOFILE, &limit)) return 127;
+    /* This private files table needs one slot for a received backing fd,
+     * even when the guest has filled its hard limit. Closing a copied guest
+     * fd here cannot release a POSIX lock owned by the guest files table. */
+    int source = call->nr == 222 && !(call->args[3] & UAPI_MAP_ANON) ? (int)call->args[4] : -1;
+    for (int slot = 0; (rlim_t)slot < limit.rlim_max; ++slot) {
+        if (slot != source && slot != user_vm_fd && slot != (int)user_fd_table()->exe_fd) {
+            close(slot);
+            break;
+        }
+    }
+    user_vm_rpc_private_files = true;
+    call->result = user_vm_rpc_impl(call->nr, call->args[0], call->args[1], call->args[2],
+                                  call->args[3], call->args[4], call->args[5]);
+    user_vm_rpc_private_files = false;
+    call->complete = true;
+    return 0;
+}
+#endif
+
+static long user_vm_rpc(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2,
+                        uint64_t a3, uint64_t a4, uint64_t a5)
+{
+#ifdef RVVM_STATIC_GLIBC_FORK
+    /* Backing descriptors received over SCM_RIGHTS belong to the emulator.
+     * Receive and map them in a trusted process with private files and limits,
+     * sharing only this already isolated child's native memory. Guest code
+     * remains in its original process with its real kernel limits unchanged. */
+    const size_t size = 256 * 1024;
+    void* stack = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (stack == MAP_FAILED) return -errno;
+    struct user_vm_rpc_call call = {.nr = nr, .args = {a0, a1, a2, a3, a4, a5}, .parent = getpid()};
+    uint64_t held = UINT64_MAX, saved_mask;
+    syscall(SYS_rt_sigprocmask, SIG_SETMASK, &held, &saved_mask, 8);
+    int self = *user_fork_native_tid;
+    rvvm_hart_t* saved_cpu = user_sig.cpu;
+    rvvm_hart_t* saved_hart = current_user_hart;
+    user_sig.cpu = NULL;
+    current_user_hart = NULL;
+    pid_t pid = clone(user_vm_rpc_resource, (char*)stack + size, CLONE_VM | CLONE_FS, &call);
+    if (pid < 0) call.result = -errno;
+    else {
+        int status;
+        pid_t waited;
+        do { waited = syscall(SYS_wait4, pid, &status, __WALL | WUNTRACED, NULL); }
+        while (waited < 0 && errno == EINTR);
+        /* The helper can hold native allocator locks. Unexpected termination
+         * must not resume guest execution in a partially updated native heap. */
+        if (waited != pid || !WIFEXITED(status) || WEXITSTATUS(status) || !call.complete)
+            syscall(SYS_exit_group, 127);
+    }
+    *user_fork_native_tid = self;
+    user_sig.cpu = saved_cpu;
+    current_user_hart = saved_hart;
+    munmap(stack, size);
+    syscall(SYS_rt_sigprocmask, SIG_SETMASK, &saved_mask, NULL, 8);
+    return call.result;
+#else
+    return user_vm_rpc_impl(nr, a0, a1, a2, a3, a4, a5);
+#endif
 }
 
 #endif

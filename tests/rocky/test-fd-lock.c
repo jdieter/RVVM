@@ -35,11 +35,15 @@ static bool user_private_fd(int fd) { return fd >= 0 && (fd == user_exe_fd || fd
 #define user_exe_relocation (user_fd_table()->relocation)
 
 static atomic_int entered, pause_entry;
+static atomic_int *process_lock_entered, *process_lock_proceed;
 static long test_syscall(long nr, int fd, int cmd, unsigned long arg, long a3, long a4, long a5)
 {
     if (cmd == F_OFD_SETLKW) {
         atomic_store(&entered, 1);
-        while (atomic_load(&pause_entry)) sched_yield();
+        if (process_lock_entered) {
+            atomic_store(process_lock_entered, 1);
+            while (!atomic_load(process_lock_proceed)) sched_yield();
+        } else while (atomic_load(&pause_entry)) sched_yield();
     }
     return syscall(nr, fd, cmd, arg, a3, a4, a5);
 }
@@ -56,6 +60,7 @@ static int test_close(int fd)
 }
 #define close test_close
 static atomic_int dup_entered;
+static atomic_int* process_dup_entered;
 static int pause_dup = -1;
 static bool before_dup;
 static long test_fd_syscall(long nr, ...)
@@ -75,11 +80,13 @@ static long test_fd_syscall(long nr, ...)
     va_end(args);
     if (before_dup && target == pause_dup) {
         atomic_store(&dup_entered, 1);
+        if (process_dup_entered) atomic_store(process_dup_entered, 1);
         for (;;) syscall(SYS_futex, &dup_entered, FUTEX_WAIT, 1, NULL, NULL, 0);
     }
     long ret = syscall(nr, source, target, flags);
     if (!before_dup && ret >= 0 && target == pause_dup) {
         atomic_store(&dup_entered, 1);
+        if (process_dup_entered) atomic_store(process_dup_entered, 1);
         for (;;) syscall(SYS_futex, &dup_entered, FUTEX_WAIT, 1, NULL, NULL, 0);
     }
     return ret;
@@ -205,9 +212,8 @@ static void test_killed_close(void)
     int status;
     assert(waitpid(child, &status, 0) == child && WIFSIGNALED(status));
     // A different owner must never be released; the verified dead child may.
-    user_fd_mutex_recover(&user_exe_lock, child + 1);
-    assert((user_exe_lock.owner & 0x7FFFFFFFU) == (unsigned)child);
-    user_fd_mutex_recover(&user_exe_lock, child);
+    user_fd_mutex_recover(&user_fd_table()->guard->lock, child + 1);
+    assert((user_fd_table()->guard->lock.owner & 0x7FFFFFFFU) == (unsigned)child);
     user_fd_guard_recover(child);
     user_fd_waits_remove(user_fd_table(), child);
     pause_close = -1;
@@ -346,9 +352,193 @@ static void test_private_survivor(void)
     assert(!munmap(stack, 2 << 20) && !prctl(PR_SET_CHILD_SUBREAPER, 0));
 }
 
+struct files_request { int fd, source, pin, handoff, mode; atomic_int ready, proceed; struct robust_list_head* robust; };
+static int process_files(void* opaque)
+{
+    struct files_request* request = opaque;
+    if (syscall(SYS_set_robust_list, request->robust, sizeof(*request->robust))) return 4;
+    user_fd_guard_child();
+    if (request->mode == 6) {
+        struct flock lock = {.l_type = F_RDLCK, .l_whence = SEEK_SET, .l_len = 1};
+        return user_exe_fcntl(request->fd, F_OFD_SETLKW, (uintptr_t)&lock) == -EBADF ? 0 : 6;
+    }
+    if (request->mode >= 4) return user_exe_dup3(request->source, request->pin, 0);
+    if (request->mode >= 2) {
+        if (request->mode == 3 && prctl(PR_SET_DUMPABLE, 0)) _exit(1);
+        user_fd_lock();
+        user_fd_mutex_lock(&user_exe_lock);
+        if (request->mode == 3) {
+            request->handoff = dup(request->source);
+            if (request->handoff < 0 || fcntl(user_exe_fd, F_SETFD, 0)) _exit(1);
+            user_fd_table()->exec_owner = syscall(SYS_gettid);
+            user_fd_table()->exec_handoff = request->handoff;
+            atomic_store(&request->ready, 1);
+            execl("/bin/sleep", "sleep", "10", NULL);
+            _exit(1);
+        }
+        atomic_store(&request->ready, 1);
+        for (;;) pause();
+    }
+    if (request->mode == 1 && user_fd_close_range(request->fd, request->fd, 2)) return 1;
+    if (user_exe_dup3(request->source, request->pin, 0) != request->pin) return 2;
+    if (!request->mode && user_exe_close(request->fd)) return 3;
+    return 0;
+}
+
+static void test_process_files(void)
+{
+    pthread_mutexattr_t attr;
+    pthread_mutex_t mutex;
+    assert(!pthread_mutexattr_init(&attr));
+    assert(!pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST));
+    assert(!pthread_mutex_init(&mutex, &attr));
+    assert(!pthread_mutex_lock(&mutex));
+    struct robust_list_head* robust;
+    size_t robust_length;
+    assert(!syscall(SYS_get_robust_list, 0, &robust, &robust_length));
+    struct robust_list* saved_next = robust->list.next;
+    assert(!robust->list_op_pending);
+    robust->list_op_pending = saved_next;
+    assert(user_fd_mutex_share(&user_fd_table()->guard->lock));
+    assert(user_fd_mutex_share(&user_exe_lock));
+    void* stack = mmap(NULL, 1 << 20, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
+    struct files_request* request = mmap(NULL, sizeof(*request), PROT_READ | PROT_WRITE,
+                                        MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    assert(stack != MAP_FAILED && request != MAP_FAILED);
+    request->robust = robust;
+    for (int mode = 0; mode < 7; ++mode) {
+        request->mode = mode;
+        request->fd = open("/dev/null", O_RDONLY);
+        request->source = open("/dev/zero", O_RDONLY);
+        request->pin = fcntl(request->fd, F_DUPFD_CLOEXEC, 64);
+        assert(request->fd >= 0 && request->source >= 0 && request->pin >= 64);
+        user_exe_fd_value = request->pin;
+        atomic_store(&request->ready, 0);
+        if (mode == 6) {
+            atomic_store(&request->proceed, 0);
+            process_lock_entered = &request->ready;
+            process_lock_proceed = &request->proceed;
+        } else if (mode >= 4) {
+            pause_dup = request->pin;
+            before_dup = mode == 4;
+            process_dup_entered = &request->ready;
+        }
+        pid_t child = clone(process_files, (char*)stack + (1 << 20), CLONE_FILES | SIGCHLD, request);
+        assert(child > 0);
+        int status;
+        if (mode == 6) {
+            while (!atomic_load(&request->ready)) sched_yield();
+            assert(user_exe_waits && user_exe_waits->tid == child);
+            assert(!user_exe_close(request->fd));
+            assert(user_exe_dup3(request->source, request->pin, 0) == request->pin);
+            assert(user_exe_fd != request->fd);
+            atomic_store(&request->proceed, 1);
+            assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status));
+            assert(!user_exe_waits && !close(user_exe_fd));
+            process_lock_entered = process_lock_proceed = NULL;
+        } else if (mode >= 2) {
+            while (!atomic_load(&request->ready)) sched_yield();
+            assert(atomic_load_uint32(&user_fd_table()->guard->lock.registered));
+            assert(atomic_load_uint32(&user_exe_lock.registered));
+            if (mode != 3) {
+                assert(!kill(child, SIGKILL));
+                pause_dup = -1;
+                process_dup_entered = NULL;
+            }
+            /* No explicit recovery: the next operation must recover both
+             * guards. Exec is tested while its owner is still alive. */
+            user_fd_lock();
+            user_fd_mutex_lock(&user_exe_lock);
+            user_fd_mutex_unlock(&user_exe_lock);
+            user_fd_unlock();
+            if (mode != 3) assert(waitpid(child, &status, 0) == child && WIFSIGNALED(status));
+            if (mode >= 4) {
+                assert(!user_exe_relocation.owner);
+                assert((user_exe_fd != request->pin) == (mode == 5));
+                if (mode == 5) assert(!close(user_exe_fd));
+            }
+            if (mode == 3) {
+                assert(fcntl(request->pin, F_GETFD) == FD_CLOEXEC);
+                assert(fcntl(request->handoff, F_GETFD) < 0 && errno == EBADF);
+                assert(!kill(child, 0) && !kill(child, SIGKILL));
+                assert(waitpid(child, &status, 0) == child && WIFSIGNALED(status));
+            }
+        } else {
+            assert(waitpid(child, &status, 0) == child);
+            if (status) fprintf(stderr, "CLONE_FILES mode %d: child status %#x\n", mode, status);
+            assert(WIFEXITED(status) && !WEXITSTATUS(status));
+            assert((user_exe_fd != request->pin) == !mode);
+            assert((fcntl(request->fd, F_GETFD) < 0) == !mode);
+            if (!mode) assert(!close(user_exe_fd));
+        }
+        if (mode && mode != 6) assert(!close(request->fd));
+        assert(!close(request->source) && !close(request->pin));
+        user_exe_fd_value = UINT32_MAX;
+        assert(robust->list.next == saved_next && robust->list_op_pending == saved_next);
+    }
+    robust->list_op_pending = NULL;
+    assert(!pthread_mutex_unlock(&mutex) && !pthread_mutex_destroy(&mutex));
+    assert(!pthread_mutexattr_destroy(&attr));
+    assert(!munmap(request, sizeof(*request)) && !munmap(stack, 1 << 20));
+}
+
+struct promotion_test {
+    user_fd_mutex_t lock;
+    atomic_uint ready;
+    unsigned count;
+};
+
+static void* promotion_waiter(void* opaque)
+{
+    struct promotion_test* test = opaque;
+    atomic_fetch_add(&test->ready, 1);
+    for (unsigned i = 0; i < 100; ++i) {
+        user_fd_mutex_lock(&test->lock);
+        ++test->count;
+        user_fd_mutex_unlock(&test->lock);
+    }
+    return NULL;
+}
+
+static void test_lock_promotion(void)
+{
+    /* Private waiters must move to shared futex keys before a different mm
+     * can become the owner responsible for waking them. */
+    for (unsigned trial = 0; trial < 16; ++trial) {
+        struct promotion_test* test = mmap(NULL, sizeof(*test), PROT_READ | PROT_WRITE,
+                                           MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        assert(test != MAP_FAILED);
+        pthread_t threads[4];
+        user_fd_mutex_lock(&test->lock);
+        for (unsigned i = 0; i < 4; ++i)
+            assert(!pthread_create(&threads[i], NULL, promotion_waiter, test));
+        while (atomic_load(&test->ready) != 4 || !(test->lock.owner & 0x80000000U)) sched_yield();
+        assert(user_fd_mutex_share(&test->lock));
+        pid_t child = fork();
+        assert(child >= 0);
+        if (!child) {
+            user_fd_guard_child();
+            promotion_waiter(test);
+            _exit(0);
+        }
+        user_fd_mutex_unlock(&test->lock);
+        for (unsigned i = 0; i < 4; ++i) assert(!pthread_join(threads[i], NULL));
+        int status;
+        assert(waitpid(child, &status, 0) == child && !status && test->count == 500);
+        user_fd_mutex_destroy(&test->lock);
+        assert(!munmap(test, sizeof(*test)));
+    }
+}
+
 int main(void)
 {
+    test_lock_promotion();
+    user_fd_table();
     user_fd_guard_set_resume(user_exe_relocation_held);
+    // These fixtures create native process sharers outside the guest clone path.
+    assert(user_fd_mutex_share(&user_fd_table()->guard->lock));
+    assert(user_fd_mutex_share(&user_exe_lock));
     test_close_range();
     test_closed_reservation(0);
     test_closed_reservation(128); // A high reservation must not hide low free slots.
@@ -358,5 +548,6 @@ int main(void)
     test_killed_relocation(true, true, false);
     test_killed_relocation(true, true, true);
     test_private_survivor();
+    test_process_files();
     puts("PASS blocking fcntl/close_range, descriptor limits and killed-child lock recovery");
 }

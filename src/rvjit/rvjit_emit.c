@@ -428,9 +428,18 @@ static void rvjit_link_block(rvjit_block_t* block, size_t skip)
             // rvjit_tail_jmp(block, next_block - exit_ptr);
         } else {
             rvjit_patchable_ret(block);
-            vector_emplace_back(block->links);
-            vector_at(block->links, vector_size(block->links) - 1).dest = next_pc;
-            vector_at(block->links, vector_size(block->links) - 1).ptr  = exit_ptr;
+            /* Linking is optional. Keep the emitted return if guest limits
+             * leave no memory for its pending patch record. */
+            if (vector_size(block->links) == vector_capacity(block->links)) {
+                size_t capacity = vector_capacity(block->links) * 2 + 1;
+                void* grown = realloc(block->links.data, capacity * sizeof(*block->links.data));
+                if (!grown) return;
+                block->links.data = grown;
+                block->links.size = capacity;
+            }
+            size_t index = block->links.count++;
+            vector_at(block->links, index).dest = next_pc;
+            vector_at(block->links, index).ptr = exit_ptr;
             return;
         }
     } else {
@@ -937,6 +946,14 @@ static void rvjit_user_fault_sync(rvjit_block_t* block)
 #ifdef USER_FAULT_META
 void rvjit_fault_record(rvjit_block_t* block, size_t length)
 {
+    if (block->fault_failed) return;
+    if (vector_size(block->faults) == vector_capacity(block->faults)) {
+        size_t capacity = vector_capacity(block->faults) * 2 + 1;
+        void* grown = realloc(block->faults.data, capacity * sizeof(*block->faults.data));
+        if (!grown) { block->fault_failed = true; return; }
+        block->faults.data = grown;
+        block->faults.size = capacity;
+    }
     rvjit_fault_t entry;
     entry.guest_pc = block->virt_pc + block->pc_off;
     entry.start = block->size;

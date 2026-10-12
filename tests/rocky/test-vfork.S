@@ -6,6 +6,11 @@ _start:
     ld t0, 0(sp)
     li t1, 2
     beq t0, t1, executed
+    li a0, 63
+    li a1, 1 /* F_GETFD: preserve an inherited high guest descriptor. */
+    li a7, 25
+    ecall
+    mv s4, a0
     li a0, 0
     li a7, 214
     ecall
@@ -66,6 +71,14 @@ _start:
     bnez t0, 1b
     la t0, arguments
     sd t1, 8(t0)
+    /* The internal resource process must not deliver a guest SIGCHLD. */
+    li a0, 0 /* SIG_BLOCK */
+    la a1, child_signal
+    li a2, 0
+    li a3, 8
+    li a7, 135
+    ecall
+    bnez a0, fail
     li a0, 0x01204111 /* VM | VFORK | CHILD_SETTID | CHILD_CLEARTID | SIGCHLD */
     la a1, child_stack_end
     li a2, 0
@@ -76,6 +89,21 @@ _start:
     beqz a0, child
     bltz a0, fail
     mv s0, a0
+    li a0, 63
+    li a1, 1
+    li a7, 25
+    ecall
+    bne a0, s4, fail
+    la a0, pending_signal
+    li a1, 8
+    li a7, 136
+    ecall
+    bnez a0, fail
+    la t0, pending_signal
+    ld t0, 0(t0)
+    li t1, 0x10000
+    and t0, t0, t1
+    bnez t0, fail
     li a0, 0
     li a7, 214
     ecall
@@ -247,6 +275,8 @@ exit:
 pi_lock: .word 0, 0
 child_tid: .word 111, 0
 shared: .quad 123
+child_signal: .quad 0x10000
+pending_signal: .quad 0
 heap_base: .quad 0
 new_mapping: .quad 0
 arguments: .quad 0, 0, 0

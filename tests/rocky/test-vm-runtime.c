@@ -19,6 +19,36 @@ static void expect_sigbus(char* address)
 int main(void)
 {
     size_t page = sysconf(_SC_PAGESIZE), size = (size_t)1 << 30;
+    // glibc marks the main stack executable through its top page only.
+    char* stack = user_vma_map(NULL, page * 5, PROT_NONE,
+                              MAP_PRIVATE | MAP_ANONYMOUS | MAP_GROWSDOWN, -1, 0);
+    assert(stack != MAP_FAILED && !mprotect(stack + page, page * 3, PROT_READ | PROT_WRITE));
+    uintptr_t start = (uintptr_t)(stack + page * 3);
+    size_t span = page;
+    assert(!user_vma_protect_span(&start, &span, PROT_GROWSDOWN));
+    assert(start == (uintptr_t)(stack + page) && span == page * 3);
+    assert(!mprotect(stack + page * 3, page, PROT_READ | PROT_GROWSDOWN));
+    span = 0;
+    assert(!user_vma_protect_span(&start, &span, PROT_GROWSDOWN) && !span);
+    assert(!user_vma_unmap(stack, page * 5));
+    char* source = user_vma_map(NULL, page, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char* hint = user_vma_map(NULL, page * 64, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    assert(source != MAP_FAILED && hint != MAP_FAILED);
+    source[0] = 17;
+    assert(!user_vma_unmap(hint, page * 64));
+    assert(user_vma_remap(source, page, page, MREMAP_MAYMOVE | MREMAP_DONTUNMAP,
+                          hint + 1) == MAP_FAILED && errno == EINVAL && source[0] == 17);
+    assert(user_vma_remap(source, page, page, MREMAP_MAYMOVE | MREMAP_DONTUNMAP,
+                          source) == MAP_FAILED && errno == EINVAL && source[0] == 17);
+    char* moved = user_vma_remap(source, page, page, MREMAP_MAYMOVE | MREMAP_DONTUNMAP, hint);
+    assert(moved == hint && moved[0] == 17 && !source[0]);
+    source[0] = 23;
+    assert(moved[0] == 17);
+    char* again = user_vma_remap(source, page, page, MREMAP_MAYMOVE | MREMAP_DONTUNMAP, moved);
+    assert(again != MAP_FAILED && again != moved && again[0] == 23 && moved[0] == 17);
+    assert(!user_vma_unmap(source, page) && !user_vma_unmap(moved, page) && !user_vma_unmap(again, page));
+    assert(!user_vma_owned_count);
     unsigned char* memory = user_vma_map(NULL, size, PROT_NONE,
                                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     assert(memory != MAP_FAILED);

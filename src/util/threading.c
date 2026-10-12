@@ -202,7 +202,8 @@ rvvm_thread_t* rvvm_thread_create_ex(rvvm_thread_func_t func, void* arg, uint32_
 #if defined(USE_THREAD_EMU)
     UNUSED(func && arg && stack_size);
 #else
-    rvvm_thread_t* thread = safe_new_obj(rvvm_thread_t);
+    rvvm_thread_t* thread = calloc(1, sizeof(*thread));
+    if (!thread) return NULL;
     bool           result = false;
 #if defined(SANITIZERS_ENABLED)
     // Sanitizers consume a lot of extra stack space, use default stack size

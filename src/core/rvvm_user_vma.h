@@ -5,6 +5,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,15 +26,55 @@ struct user_vma_layout {
 static struct user_vma_layout user_vma_layout = {
     UINT64_C(0x800000000000), UINT64_C(0x7fff00000000), UINT64_C(0x7a0000000000), UINT64_C(64) << 30
 };
+static size_t user_vma_huge_page;
+
+/* Base page size is fixed for this host. Avoid repeated libc queries in the
+ * mapping path; native fixtures can also initialize it before user_vma_init. */
+static size_t user_vma_page(void)
+{
+    static size_t cached;
+    size_t page = __atomic_load_n(&cached, __ATOMIC_RELAXED);
+    if (!page) {
+        page = (size_t)sysconf(_SC_PAGESIZE);
+        __atomic_store_n(&cached, page, __ATOMIC_RELAXED);
+    }
+    return page;
+}
 
 static int user_vma_init(const char* bits)
 {
-    if (!bits || !strcmp(bits, "48")) return 1;
-    if (strcmp(bits, "39")) return 0;
-    user_vma_layout = (struct user_vma_layout) {
-        UINT64_C(0x4000000000), UINT64_C(0x3fff000000), UINT64_C(0x3c00000000), UINT64_C(1) << 30
-    };
+    if (bits && strcmp(bits, "39") && strcmp(bits, "48")) return 0;
+    if (bits && !strcmp(bits, "39"))
+        user_vma_layout = (struct user_vma_layout) {
+            UINT64_C(0x4000000000), UINT64_C(0x3fff000000), UINT64_C(0x3c00000000), UINT64_C(1) << 30
+        };
+    /* Cache the kernel's default before guests can exhaust descriptor slots. */
+    int fd = open("/proc/meminfo", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        char info[4096];
+        ssize_t count = read(fd, info, sizeof(info) - 1);
+        close(fd);
+        if (count > 0) {
+            info[count] = 0;
+            char* value = strstr(info, "Hugepagesize:");
+            if (value) user_vma_huge_page = strtoul(value + 13, NULL, 10) * 1024;
+        }
+    }
     return 1;
+}
+
+static size_t user_vma_map_page(int flags)
+{
+    size_t page = user_vma_page();
+#ifdef MAP_HUGETLB
+    if (flags & MAP_HUGETLB) {
+        unsigned shift = ((unsigned)flags >> 26) & 63;
+        size_t huge = shift ? (size_t)1 << shift : user_vma_huge_page;
+        if (!huge) return 0;
+        if (huge > page) page = huge;
+    }
+#endif
+    return page;
 }
 
 static uintptr_t user_vma_cursor;
@@ -47,26 +88,47 @@ static struct user_vma_range* user_vma_owned;
 static size_t user_vma_owned_count, user_vma_owned_capacity;
 static user_fd_mutex_t user_vma_owned_lock;
 
-static void user_vma_grow(void)
+static bool user_vma_reserve_locked(size_t extra)
 {
-    if (user_vma_owned_count < user_vma_owned_capacity) return;
+    if (extra <= user_vma_owned_capacity - user_vma_owned_count) return true;
     size_t capacity = user_vma_owned_capacity ? user_vma_owned_capacity * 2 : 256;
-    if (capacity <= user_vma_owned_capacity || capacity > SIZE_MAX / sizeof(*user_vma_owned)) abort();
+    if (extra > SIZE_MAX - user_vma_owned_count) { errno = ENOMEM; return false; }
+    if (capacity < user_vma_owned_count + extra) capacity = user_vma_owned_count + extra;
+    if (capacity <= user_vma_owned_capacity || capacity > SIZE_MAX / sizeof(*user_vma_owned)) {
+        errno = ENOMEM;
+        return false;
+    }
     size_t bytes = capacity * sizeof(*user_vma_owned);
     /* Native metadata uses kernel mappings, not malloc: VM transitions may
      * have parked a guest thread inside the native allocator. */
     void* ranges = user_vma_owned
         ? mremap(user_vma_owned, user_vma_owned_capacity * sizeof(*user_vma_owned), bytes, MREMAP_MAYMOVE)
         : mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (ranges == MAP_FAILED) abort();
+    if (ranges == MAP_FAILED) return false;
     user_vma_owned = ranges;
     user_vma_owned_capacity = capacity;
+    return true;
+}
+
+static bool user_vma_reserve(size_t extra)
+{
+    user_fd_mutex_lock(&user_vma_owned_lock);
+    bool result = user_vma_reserve_locked(extra);
+    user_fd_mutex_unlock(&user_vma_owned_lock);
+    return result;
+}
+
+static void user_vma_grow(void)
+{
+    /* Mutating callers reserve metadata before changing kernel mappings.
+     * A failure here therefore indicates a broken ownership invariant. */
+    if (!user_vma_reserve_locked(1)) abort();
 }
 
 static void user_vma_forget(uintptr_t start, size_t size)
 {
     user_fd_mutex_lock(&user_vma_owned_lock);
-    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    size_t page = user_vma_page();
     uintptr_t end = start + ((size + page - 1) & ~(page - 1));
     for (size_t i = 0; i < user_vma_owned_count;) {
         struct user_vma_range range = user_vma_owned[i];
@@ -92,7 +154,7 @@ static void user_vma_forget(uintptr_t start, size_t size)
 static void user_vma_remember(uintptr_t start, size_t size)
 {
     user_fd_mutex_lock(&user_vma_owned_lock);
-    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    size_t page = user_vma_page();
     uintptr_t end = start + ((size + page - 1) & ~(page - 1));
     size_t first = 0, last;
     while (first < user_vma_owned_count && user_vma_owned[first].end < start) ++first;
@@ -113,10 +175,22 @@ static void user_vma_remember(uintptr_t start, size_t size)
 
 static int user_vma_unmap(void* addr, size_t size)
 {
+    uintptr_t start = (uintptr_t)addr;
+    size_t page = user_vma_page();
+    if (!size || start % page || size > SIZE_MAX - page + 1
+        || start > SIZE_MAX - ((size + page - 1) & ~(page - 1)))
+        return munmap(addr, size);
+    if (size <= SIZE_MAX - page + 1) {
+        uintptr_t end = start + ((size + page - 1) & ~(page - 1));
+        for (size_t i = 0; i < user_vma_owned_count; ++i) {
+            if (user_vma_owned[i].start < start && user_vma_owned[i].end > end
+                && !user_vma_reserve(1)) return -1;
+        }
+    }
     int ret = munmap(addr, size);
     if (!ret) {
         user_vma_forget((uintptr_t)addr, size);
-        size_t page = (size_t)sysconf(_SC_PAGESIZE);
+        size_t page = user_vma_page();
         uintptr_t expected = (uintptr_t)addr;
         uintptr_t end = expected + ((size + page - 1) & ~(page - 1));
         /* Reuse the most recent hole instead of churning page tables. A racing
@@ -131,6 +205,51 @@ static int user_vma_unmap(void* addr, size_t size)
 static inline int user_vma_range(uintptr_t addr, size_t size)
 {
     return addr < user_vma_layout.limit && size <= user_vma_layout.limit - addr;
+}
+
+/* GROWSDOWN/GROWSUP protection changes extend to the containing kernel VMA.
+ * Read its bounds before mprotect can split it; ordinary calls skip this scan. */
+static int user_vma_protect_span(uintptr_t* addr, size_t* size, int prot)
+{
+    int grow = prot & (PROT_GROWSDOWN | PROT_GROWSUP);
+    /* Leave argument validation to mprotect before a maps lookup can mask
+     * EINVAL with ENOMEM, or alter the span of an invalid request. */
+    if (!*size || !grow || grow == (PROT_GROWSDOWN | PROT_GROWSUP)
+        || (*addr & (user_vma_page() - 1))) return 0;
+    int fd = open("/proc/thread-self/maps", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    char buffer[4096], line[128];
+    size_t used = 0;
+    ssize_t count;
+    while ((count = read(fd, buffer, sizeof(buffer))) != 0) {
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            int error = errno;
+            close(fd);
+            errno = error;
+            return -1;
+        }
+        for (ssize_t i = 0; i < count; ++i) {
+            if (buffer[i] != '\n') {
+                if (used < sizeof(line) - 1) line[used++] = buffer[i];
+                continue;
+            }
+            line[used] = 0;
+            used = 0;
+            char* delimiter;
+            uintptr_t start = strtoull(line, &delimiter, 16);
+            if (*delimiter != '-') continue;
+            uintptr_t end = strtoull(delimiter + 1, NULL, 16);
+            if (*addr < start || *addr >= end) continue;
+            if (prot & PROT_GROWSDOWN) { *size += *addr - start; *addr = start; }
+            if (prot & PROT_GROWSUP) *size = end - *addr;
+            close(fd);
+            return 0;
+        }
+    }
+    close(fd);
+    errno = ENOMEM;
+    return -1;
 }
 
 /* Callers hold the fd guard before their mapping/brk locks. The slow path
@@ -180,7 +299,8 @@ done:
  * No new userspace lock needs resetting after fork. */
 static void* user_vma_map_raw(void* addr, size_t size, int prot, int flags, int fd, off_t offset)
 {
-    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    size_t page = user_vma_map_page(flags);
+    if (!page || page >= user_vma_layout.limit) { errno = ENOMEM; return MAP_FAILED; }
     if (!size || size > user_vma_layout.limit - page) { errno = size ? ENOMEM : EINVAL; return MAP_FAILED; }
     size_t span = (size + page - 1) & ~(page - 1);
     if (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) {
@@ -210,14 +330,16 @@ static void* user_vma_map_raw(void* addr, size_t size, int prot, int flags, int 
         uintptr_t floor = span <= user_vma_layout.top - arena ? arena : UINT64_C(0x10000);
         uintptr_t next;
         do {
-            next = top >= floor + span ? top - span : user_vma_layout.top - span;
+            next = (top >= floor + span ? top - span : user_vma_layout.top - span) & ~(page - 1);
         } while (!__atomic_compare_exchange_n(&user_vma_cursor, &top, next, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
         void* ret = mmap((void*)next, size, prot, flags | MAP_FIXED_NOREPLACE, fd, offset);
         if (ret != MAP_FAILED || errno != EEXIST) return ret;
     }
     for (unsigned retry = 0; retry < 128; ++retry) {
-        uintptr_t next = user_vma_gap(span, UINT64_C(0x10000), user_vma_layout.top);
+        uintptr_t next = user_vma_gap(span + page - user_vma_page(),
+                                     UINT64_C(0x10000), user_vma_layout.top);
         if (!next) { errno = ENOMEM; return MAP_FAILED; }
+        next = (next + page - 1) & ~(page - 1);
         void* ret = mmap((void*)next, size, prot, flags | MAP_FIXED_NOREPLACE, fd, offset);
         if (ret != MAP_FAILED || errno != EEXIST) return ret;
     }
@@ -227,13 +349,34 @@ static void* user_vma_map_raw(void* addr, size_t size, int prot, int flags, int 
 
 static void* user_vma_map(void* addr, size_t size, int prot, int flags, int fd, off_t offset)
 {
+    size_t page = user_vma_map_page(flags);
+    /* Argument errors must not be replaced by a metadata allocation failure. */
+    if (!size || !page || page >= user_vma_layout.limit || size > user_vma_layout.limit - page
+        || offset % user_vma_page()
+        || ((flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) && (uintptr_t)addr % page)
+        || (!(flags & MAP_ANONYMOUS) && fcntl(fd, F_GETFD) < 0))
+        return user_vma_map_raw(addr, size, prot, flags, fd, offset);
+    if (!user_vma_reserve(1)) return MAP_FAILED;
     void* ret = user_vma_map_raw(addr, size, prot, flags, fd, offset);
-    if (ret != MAP_FAILED) user_vma_remember((uintptr_t)ret, size);
+    if (ret != MAP_FAILED) {
+        size_t page = user_vma_map_page(flags);
+        user_vma_remember((uintptr_t)ret, (size + page - 1) & ~(page - 1));
+    }
     return ret;
 }
 
 static void* user_vma_remap_raw(void* addr, size_t oldsize, size_t newsize, int flags, void* newaddr)
 {
+    if (flags & MREMAP_DONTUNMAP) {
+        size_t page = user_vma_page();
+        uintptr_t old = (uintptr_t)addr, hint = (uintptr_t)newaddr;
+        if (!(flags & MREMAP_MAYMOVE) || oldsize != newsize || hint % page
+            || !user_vma_range(hint, newsize)
+            || (old + oldsize > hint && hint + newsize > old)) {
+            errno = EINVAL;
+            return MAP_FAILED;
+        }
+    }
     if (!user_vma_range((uintptr_t)addr, oldsize)
         || ((flags & MREMAP_FIXED) && !user_vma_range((uintptr_t)newaddr, newsize))) {
         errno = ENOMEM;
@@ -249,7 +392,10 @@ static void* user_vma_remap_raw(void* addr, size_t oldsize, size_t newsize, int 
         void* ret = mremap(addr, oldsize, newsize, flags & ~MREMAP_MAYMOVE);
         if (ret != MAP_FAILED || errno != ENOMEM) return ret;
     }
-    void* dest = user_vma_map_raw(NULL, newsize, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    /* DONTUNMAP uses newaddr as a hint even without FIXED. Reserve it with
+     * ordinary mmap placement, so an occupied hint is never overwritten. */
+    void* hint = (flags & MREMAP_DONTUNMAP) ? newaddr : NULL;
+    void* dest = user_vma_map_raw(hint, newsize, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (dest == MAP_FAILED) return dest;
     void* ret = mremap(addr, oldsize, newsize, flags | MREMAP_FIXED, dest);
     if (ret == MAP_FAILED) {
@@ -262,6 +408,13 @@ static void* user_vma_remap_raw(void* addr, size_t oldsize, size_t newsize, int 
 
 static void* user_vma_remap(void* addr, size_t oldsize, size_t newsize, int flags, void* newaddr)
 {
+    size_t page = user_vma_page();
+    if (!newsize || (uintptr_t)addr % page
+        || (flags & ~(MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP))
+        || ((flags & (MREMAP_FIXED | MREMAP_DONTUNMAP)) && !(flags & MREMAP_MAYMOVE))
+        || ((flags & MREMAP_FIXED) && (uintptr_t)newaddr % page))
+        return user_vma_remap_raw(addr, oldsize, newsize, flags, newaddr);
+    if (!user_vma_reserve(2)) return MAP_FAILED;
     void* ret = user_vma_remap_raw(addr, oldsize, newsize, flags, newaddr);
     if (ret != MAP_FAILED) {
         if (oldsize && !(flags & MREMAP_DONTUNMAP)) user_vma_forget((uintptr_t)addr, oldsize);
@@ -274,13 +427,15 @@ static void* user_vma_shmat(int id, void* addr, int flags)
 {
     struct shmid_ds info;
     if (shmctl(id, IPC_STAT, &info)) return (void*)-1;
+    if (!addr && (flags & SHM_REMAP)) { errno = EINVAL; return (void*)-1; }
     if (addr) {
         if (!user_vma_range((uintptr_t)addr, info.shm_segsz)) { errno = EINVAL; return (void*)-1; }
+        if (!user_vma_reserve(1)) return (void*)-1;
         void* ret = shmat(id, addr, flags);
         if (ret != (void*)-1) user_vma_remember((uintptr_t)ret, info.shm_segsz);
         return ret;
     }
-    if (flags & SHM_REMAP) { errno = EINVAL; return (void*)-1; }
+    if (!user_vma_reserve(1)) return (void*)-1;
     void* dest = user_vma_map_raw(NULL, info.shm_segsz, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (dest == MAP_FAILED) return dest;
     void* ret = shmat(id, dest, flags | SHM_REMAP);
@@ -314,6 +469,13 @@ static int user_vma_shmdt(void* addr)
         if (!grown) { fclose(maps); free(fragments); return -1; }
         fragments = grown;
         fragments[count++] = range;
+    }
+    if (count > SIZE_MAX / 2 || !user_vma_reserve(count * 2)) {
+        int error = count > SIZE_MAX / 2 ? ENOMEM : errno;
+        fclose(maps);
+        free(fragments);
+        errno = error;
+        return -1;
     }
     int ret = shmdt(addr), saved = errno;
     if (!ret) {

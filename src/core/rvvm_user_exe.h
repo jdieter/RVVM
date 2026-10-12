@@ -233,9 +233,8 @@ static bool user_exe_fast_open(const char* path, unsigned long flags, long* resu
     if (!user_path_match(path, "/proc/self/exe")
         || !user_exe_cached_link(AT_FDCWD, "/proc/self/exe")) return false;
     user_fd_lock();
-    user_fd_mutex_lock(&user_exe_lock);
+    // Pin writers also hold this guard; the generated path is private TLS.
     *result = errno_ret(USER_SYSCALL(SYS_openat, AT_FDCWD, user_exe_path(), flags, 0, 0, 0));
-    user_fd_mutex_unlock(&user_exe_lock);
     user_fd_unlock();
     return true;
 }
@@ -246,10 +245,8 @@ static long user_exe_opened(long fd, unsigned long flags, const struct stat* st)
         return fd;
     // Reopen rather than dup: guest file offsets and status flags must be independent.
     user_fd_lock();
-    user_fd_mutex_lock(&user_exe_lock);
     int replacement = open(user_exe_path(), flags & ~O_NOFOLLOW);
     long result = replacement < 0 ? -errno : replacement;
-    user_fd_mutex_unlock(&user_exe_lock);
     close(fd);
     user_fd_unlock();
     return result;

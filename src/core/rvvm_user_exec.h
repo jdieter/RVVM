@@ -45,11 +45,13 @@ static long user_execve(const char* path, char** argv, char** envp)
     snprintf(marker, sizeof(marker), "RVVM_USER_EXEPIN=%d", pin);
     ret = user_exec_environment(envp, marker, &next_env);
     if (ret) goto out;
+    user_fd_table()->exec_owner = syscall(SYS_gettid);
     if (fcntl(pin, F_SETFD, 0)) ret = -errno;
     else {
         ret = errno_ret(USER_SYSCALL(SYS_execve, path, argv, next_env, 0, 0, 0));
         fcntl(pin, F_SETFD, FD_CLOEXEC);
     }
+    user_fd_table()->exec_owner = 0;
     free(next_env);
 out:
     user_fd_mutex_unlock(&user_exe_lock);
@@ -57,19 +59,24 @@ out:
     return ret;
 }
 
-/* binfmt_misc rejects AT_EMPTY_PATH on a CLOEXEC fd before loading the
- * interpreter. Keep a separate descriptor alive until the next RVVM loads
- * the ELF; never change the guest descriptor's flags or resolve its name. */
+/* binfmt_misc cannot reopen ELF paths through CLOEXEC file/directory fds.
+ * Keep a separate ELF descriptor alive until the next RVVM loads it;
+ * never change the guest descriptor's flags. */
 static long user_execveat_inner(int fd, const char* path, char** argv, char** envp, int flags)
 {
     long ret = errno_ret(USER_SYSCALL(SYS_execveat, fd, path, argv, envp, flags, 0));
-    char empty;
-    if (ret != -ENOENT || !(flags & AT_EMPTY_PATH)
-        || user_memory_copy(&empty, path, 1) || empty
-        || !(fcntl(fd, F_GETFD) & FD_CLOEXEC)) return ret;
+    char first;
+    if (ret != -ENOENT || user_memory_copy(&first, path, 1)
+        || first == '/' || fd == AT_FDCWD
+        || !(fcntl(fd, F_GETFD) & FD_CLOEXEC)
+        || (!first && !(flags & AT_EMPTY_PATH))) return ret;
 
-    int handoff = fcntl(fd, F_DUPFD_CLOEXEC, 0);
-    if (handoff < 0) return -errno;
+    int handoff = first ? openat(fd, path, O_RDONLY | O_CLOEXEC
+                                    | ((flags & AT_SYMLINK_NOFOLLOW) ? O_NOFOLLOW : 0))
+                        : fcntl(fd, F_DUPFD_CLOEXEC, 0);
+    if (handoff < 0) return ret;
+    user_fd_table()->exec_owner = syscall(SYS_gettid);
+    user_fd_table()->exec_handoff = handoff;
     char name[64];
     snprintf(name, sizeof(name), "/proc/thread-self/fd/%d", handoff);
     int reader = open(name, O_RDONLY | O_CLOEXEC);
@@ -88,11 +95,14 @@ static long user_execveat_inner(int fd, const char* path, char** argv, char** en
     if (ret) goto out;
     if (fcntl(handoff, F_SETFD, 0)) ret = -errno;
     else {
-        ret = errno_ret(USER_SYSCALL(SYS_execveat, handoff, "", argv, next_env, flags, 0));
+        ret = errno_ret(USER_SYSCALL(SYS_execveat, handoff, "", argv, next_env,
+                                    flags | AT_EMPTY_PATH, 0));
     }
     free(next_env);
 out:
     close(handoff);
+    user_fd_table()->exec_handoff = -1;
+    user_fd_table()->exec_owner = 0;
     return ret;
 }
 

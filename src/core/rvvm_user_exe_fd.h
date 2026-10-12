@@ -54,9 +54,22 @@ static void user_exe_relocation_finish(bool shared_files, uint32_t tid)
 
 static void user_exe_relocation_held(void)
 {
-    if (!atomic_load_uint32(&user_exe_relocation.recovery_pending)) return;
+    /* The outer descriptor guard serializes publication of these states.
+     * Wait slots remain allocated after their first use, so an unlocked
+     * blocking waiter cannot make this empty-table check miss recovery. */
+    if (!atomic_load_uint32(&user_exe_relocation.owner) && !user_fd_table()->exec_owner
+        && !user_fd_table()->wait_slots) return;
     user_fd_mutex_lock(&user_exe_lock);
-    if (user_exe_relocation.recovery_pending) user_exe_relocation_finish(true, 0);
+    user_exe_relocation_finish(true, 0);
+    user_fd_waits_reap();
+    if (user_fd_table()->exec_owner) {
+        /* Successful exec detached the owner's kernel table and discarded
+         * its mappings. Restore handoff flags in the surviving table. */
+        if (user_exe_fd >= 0) fcntl(user_exe_fd, F_SETFD, FD_CLOEXEC);
+        if (user_fd_table()->exec_handoff >= 0) close(user_fd_table()->exec_handoff);
+        user_fd_table()->exec_handoff = -1;
+        user_fd_table()->exec_owner = 0;
+    }
     user_fd_mutex_unlock(&user_exe_lock);
 }
 
@@ -150,16 +163,16 @@ static long user_exe_fcntl(int fd, int cmd, unsigned long arg)
 {
     user_fd_lock();
     if (cmd == F_SETLKW || cmd == F_OFD_SETLKW) {
-        struct user_fd_wait* wait = calloc(1, sizeof(*wait));
-        if (!wait) { user_fd_unlock(); return -ENOMEM; }
+        user_fd_mutex_lock(&user_exe_lock);
+        struct user_fd_wait* wait = user_fd_wait_alloc();
+        if (!wait) { user_fd_mutex_unlock(&user_exe_lock); user_fd_unlock(); return -ENOMEM; }
         wait->fd = fd;
         wait->placeholder = -1;
         wait->tid = syscall(SYS_gettid);
-        user_fd_mutex_lock(&user_exe_lock);
         if (user_private_fd(fd) || fcntl(fd, F_GETFD) < 0) {
+            user_fd_wait_free(wait);
             user_fd_mutex_unlock(&user_exe_lock);
             user_fd_unlock();
-            free(wait);
             return -EBADF;
         }
         wait->next = user_exe_waits;
@@ -173,8 +186,8 @@ static long user_exe_fcntl(int fd, int cmd, unsigned long arg)
         struct user_fd_wait** link = &user_exe_waits;
         while (*link != wait) link = &(*link)->next;
         *link = wait->next;
+        user_fd_wait_free(wait);
         user_fd_mutex_unlock(&user_exe_lock);
-        free(wait);
         return ret;
     }
     long ret = user_private_fd(fd) ? -EBADF : errno_ret(USER_SYSCALL(SYS_fcntl, fd, cmd, arg, 0, 0, 0));
@@ -193,9 +206,7 @@ static long user_exe_dup(int fd)
 static long user_exe_close(int fd)
 {
     user_fd_lock();
-    user_fd_mutex_lock(&user_exe_lock);
     long ret = user_private_fd(fd) ? -EBADF : (long)errno_ret(close(fd));
-    user_fd_mutex_unlock(&user_exe_lock);
     user_fd_unlock();
     return ret;
 }

@@ -112,6 +112,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <sys/xattr.h>   // fgetxattr(), fsetxattr()
 #include <sys/inotify.h>
 #include <sys/timerfd.h>
+#include <sys/timex.h>
 
 // Put syscall headers here
 #include <linux/futex.h> // FUTEX_*
@@ -525,6 +526,7 @@ static const char* wrap_path(char* buffer, const char* path)
 #include "user_ptrace/user_ptrace.h"
 #include "user_ptrace/user_ptrace_events.h"
 #include "rvvm_user_vm_pause.h"
+#include "rvvm_user_service.h"
 #include "rvvm_user_signal.h"
 #include "rvvm_user_posix.h"
 #include "rvvm_user_ipc.h"
@@ -730,6 +732,8 @@ typedef struct rvvm_user_thread {
     uint32_t* child_cleartid;
     uint32_t* parent_settid;
     uint32_t tid;
+    uint32_t unshare_flags, setup_ready;
+    int setup_error;
     uint32_t refs;
     uint64_t signal_mask;
     bool process_thread;
@@ -754,7 +758,7 @@ static spinlock_t brk_lock = {0};
 static spinlock_t mmap_lock = {0};
 static user_fd_mutex_t user_vm_transition_lock;
 static THREAD_LOCAL unsigned user_vm_transition_depth;
-static THREAD_LOCAL bool user_vm_service, user_vm_child;
+static THREAD_LOCAL bool user_vm_service, user_vm_child, user_vm_fork_peer;
 
 static void user_vm_enter(void)
 {
@@ -771,7 +775,6 @@ static bool user_reaper_running;
 /* Publish the last guest exit status together with the live count. The
  * internal reaper must not turn a nonzero last-thread exit into success. */
 static uint64_t user_thread_lifetime = 1;
-static uint32_t user_reap_wake;
 
 static void user_reap_finished(void)
 {
@@ -813,24 +816,17 @@ static void* user_thread_reaper(void* unused)
         user_fd_mutex_lock(&user_vm_reaper_lock);
         user_reap_finished();
         bool pending = user_reap_threads != NULL;
-        uint32_t wake = atomic_load_uint32(&user_reap_wake);
         uint64_t lifetime = atomic_load_uint64(&user_thread_lifetime);
-        if (!pending && !(uint32_t)lifetime) {
+        if (!pending) {
             user_reaper_running = false;
+            atomic_store_uint32(&user_vm_reaper_tid, 0);
             user_fd_mutex_unlock(&user_vm_reaper_lock);
-            syscall(SYS_exit, lifetime >> 32);
+            if (!(uint32_t)lifetime) syscall(SYS_exit, lifetime >> 32);
             return NULL;
         }
         user_fd_mutex_unlock(&user_vm_reaper_lock);
-        if (pending) sleep_ms(1);
-        else rvvm_futex_wait(&user_reap_wake, wake, RVVM_FUTEX_INFINITE);
+        sleep_ms(1);
     }
-}
-
-static void user_reap_notify(void)
-{
-    atomic_add_uint32(&user_reap_wake, 1);
-    rvvm_futex_wake(&user_reap_wake, 1);
 }
 #ifdef USER_FAULT_META
 #include "rvvm_user_memory.h"
@@ -879,6 +875,7 @@ static void* rvvm_sys_brk(void* addr)
 #endif
 
 #define UAPI_CLONE_VM             0x00000100
+#define UAPI_CLONE_FILES          0x00000400
 #define UAPI_CLONE_SIGHAND        0x00000800
 #define UAPI_CLONE_PIDFD          0x00001000
 #define UAPI_CLONE_THREAD         0x00010000
@@ -896,6 +893,7 @@ static void* rvvm_sys_brk(void* addr)
 static rvvm_hart_t* user_clone_cpu(rvvm_hart_t* parent)
 {
     rvvm_hart_t* cpu = rvvm_create_user_thread(userland);
+    if (!cpu) return NULL;
     for (size_t i = 1; i < 32; ++i)
         rvvm_write_cpu_reg(cpu, RVVM_REGID_X0 + i, rvvm_read_cpu_reg(parent, RVVM_REGID_X0 + i));
     for (size_t i = 0; i < 32; ++i)
@@ -911,6 +909,8 @@ static rvvm_hart_t* user_clone_cpu(rvvm_hart_t* parent)
 
 // long sys_clone(unsigned long flags, void *stack, int *parent_tid, unsigned long tls, int *child_tid);
 static int rvvm_sys_vfork(rvvm_user_thread_t*, uint32_t, size_t, uint32_t*, size_t, uint32_t*);
+#include "rvvm_user_fork.h"
+#include "rvvm_user_fork_cache.h"
 
 static int rvvm_sys_clone_impl(rvvm_user_thread_t* current, uint32_t flags, size_t stack, uint32_t* parent_tid, size_t tls, uint32_t* child_tid)
 {
@@ -919,15 +919,21 @@ static int rvvm_sys_clone_impl(rvvm_user_thread_t* current, uint32_t flags, size
     if (flags & UAPI_CLONE_VM) {
         const uint32_t supported = 0xff | UAPI_CLONE_THREAD_FLAGS | UAPI_CLONE_OPTIONAL_FLAGS
             | 0x00008000; // CLONE_PARENT
-        if ((flags & UAPI_CLONE_THREAD_FLAGS) != UAPI_CLONE_THREAD_FLAGS || (flags & ~supported)) {
+        const uint32_t required = UAPI_CLONE_VM | UAPI_CLONE_SIGHAND | UAPI_CLONE_THREAD;
+        if ((flags & required) != required || (flags & ~supported)) {
             return -UAPI_EINVAL;
         }
 
+        uint32_t separate = (CLONE_FS | CLONE_FILES | CLONE_SYSVSEM) & ~flags;
         uint64_t held = UINT64_MAX, saved_mask;
         syscall(SYS_rt_sigprocmask, SIG_SETMASK, &held, &saved_mask, 8);
+        if (separate) user_fd_lock();
+        user_fd_mutex_lock(&user_vm_reaper_lock);
         if (!user_reaper_running) {
             rvvm_thread_t* reaper = rvvm_thread_create(user_thread_reaper, NULL);
             if (!reaper) {
+                user_fd_mutex_unlock(&user_vm_reaper_lock);
+                if (separate) user_fd_unlock();
                 syscall(SYS_rt_sigprocmask, SIG_SETMASK, &saved_mask, NULL, 8);
                 return -EAGAIN;
             }
@@ -937,8 +943,14 @@ static int rvvm_sys_clone_impl(rvvm_user_thread_t* current, uint32_t flags, size
                 rvvm_futex_wait(&user_vm_reaper_tid, 0, RVVM_FUTEX_INFINITE);
         }
 
-        rvvm_user_thread_t* thread = safe_new_obj(rvvm_user_thread_t);
-        thread->cpu = user_clone_cpu(cpu);
+        rvvm_user_thread_t* thread = calloc(1, sizeof(*thread));
+        if (!thread || !(thread->cpu = user_clone_cpu(cpu))) {
+            free(thread);
+            user_fd_mutex_unlock(&user_vm_reaper_lock);
+            if (separate) user_fd_unlock();
+            syscall(SYS_rt_sigprocmask, SIG_SETMASK, &saved_mask, NULL, 8);
+            return -EAGAIN;
+        }
 
         // Set guest stack pointer
         rvvm_write_cpu_reg(thread->cpu, RVVM_REGID_X0 + 2, stack);
@@ -955,12 +967,26 @@ static int rvvm_sys_clone_impl(rvvm_user_thread_t* current, uint32_t flags, size
         thread->refs = 3; // Parent, child and native-exit reaper.
         thread->signal_mask = user_sig.mask;
         thread->signals = user_signal_process_retain();
-        thread->fd_table = user_fd_table_retain();
+        thread->fd_table = (separate & CLONE_FILES)
+            ? user_fd_table_copy(user_fd_table()) : user_fd_table_retain();
+        if (!thread->fd_table) {
+            user_signal_process_release(thread->signals);
+            rvvm_free_user_thread(thread->cpu);
+            free(thread);
+            user_fd_mutex_unlock(&user_vm_reaper_lock);
+            if (separate) user_fd_unlock();
+            syscall(SYS_rt_sigprocmask, SIG_SETMASK, &saved_mask, NULL, 8);
+            return -EAGAIN;
+        }
+        thread->unshare_flags = separate;
         thread->ptrace_state = user_ptrace_prepare(thread->cpu, user_cpu_auxv, user_cpu_auxv_size, thread->signal_mask);
         atomic_add_uint64(&user_thread_lifetime, 1);
-        rvvm_thread_t* host_thread = rvvm_thread_create_ex(rvvm_user_thread_wrap, thread, 0);
+        // Guest stacks are separate mappings; native execution needs no 8 MiB stack.
+        rvvm_thread_t* host_thread = rvvm_thread_create_ex(rvvm_user_thread_wrap, thread, 256 * 1024);
         syscall(SYS_rt_sigprocmask, SIG_SETMASK, &saved_mask, NULL, 8);
         if (!host_thread) {
+            user_fd_mutex_unlock(&user_vm_reaper_lock);
+            if (separate) user_fd_unlock();
             atomic_sub_uint64(&user_thread_lifetime, 1);
             user_signal_process_release(thread->signals);
             user_fd_table_release(thread->fd_table);
@@ -969,12 +995,17 @@ static int rvvm_sys_clone_impl(rvvm_user_thread_t* current, uint32_t flags, size
             free(thread);
             return -UAPI_EAGAIN;
         }
+        if (separate) {
+            /* Freeze the source table until Linux has made the child's copy.
+             * The child publishes setup before taking any descriptor guard. */
+            while (!atomic_load_uint32(&thread->setup_ready))
+                rvvm_futex_wait(&thread->setup_ready, 0, RVVM_FUTEX_INFINITE);
+            user_fd_unlock();
+        }
         thread->host_thread = host_thread;
-        user_fd_mutex_lock(&user_vm_reaper_lock);
         thread->reap_next = user_reap_threads;
         user_reap_threads = thread;
         user_fd_mutex_unlock(&user_vm_reaper_lock);
-        user_reap_notify();
 
         uint32_t tid = atomic_load_uint32(&thread->tid);
         while (!tid) {
@@ -982,20 +1013,42 @@ static int rvvm_sys_clone_impl(rvvm_user_thread_t* current, uint32_t flags, size
             tid = atomic_load_uint32(&thread->tid);
         }
 
+        int result = thread->setup_error ? thread->setup_error : (int)tid;
         rvvm_user_thread_put(thread);
-
-        return tid;
+        return result;
     } else {
-        const uint32_t supported = 0xff | UAPI_CLONE_OPTIONAL_FLAGS | UAPI_CLONE_PIDFD;
-        if ((flags & ~supported) || (flags & 0xff) != SIGCHLD) return -UAPI_EINVAL;
+        const uint32_t supported = 0xff | UAPI_CLONE_OPTIONAL_FLAGS | UAPI_CLONE_PIDFD
+            | UAPI_CLONE_FILES;
+        if (flags & ~supported) return -UAPI_EINVAL;
         if ((flags & UAPI_CLONE_PIDFD) && (flags & UAPI_CLONE_PARENT_SETTID))
             return -EINVAL;
         int publish[2] = {-1, -1};
         user_fd_lock();
+        bool shared_files = flags & UAPI_CLONE_FILES;
+        user_fd_table_t* source_table = user_fd_table();
+        if (shared_files && !user_fd_waits_init(source_table)) { user_fd_unlock(); return -ENOMEM; }
+        if (shared_files && (!user_fd_mutex_share(&source_table->guard->lock)
+                             || !user_fd_mutex_share(&source_table->lock))) {
+            user_fd_unlock();
+            return -ENOMEM;
+        }
+        /* All private-files thread tables retain this guard. Mark before any
+         * new mm inherits it, including helpers created by vfork below. */
+        atomic_store_uint32(&source_table->guard->escaped, 1);
+        struct user_fork_slot* fork_slot = user_fork_cache_prepare(source_table,
+            !shared_files && !user_vm_service && !user_vm_fork_peer);
+        user_fd_table_t* child_table = shared_files ? source_table
+            : fork_slot ? fork_slot->table : user_fd_table_copy_guard(source_table, true);
+        if (!child_table) {
+            user_fork_cache_finish(fork_slot, -1);
+            user_fd_unlock(); return -ENOMEM;
+        }
         // Linux publishes parent_tid before the child can observe shared memory.
-        if ((flags & (UAPI_CLONE_PARENT_SETTID | UAPI_CLONE_PIDFD))
+        if (!shared_files && (flags & (UAPI_CLONE_PARENT_SETTID | UAPI_CLONE_PIDFD))
             && socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, publish)) {
             int error = -errno;
+            if (!fork_slot) user_fd_table_release(child_table);
+            user_fork_cache_finish(fork_slot, -1);
             user_fd_unlock();
             return error;
         }
@@ -1010,31 +1063,47 @@ static int rvvm_sys_clone_impl(rvvm_user_thread_t* current, uint32_t flags, size
         user_fd_mutex_lock(&user_vm_reaper_lock);
         rvvm_user_fork_lock();
         user_ptrace_clone(cpu);
-        pid_t pid = fork();
+        pid_t pid = user_host_fork_files(flags & 0xff, shared_files);
         int fork_errno = errno;
+        user_fork_cache_finish(fork_slot, pid);
+        unsigned child_fd_depth = 0;
         if (!pid) {
+            user_services = NULL;
             /* Other native threads, their join handles and wake queues do
              * not survive host fork. The survivor is now a process thread. */
             user_reap_threads = NULL;
             user_reaper_running = false;
             user_thread_lifetime = 1;
-            user_reap_wake = 0;
             user_vm_reaper_tid = 0;
             user_vm_initial_tid = gettid();
             user_vm_pi_users = 0;
             user_vm_pi_owned = 0;
-            user_fd_fork_reset();
+            child_fd_depth = user_fd_fork_select(child_table->guard);
+            user_fd_guard_default(child_table->guard);
+            user_fd_current = child_table;
+            current->fd_table = child_table;
+            user_ptrace_set_exe_fd_pointer(&child_table->exe_fd);
+            user_fd_table_t* initial_table = user_fd_initial;
+            user_fd_initial = child_table;
+            if (!shared_files) user_fd_table_fork_discard(source_table);
+            if (initial_table != source_table) user_fd_table_fork_discard(initial_table);
             rvvm_user_fork_child(cpu);
             user_ptrace_fork(cpu);
         }
         rvvm_user_fork_unlock();
         user_fd_mutex_unlock(&user_vm_reaper_lock);
-        user_fd_mutex_unlock(&user_exe_lock);
-        if (!pid) user_fd_table_fork_child();
+        if (pid) user_fd_mutex_unlock(&user_exe_lock);
+        if (!pid) {
+            user_fd_table_fork_child();
+            user_fd_table_enter(child_table);
+        }
         spin_unlock(&mmap_lock);
         spin_unlock(&brk_lock);
         spin_unlock(&user_action_lock);
         if (pid == 0) {
+            /* With CLONE_FILES, acquiring the shared guard is also the
+             * publication barrier; socket endpoints would themselves be shared. */
+            for (unsigned i = 0; i < child_fd_depth; ++i) user_fd_lock();
             if (publish[0] >= 0) {
                 char ready;
                 close(publish[0]);
@@ -1046,7 +1115,7 @@ static int rvvm_sys_clone_impl(rvvm_user_thread_t* current, uint32_t flags, size
             user_fd_unlock();
             /* A new ordinary-fork child must not keep its parent's vfork
              * completion channel alive after that parent execs or exits. */
-            if (user_vm_fd >= 0) {
+            if (!shared_files && user_vm_fd >= 0 && !user_vm_fork_peer) {
                 close(user_vm_fd);
                 atomic_store_uint32_relax(&user_fd_table()->vm_fd, UINT32_MAX);
             }
@@ -1074,12 +1143,15 @@ static int rvvm_sys_clone_impl(rvvm_user_thread_t* current, uint32_t flags, size
              * and wrapper initialization; keep its native signals blocked. */
             if (!user_vm_service) user_apply_mask();
         } else {
+            if (pid > 0) user_service_guest(pid);
+            if (!shared_files && !fork_slot) user_fd_table_release(child_table);
             int publish_error = 0;
             if (pid > 0 && (flags & UAPI_CLONE_PIDFD)) {
                 // The child cannot exit/exec until its pidfd is opened and published.
                 int pidfd = syscall(SYS_pidfd_open, pid, 0);
                 publish_error = pidfd < 0 ? -errno : uapi_extra_copy(&pidfd, parent_tid, sizeof(pidfd), true);
                 if (publish_error && pidfd >= 0) close(pidfd);
+                if (publish_error && shared_files) kill(pid, SIGKILL);
             }
             if (pid > 0 && (flags & UAPI_CLONE_PARENT_SETTID))
                 (void)uapi_extra_copy(&pid, parent_tid, sizeof(pid), true);
@@ -1091,7 +1163,9 @@ static int rvvm_sys_clone_impl(rvvm_user_thread_t* current, uint32_t flags, size
             user_fd_unlock();
             syscall(SYS_rt_sigprocmask, SIG_SETMASK, &saved_mask, NULL, 8);
             if (publish_error) {
-                while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
+                pid_t reaped;
+                do { reaped = waitpid(pid, NULL, __WALL); } while (reaped < 0 && errno == EINTR);
+                if (reaped > 0) user_fork_cache_reaped(reaped);
                 return publish_error;
             }
         }
@@ -1128,11 +1202,74 @@ struct user_vfork {
     int result;
     int publish_error;
     uint32_t stage;
+    pid_t group;
+    struct rlimit nofile;
+    uint32_t service_ready;
+    struct user_service* service;
+    user_fd_table_t snapshot;
+    pid_t aborted_child;
+    bool transition_released;
+    uint32_t files_ready;
+    int control[2], old_vm_fd;
+    struct user_vm* vm;
 };
+
+/* Only the service raises its limit. Channel installation briefly shares
+ * the primary's files while guest kernel writers are parked; moving these
+ * new socket descriptors cannot release any guest POSIX file locks. */
+static void user_vfork_channels(struct user_vfork* request)
+{
+    int error = 0;
+    if (user_vm_pause_begin()) error = errno;
+    else {
+        if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, request->control)) error = errno;
+        if (!error && getpid() != request->group) {
+            int minimum = request->nofile.rlim_max > 2 ? request->nofile.rlim_max - 2 : 0;
+            for (unsigned i = 0; i < 2 && !error; ++i) {
+                int moved = fcntl(request->control[i], F_DUPFD_CLOEXEC, minimum);
+                if (moved < 0 && errno == EMFILE)
+                    moved = fcntl(request->control[i], F_DUPFD_CLOEXEC, request->nofile.rlim_cur);
+                /* Relocation is optional: inherited high guest descriptors
+                 * may fill that range while lower slots remain available. */
+                if (moved >= 0) { close(request->control[i]); request->control[i] = moved; }
+            }
+        }
+        if (!error && syscall(SYS_unshare, CLONE_FILES)) error = errno;
+        if (error) {
+            for (unsigned i = 0; i < 2; ++i) {
+                if (request->control[i] >= 0) close(request->control[i]);
+                request->control[i] = -1;
+            }
+        }
+        user_vm_pause_end();
+    }
+    request->result = -error;
+    atomic_store_uint32(&request->stage, 5);
+    rvvm_futex_wake(&request->stage, 1);
+}
 
 static void* user_vfork_worker(void* opaque)
 {
+    user_host_fork_init();
     struct user_vfork* request = opaque;
+    if (user_vm_service_group) {
+        /* The watcher copied metadata under the same guard as clone's
+         * kernel FD-table copy. Subsequent parent IO cannot change it. */
+        user_fd_table_t* private = user_fd_table_copy(&request->snapshot);
+        if (private) {
+            user_fd_guard_release(private->guard);
+            private->guard = user_fd_guard_create();
+        }
+        if (!private || !private->guard) {
+            if (private) user_fd_table_release(private);
+            request->result = -ENOMEM;
+            atomic_store_uint32(&request->stage, 3);
+            rvvm_futex_wake(&request->stage, 1);
+            return NULL;
+        }
+        user_fd_table_release(request->source_table);
+        request->source_table = private;
+    }
     user_vm_service = true;
     user_sig = request->signal;
     user_sig.cpu = NULL;
@@ -1141,18 +1278,22 @@ static void* user_vfork_worker(void* opaque)
     user_fd_table_enter(source);
     uint64_t mask = UINT64_MAX;
     syscall(SYS_rt_sigprocmask, SIG_SETMASK, &mask, NULL, 8);
-    user_fd_mutex_lock(&user_vm_transition_lock);
     user_fd_lock();
     struct user_vm* vm = NULL;
-    int control[2] = {-1, -1};
-    bool transition_held = true;
-    user_fd_table_t* table = calloc(1, sizeof(*table));
-    if (!table) { request->result = -ENOMEM; goto out; }
-    table->refs = 1;
+    int control[2] = {request->control[0], -1};
+    user_fd_table_t* table = mmap(NULL, sizeof(*table), PROT_READ | PROT_WRITE,
+                                MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (table == MAP_FAILED) { request->result = -ENOMEM; goto out; }
+    table->refs = calloc(1, sizeof(*table->refs));
+    if (!table->refs) { munmap(table, sizeof(*table)); request->result = -ENOMEM; goto out; }
+    *table->refs = 1;
+    table->exec_handoff = -1;
+    table->lock.shared = true;
     table->exe_fd = source->exe_fd;
     table->vm_fd = UINT32_MAX;
     table->vm_service = true;
     table->guard = user_fd_guard_create();
+    if (!table->guard) { request->result = -ENOMEM; user_fd_table_release(table); goto out; }
     memcpy(table->descriptor, source->descriptor, sizeof(table->descriptor));
     if (syscall(SYS_unshare, CLONE_FILES)) { request->result = -errno; user_fd_table_release(table); goto out; }
     /* The service's private descriptors must not block unrelated guest IO. */
@@ -1166,8 +1307,7 @@ static void* user_vfork_worker(void* opaque)
     spin_lock(&mmap_lock);
     if (request->flags & UAPI_CLONE_VM) vm = user_vm_prepare();
     if (vm && (request->flags & UAPI_CLONE_CHILD_CLEARTID)) vm->child_cleartid = (uintptr_t)request->child_tid;
-    if (((request->flags & UAPI_CLONE_VM) && !vm)
-        || socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, control)) request->result = -errno;
+    if ((request->flags & UAPI_CLONE_VM) && !vm) request->result = -errno;
     else if (vm) {
         if (user_vm_pause_begin()) request->result = -errno;
         else {
@@ -1186,52 +1326,30 @@ static void* user_vfork_worker(void* opaque)
     spin_unlock(&brk_lock);
     if (request->result) goto out;
 
-    /* Host fork isolates every native allocation and lock while inheriting
-     * shared guest VMAs. The existing fork path owns signal/FD/CPU recovery. */
-    int pid = rvvm_sys_clone_impl(&request->child,
-        request->flags & ~(UAPI_CLONE_VM | UAPI_CLONE_VFORK | UAPI_CLONE_PIDFD | UAPI_CLONE_PARENT_SETTID), request->stack,
-        request->parent_tid, request->tls, request->child_tid);
-    if (!pid) {
-        close(control[0]);
-        table->vm_fd = control[1];
-        table->vm_service = false;
-        char ready;
-        ssize_t received;
-        do { received = recv(control[1], &ready, 1, 0); } while (received < 0 && errno == EINTR);
-        if (received != 1) _exit(127);
-        /* These descriptors and native aliases belong to the service only. */
-        if (vm) user_vm_destroy(vm);
-        user_fd_unlock();
-        user_vm_service = false;
-        user_vm_child = (request->flags & UAPI_CLONE_VM) != 0;
-        user_vm_transition_lock = (user_fd_mutex_t){0};
-        user_vm_transition_depth = 0;
-        user_vm_pause.active = 0;
-        request->child.fd_table = table;
-        request->child.signal_mask = request->signal.mask;
-        request->child.inherit_signal_stack = true;
-        request->child.signal_stack = request->signal.stack;
-        current_user_hart = request->child.cpu;
-        rvvm_user_thread_wrap(&request->child);
-        _exit(127);
-    }
-    request->result = pid;
-    close(control[1]);
-    control[1] = -1;
+    /* Fork in the primary, so the kernel supplies its credentials, session,
+     * limits, parent relationship and SIGCHLD behavior without emulation. */
+    request->vm = vm;
+    atomic_store_uint32(&request->stage, 4);
+    rvvm_futex_wake(&request->stage, 1);
+    while (atomic_load_uint32(&request->stage) == 4)
+        rvvm_futex_wait(&request->stage, 4, RVVM_FUTEX_INFINITE);
+    int pid = request->result;
     if (pid > 0) {
-        atomic_store_uint32(&request->stage, 1);
-        rvvm_futex_wake(&request->stage, 1);
-        while (atomic_load_uint32(&request->stage) == 1)
-            rvvm_futex_wait(&request->stage, 1, RVVM_FUTEX_INFINITE);
         if (request->publish_error) {
             close(control[0]);
             control[0] = -1;
-            while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
+            request->aborted_child = pid;
             request->result = request->publish_error;
         } else {
-            if (!vm) {
+            if (!vm && !request->service) {
                 user_fd_mutex_unlock(&user_vm_transition_lock);
-                transition_held = false;
+                request->transition_released = true;
+            }
+            if (!vm && request->service) {
+                /* Lend TLS exclusively while the watcher releases transition:
+                 * its mutex unlock saves/restores the same native errno. */
+                atomic_store_uint32(&request->files_ready, 3);
+                while (atomic_load_uint32(&request->service_ready) != 3) {}
             }
             (void)!send(control[0], "", 1, MSG_NOSIGNAL);
             /* CLOEXEC closes the peer only after successful exec. A failed exec
@@ -1245,7 +1363,7 @@ static void* user_vfork_worker(void* opaque)
          * one guest thread, so Linux may skip its clear_child_tid store;
          * publish it into the shared guest view before restoring COW. */
         uint32_t zero = 0;
-        if (vm->child_cleartid
+        if (pid > 0 && vm->child_cleartid
             && !uapi_extra_copy(&zero, (void*)vm->child_cleartid, sizeof(zero), true))
             syscall(SYS_futex, (void*)vm->child_cleartid, FUTEX_WAKE, 1, NULL, NULL, 0);
         spin_lock(&brk_lock);
@@ -1261,7 +1379,6 @@ out:
     if (control[1] >= 0) close(control[1]);
     if (vm) user_vm_destroy(vm);
     user_fd_unlock();
-    if (transition_held) user_fd_mutex_unlock(&user_vm_transition_lock);
     rvvm_free_user_thread(request->child.cpu);
     user_fd_table_leave();
     if (request->source_table) request->source_table = NULL;
@@ -1270,6 +1387,159 @@ out:
     rvvm_futex_wake(&request->stage, 1);
     return NULL;
 }
+
+#ifdef RVVM_STATIC_GLIBC_FORK
+static int user_vfork_service(void* opaque)
+{
+    struct user_vfork* request = opaque;
+    /* Do not touch the lent native TLS until the watcher has dropped its
+     * descriptor bookkeeping. This publication window is allocation-free. */
+    while (!atomic_load_uint32(&request->service_ready)) {}
+    /* The waiting native thread lends this service its TLS exclusively.
+     * A guest child never shares this native heap: the existing fork path
+     * still creates its COW process, with the original guest as parent. */
+    *user_fork_native_tid = syscall(SYS_gettid);
+    syscall(SYS_set_robust_list, user_fork_native_robust, sizeof(*user_fork_native_robust));
+    syscall(SYS_prctl, PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
+    if (getppid() != request->group) _exit(127);
+    if (setsid() < 0) _exit(127);
+    user_vm_service_group = request->group;
+    if (getrlimit(RLIMIT_NOFILE, &request->nofile)) _exit(127);
+    struct rlimit internal = request->nofile;
+    internal.rlim_cur = internal.rlim_max;
+    if (setrlimit(RLIMIT_NOFILE, &internal)) _exit(127);
+    user_vfork_channels(request);
+    while (atomic_load_uint32(&request->service_ready) != 2) {}
+    if (request->result) {
+        atomic_store_uint32(&request->stage, 3);
+        rvvm_futex_wake(&request->stage, 1);
+        return 0;
+    }
+    close(request->control[1]);
+    user_vfork_worker(request);
+    return 0;
+}
+
+static void* user_vfork_watch(void* opaque)
+{
+    user_host_fork_init();
+    struct user_vfork* request = opaque;
+    if (!user_fork_native_tid || !user_fork_native_robust) {
+        request->result = -ENOSYS;
+        atomic_store_uint32(&request->stage, 3);
+        rvvm_futex_wake(&request->stage, 1);
+        return NULL;
+    }
+    const size_t size = 256 * 1024;
+    request->service = calloc(1, sizeof(*request->service));
+    if (!request->service) {
+        request->result = -ENOMEM;
+        atomic_store_uint32(&request->stage, 3);
+        rvvm_futex_wake(&request->stage, 1);
+        return NULL;
+    }
+    void* stack = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    pid_t self = syscall(SYS_gettid);
+    /* The watcher owns the transition through preparation and restoration.
+     * Lending TLS to the service must not open a gap for another vfork to
+     * replace this request's peer in the primary descriptor metadata. */
+    user_fd_mutex_lock(&user_vm_transition_lock);
+    atomic_add_uint32(request->source_table->refs, 1);
+    user_fd_table_enter(request->source_table);
+    user_fd_lock();
+    request->snapshot = *request->source_table;
+    pid_t service = stack == MAP_FAILED ? -1
+        : clone(user_vfork_service, (char*)stack + size, CLONE_VM | CLONE_FS | CLONE_FILES, request);
+    int error = errno;
+    if (service < 0) {
+        user_fd_unlock();
+        user_fd_table_leave();
+        user_fd_mutex_unlock(&user_vm_transition_lock);
+        free(request->service);
+        request->service = NULL;
+        if (stack != MAP_FAILED) munmap(stack, size);
+        request->result = -error;
+        atomic_store_uint32(&request->stage, 3);
+        rvvm_futex_wake(&request->stage, 1);
+        return NULL;
+    }
+    user_service_publish(request->service, service);
+    atomic_store_uint32(&request->service_ready, 1);
+    while (atomic_load_uint32(&request->files_ready) != 2) {
+        int status;
+        /* Successful WNOHANG polling leaves borrowed TLS untouched. Startup
+         * death must fail closed rather than leave the primary waiting forever. */
+        if (syscall(SYS_wait4, service, &status, __WALL | WNOHANG | WUNTRACED, NULL))
+            syscall(SYS_exit_group, 127);
+    }
+    user_fd_unlock();
+    user_fd_table_leave();
+    atomic_store_uint32(&request->service_ready, 2);
+    if (!(request->flags & UAPI_CLONE_VM)) {
+        /* A private-mm child may wait for another parent thread to map memory.
+         * Once publication restored the parent peer, it needs no VM lock. */
+        while (atomic_load_uint32(&request->files_ready) != 3
+               && atomic_load_uint32(&request->stage) != 3) {
+            int status;
+            pid_t waited = syscall(SYS_wait4, service, &status, __WALL | WNOHANG | WUNTRACED, NULL);
+            if (waited && atomic_load_uint32(&request->stage) == 3
+                && ((waited == service && WIFEXITED(status) && !WEXITSTATUS(status))
+                    || (waited < 0 && errno == ECHILD))) {
+                if (waited == service) user_service_wait(service, status, true);
+                break;
+            }
+            if (waited) syscall(SYS_exit_group, 127);
+        }
+        if (atomic_load_uint32(&request->files_ready) == 3) {
+            user_fd_mutex_unlock(&user_vm_transition_lock);
+            request->transition_released = true;
+            atomic_store_uint32(&request->service_ready, 3);
+        }
+    }
+    int status;
+    pid_t waited;
+    do { waited = syscall(SYS_wait4, service, &status, __WALL | WUNTRACED, NULL); }
+    while (waited < 0 && errno == EINTR);
+    /* A trusted service can be in a native allocator critical section.
+     * Never continue the primary after unexpected service death or stop. */
+    if (waited < 0 && errno == ECHILD && atomic_load_uint32(&request->service->reaped)) {
+        status = request->service->status;
+        waited = service;
+    }
+    if ((waited != service && !(waited < 0 && errno == ECHILD))
+        || (waited == service && (!WIFEXITED(status) || WEXITSTATUS(status)))
+        || atomic_load_uint32(&request->stage) != 3) syscall(SYS_exit_group, 127);
+    *user_fork_native_tid = self;
+    atomic_store_uint32(&request->service->pid, 0);
+    if (!request->transition_released) user_fd_mutex_unlock(&user_vm_transition_lock);
+    munmap(stack, size);
+    return NULL;
+}
+#else
+static void* user_vfork_watch(void* opaque)
+{
+    struct user_vfork* request = opaque;
+    user_fd_mutex_lock(&user_vm_transition_lock);
+    atomic_add_uint32(request->source_table->refs, 1);
+    user_fd_table_enter(request->source_table);
+    user_fd_lock();
+    request->snapshot = *request->source_table;
+    user_vm_service_group = request->group;
+    user_vfork_channels(request);
+    while (atomic_load_uint32(&request->files_ready) != 2) {}
+    user_fd_unlock();
+    user_fd_table_leave();
+    if (!request->result) {
+        close(request->control[1]);
+        user_vfork_worker(request);
+    } else {
+        atomic_store_uint32(&request->stage, 3);
+        rvvm_futex_wake(&request->stage, 1);
+    }
+    if (!request->transition_released) user_fd_mutex_unlock(&user_vm_transition_lock);
+    return NULL;
+}
+#endif
 
 static int rvvm_sys_vfork(rvvm_user_thread_t* current, uint32_t flags, size_t stack,
                           uint32_t* parent_tid, size_t tls, uint32_t* child_tid)
@@ -1281,19 +1551,32 @@ static int rvvm_sys_vfork(rvvm_user_thread_t* current, uint32_t flags, size_t st
     struct user_vfork* request = calloc(1, sizeof(*request));
     if (!request) return -ENOMEM;
     request->child.cpu = user_clone_cpu(current->cpu);
+    if (!request->child.cpu) { free(request); return -EAGAIN; }
     request->child.refs = 1;
     request->child.signals = user_signal_process_retain();
     request->signal = user_sig;
     request->source_table = user_fd_table_retain();
+    atomic_store_uint32(&request->source_table->guard->escaped, 1);
     request->flags = flags;
     request->stack = stack;
     request->tls = tls;
     request->parent_tid = parent_tid;
     request->child_tid = child_tid;
+    request->group = getpid();
+    request->control[0] = request->control[1] = -1;
+    request->old_vm_fd = user_vm_fd;
+    if (getrlimit(RLIMIT_NOFILE, &request->nofile)) {
+        int error = errno;
+        rvvm_free_user_thread(request->child.cpu);
+        user_signal_process_release(request->child.signals);
+        user_fd_table_release(request->source_table);
+        free(request);
+        return -error;
+    }
     /* A helper must not receive guest signals before its TLS is initialized. */
     uint64_t held = UINT64_MAX, saved_mask;
     syscall(SYS_rt_sigprocmask, SIG_SETMASK, &held, &saved_mask, 8);
-    rvvm_thread_t* worker = rvvm_thread_create(user_vfork_worker, request);
+    rvvm_thread_t* worker = rvvm_thread_create(user_vfork_watch, request);
     syscall(SYS_rt_sigprocmask, SIG_SETMASK, &saved_mask, NULL, 8);
     if (!worker) {
         rvvm_free_user_thread(request->child.cpu);
@@ -1305,20 +1588,93 @@ static int rvvm_sys_vfork(rvvm_user_thread_t* current, uint32_t flags, size_t st
     uint32_t stage;
     while (!(stage = atomic_load_uint32(&request->stage)))
         rvvm_futex_wait(&request->stage, 0, RVVM_FUTEX_INFINITE);
-    if (stage == 1) {
+    if (stage == 5) {
+        if (!request->result) {
+            /* The service has detached its files; only this endpoint is
+             * needed in the primary until its native fork copies it. */
+            close(request->control[0]);
+            atomic_store_uint32_relax(&user_fd_table()->vm_fd, request->control[1]);
+        }
+        atomic_store_uint32(&request->files_ready, 2);
+        while ((stage = atomic_load_uint32(&request->stage)) == 5)
+            rvvm_futex_wait(&request->stage, 5, RVVM_FUTEX_INFINITE);
+    }
+    if (stage == 4) {
+        user_vm_fork_peer = true;
+        user_vm_service = true; // Keep child native signals held until wrapper setup.
+#ifdef RVVM_STATIC_GLIBC_FORK
+        user_fork_want_pidfd = (flags & UAPI_CLONE_PIDFD) != 0;
+        user_fork_pidfd = (int*)parent_tid;
+#endif
+        int pid = rvvm_sys_clone_impl(&request->child,
+            flags & ~(UAPI_CLONE_VM | UAPI_CLONE_VFORK | UAPI_CLONE_PIDFD | UAPI_CLONE_PARENT_SETTID),
+            stack, parent_tid, tls, child_tid);
+#ifdef RVVM_STATIC_GLIBC_FORK
+        user_fork_want_pidfd = false;
+        user_fork_pidfd = NULL;
+#endif
+        user_vm_fork_peer = false;
+        if (!pid) {
+            user_fd_table_t* table = user_fd_table();
+            char ready;
+            ssize_t received;
+            do { received = recv(request->control[1], &ready, 1, 0); } while (received < 0 && errno == EINTR);
+            if (received != 1) _exit(127);
+            /* Backing/proc descriptors exist only in the resource service.
+             * Drop this fork's aliases without closing unrelated guest fds. */
+            if (request->vm) user_vm_destroy_view(request->vm, false);
+            user_vm_service = false;
+            user_vm_child = (flags & UAPI_CLONE_VM) != 0;
+            user_vm_service_group = 0;
+            user_vm_transition_lock = (user_fd_mutex_t){0};
+            user_vm_transition_depth = 0;
+            user_vm_pause.active = 0;
+            request->child.fd_table = table;
+            request->child.signal_mask = request->signal.mask;
+            request->child.inherit_signal_stack = true;
+            request->child.signal_stack = request->signal.stack;
+            user_sig = request->signal;
+            user_sig.cpu = NULL;
+            current_user_hart = request->child.cpu;
+            rvvm_user_thread_wrap(&request->child);
+            _exit(127);
+        }
+        user_vm_service = false;
+        request->result = pid;
+        user_fd_lock();
+        close(request->control[1]);
+        request->control[1] = -1;
+        atomic_store_uint32_relax(&user_fd_table()->vm_fd, request->old_vm_fd);
+        user_fd_unlock();
+#ifndef RVVM_STATIC_GLIBC_FORK
         if (flags & UAPI_CLONE_PIDFD) {
             user_fd_lock();
             int pidfd = syscall(SYS_pidfd_open, request->result, 0);
             request->publish_error = pidfd < 0 ? -errno : uapi_extra_copy(&pidfd, parent_tid, sizeof(pidfd), true);
             if (request->publish_error && pidfd >= 0) close(pidfd);
             user_fd_unlock();
-        } else if (flags & UAPI_CLONE_PARENT_SETTID)
+        } else
+#endif
+        if (pid > 0 && (flags & UAPI_CLONE_PARENT_SETTID))
             (void)uapi_extra_copy(&request->result, parent_tid, sizeof(request->result), true);
         atomic_store_uint32(&request->stage, 2);
         rvvm_futex_wake(&request->stage, 1);
     }
     thread_join(worker);
+    if (request->control[1] >= 0) {
+        user_fd_lock();
+        close(request->control[1]);
+        atomic_store_uint32_relax(&user_fd_table()->vm_fd, request->old_vm_fd);
+        user_fd_unlock();
+    }
+    if (request->aborted_child)
+        while (waitpid(request->aborted_child, NULL, 0) < 0 && errno == EINTR) {}
     int result = request->result;
+    if (request->source_table) {
+        rvvm_free_user_thread(request->child.cpu);
+        user_signal_process_release(request->child.signals);
+        user_fd_table_release(request->source_table);
+    }
     free(request);
     return result;
 }
@@ -1379,6 +1735,41 @@ static int rvvm_sys_futex(uint32_t* addr, int futex_op, uint32_t val, size_t val
 
 static int64_t rvvm_sys_getdents64(int fd, void* dirp, size_t size)
 {
+    char link[64], path[128];
+    snprintf(link, sizeof(link), "/proc/thread-self/fd/%d", fd);
+    ssize_t n = readlink(link, path, sizeof(path) - 1);
+    unsigned pid;
+    int end = 0;
+    if (n >= 0) path[n] = 0;
+    if (n >= 0 && sscanf(path, "/proc/%u/task%n", &pid, &end) == 1 && end && !path[end]) {
+        char buffer[4096];
+        user_fd_lock();
+        long result;
+        do {
+            result = errno_ret(syscall(SYS_getdents64, fd, buffer,
+                               EVAL_MIN((unsigned int)size, sizeof(buffer))));
+            if (result <= 0) break;
+            size_t kept = 0;
+            for (size_t pos = 0; pos < (size_t)result;) {
+                struct uapi_linux_dirent64* entry = (void*)(buffer + pos);
+                bool recognized = false;
+                unsigned tid = strtoul(entry->d_name, NULL, 10);
+                bool visible = !tid || user_ptrace_guest_task(pid, tid, &recognized);
+                if (visible || !recognized) {
+                    memmove(buffer + kept, entry, entry->d_reclen);
+                    kept += entry->d_reclen;
+                }
+                pos += entry->d_reclen;
+            }
+            if (kept) {
+                int error = uapi_extra_copy(buffer, dirp, kept, true);
+                result = error ? error : (long)kept;
+                break;
+            }
+        } while (true);
+        user_fd_unlock();
+        return result;
+    }
     return user_exe_getdents(fd, dirp, size);
 }
 
@@ -1405,6 +1796,7 @@ static inline int rvvm_sys_prot(int prot)
     if (prot & UAPI_PROT_WRITE) ret |= PROT_WRITE;
     // No real PROT_EXEC, since rvvm-user reads code when translating
     if (prot & UAPI_PROT_EXEC)  ret |= PROT_READ;
+    ret |= prot & (PROT_GROWSDOWN | PROT_GROWSUP);
     return ret;
 }
 
@@ -1440,12 +1832,16 @@ static rvvm_addr_t rvvm_sys_mmap(void* addr, size_t size, int prot, int flags, i
 
 #ifdef __linux__
     if (flags & 0x4000) mmap_flags |= MAP_NORESERVE;
+    if (flags & 0x40000) mmap_flags |= MAP_HUGETLB | (flags & (63U << 26));
     rvvm_addr_t ret = errno_ret((size_t)user_vma_map(addr, size, rvvm_sys_prot(prot), mmap_flags, fd, offset));
 #else
     rvvm_addr_t ret = errno_ret((size_t)mmap(addr, size, rvvm_sys_prot(prot), mmap_flags, fd, offset));
 #endif
 #ifdef USER_FAULT_META
-    if (ret < (rvvm_addr_t)-4095) user_exec_update(ret, size, prot & UAPI_PROT_EXEC);
+    if (ret < (rvvm_addr_t)-4095) {
+        size_t page = user_vma_map_page(mmap_flags);
+        user_exec_update(ret, (size + page - 1) & ~(page - 1), prot & UAPI_PROT_EXEC);
+    }
 #endif
     spin_unlock(&mmap_lock);
     user_fd_unlock();
@@ -1617,11 +2013,20 @@ static rvvm_addr_t rvvm_sys_readlinkat(int dirfd, const char* pathname, char* bu
 static void* rvvm_user_thread_wrap(void* arg)
 {
     user_signal_block_all();
+    user_host_fork_init();
     rvvm_user_thread_t* thread = arg;
     rvvm_hart_t* cpu = thread->cpu;
     bool running = true;
     int exit_status = 0;
 
+    if (thread->unshare_flags) {
+        if (syscall(SYS_unshare, thread->unshare_flags)) {
+            thread->setup_error = -errno;
+            running = false;
+        }
+        atomic_store_uint32(&thread->setup_ready, 1);
+        rvvm_futex_wake(&thread->setup_ready, 1);
+    }
     current_user_hart = cpu;
     user_signal_process = thread->signals;
     user_fd_table_enter(thread->fd_table);
@@ -1636,12 +2041,14 @@ static void* rvvm_user_thread_wrap(void* arg)
     // Set up thread tid, child_tid
     uint32_t tid = rvvm_sys_gettid();
     if (thread->process_thread) user_vm_initial_tid = tid;
-    if (thread->child_settid) {
+    if (!thread->setup_error && thread->child_settid) {
         (void)uapi_extra_copy(&tid, thread->child_settid, sizeof(tid), true);
     }
     // CLONE_VM shares the parent address space. Write both TID slots before
     // guest execution so the parent cannot overwrite an already-cleared TID.
-    if (thread->parent_settid) (void)uapi_extra_copy(&tid, thread->parent_settid, sizeof(tid), true);
+    if (!thread->setup_error && thread->parent_settid)
+        (void)uapi_extra_copy(&tid, thread->parent_settid, sizeof(tid), true);
+    if (thread->setup_error) thread->child_cleartid = NULL;
     atomic_store_uint32(&thread->tid, tid);
     rvvm_futex_wake(&thread->tid, 1);
     user_ptrace_set_exe_fd_pointer(&user_exe_fd_value);
@@ -1772,8 +2179,18 @@ static void* rvvm_user_thread_wrap(void* arg)
                 case 117:
                     a0 = user_ptrace_request(a0, a1, a2, a3);
                     break;
-                case 92: // personality: only the default Linux execution domain is emulated
-                    a0 = ((uint32_t)a0 == 0 || (uint32_t)a0 == UINT32_MAX) ? 0 : -UAPI_EINVAL;
+                case 92: // personality: let Linux validate execution domains and flags
+                    a0 = errno_ret(syscall(SYS_personality, (unsigned int)a0));
+                    break;
+                case 171: // adjtimex: RV64 and LP64 hosts share the Linux timex ABI
+                    BUILD_ASSERT(sizeof(struct timex) == 208);
+                    a0 = errno_ret(syscall(SYS_adjtimex, to_ptr(a0)));
+                    break;
+                case 266: // clock_adjtime
+                    a0 = errno_ret(syscall(SYS_clock_adjtime, (int)a0, to_ptr(a1)));
+                    break;
+                case 184: // mq_notify: LP64 sigevent layout is checked above
+                    a0 = errno_ret(syscall(SYS_mq_notify, (int)a0, to_ptr(a1)));
                     break;
                 case 285: // copy_file_range: both offsets point to signed 64-bit values
                     a0 = errno_ret(syscall(SYS_copy_file_range, (int)a0, to_ptr(a1),
@@ -2250,6 +2667,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     long queued;
                     int type = a0;
                     bool started = false;
+                    if (type == P_PID && user_service_find(a1)) { a0 = -ECHILD; break; }
                     do {
                         bool poll = !(a3 & WNOHANG) && (user_ptrace_events_tracing()
                             || (a3 & (WNOWAIT | WSTOPPED)) == (WNOWAIT | WSTOPPED));
@@ -2262,6 +2680,17 @@ static void* rvvm_user_thread_wrap(void* arg)
                         siginfo_t* native_info = poll ? &scratch : caller_info;
                         a0 = errno_ret(USER_SYSCALL(SYS_waitid, type, (unsigned int)a1,
                             native_info, (int)a3 | (poll ? WNOHANG : 0), a4, 0));
+                        if (!(long)a0 && native_info->si_pid && !(a3 & WNOWAIT)
+                            && (native_info->si_code == CLD_EXITED || native_info->si_code == CLD_KILLED
+                                || native_info->si_code == CLD_DUMPED))
+                            user_fork_cache_reaped(native_info->si_pid);
+                        if (!(long)a0 && native_info->si_pid && user_service_find(native_info->si_pid)) {
+                            int status = native_info->si_code == CLD_EXITED
+                                ? native_info->si_status << 8 : native_info->si_status;
+                            user_service_wait(native_info->si_pid, status, !(a3 & WNOWAIT));
+                            a0 = USER_PTRACE_WAIT_AGAIN;
+                            continue;
+                        }
                         if (started && (long)a0 == -EINTR) user_sig.syscall_unstarted = false;
                         if (poll && !a0 && !scratch.si_pid) {
                             started = true;
@@ -2367,16 +2796,16 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 case 129: // kill
                     rvvm_debug("sys_kill(%lx, %lx)", a0, a1);
-                    a0 = errno_ret(kill(a0, a1));
+                    a0 = user_service_find((pid_t)a0) ? -ESRCH : errno_ret(kill(a0, a1));
                     break;
 #ifdef __linux__
                 case 130: // tkill
                     rvvm_debug("sys_tkill(%lx, %lx)", a0, a1);
-                    a0 = errno_ret(syscall(SYS_tkill, (int)a0, (int)a1));
+                    a0 = user_service_find((pid_t)a0) ? -ESRCH : errno_ret(syscall(SYS_tkill, (int)a0, (int)a1));
                     break;
                 case 131: // tgkill
                     rvvm_debug("sys_tgkill(%lx, %lx, %ld)", a0, a1, a2);
-                    a0 = errno_ret(tgkill(a0, a1, a2));
+                    a0 = user_service_find((pid_t)a1) ? -ESRCH : errno_ret(tgkill(a0, a1, a2));
                     break;
 #endif
                 case 133: // rt_sigsuspend
@@ -2721,13 +3150,18 @@ static void* rvvm_user_thread_wrap(void* arg)
                 case 226: // mprotect
                     rvvm_info("sys_mprotect(%lx, %lx, %x)", a0, a1, a2);
 #ifdef USER_FAULT_META
+                    user_fd_lock();
                     spin_lock(&mmap_lock);
                     {
-                        rvvm_addr_t ret = errno_ret(mprotect(to_ptr(a0), a1, rvvm_sys_prot(a2)));
-                        if (!ret) user_exec_update(a0, a1, a2 & UAPI_PROT_EXEC);
+                        uintptr_t start = a0;
+                        size_t size = a1;
+                        rvvm_addr_t ret = user_vma_protect_span(&start, &size, a2)
+                            ? last_errno() : errno_ret(mprotect(to_ptr(a0), a1, rvvm_sys_prot(a2)));
+                        if (!ret) user_exec_update(start, size, a2 & UAPI_PROT_EXEC);
                         a0 = ret;
                     }
                     spin_unlock(&mmap_lock);
+                    user_fd_unlock();
 #else
                     a0 = errno_ret(mprotect(to_ptr(a0), a1, a2));
 #endif
@@ -2776,15 +3210,22 @@ static void* rvvm_user_thread_wrap(void* arg)
                     long queued;
                     pid_t selector = a0;
                     bool started = false;
+                    if (user_service_find(selector)) { a0 = -ECHILD; break; }
                     do {
                         bool tracing = user_ptrace_events_tracing();
                         bool poll = tracing && !(a2 & WNOHANG);
                         uint32_t generation = poll ? user_ptrace_events_generation() : 0;
                         int scratch;
-                        int* status = !a1 && tracing ? &scratch : to_ptr(a1);
+                        int* status = a1 ? to_ptr(a1) : &scratch;
                         if (user_ptrace_wait_ready(selector, status, a2, to_ptr(a3), &queued)) { a0 = queued; break; }
                         a0 = errno_ret(USER_SYSCALL(SYS_wait4, selector, status,
                             a2 | (poll ? WNOHANG : 0), a3, 0, 0));
+                        if ((long)a0 > 0 && (WIFEXITED(*status) || WIFSIGNALED(*status)))
+                            user_fork_cache_reaped((pid_t)a0);
+                        if ((long)a0 > 0 && user_service_wait((pid_t)a0, *status, true)) {
+                            a0 = USER_PTRACE_WAIT_AGAIN;
+                            continue;
+                        }
                         if (started && (long)a0 == -EINTR) user_sig.syscall_unstarted = false;
                         if (poll && !a0) {
                             started = true;
@@ -3009,7 +3450,9 @@ static void* rvvm_user_thread_wrap(void* arg)
     uint64_t lifetime = atomic_load_uint64(&user_thread_lifetime);
     while (!atomic_cas_uint64_loop(&user_thread_lifetime, &lifetime,
         ((uint64_t)(uint32_t)exit_status << 32) | ((uint32_t)lifetime - 1))) {}
-    user_reap_notify();
+    /* A retiring native helper may still be inside pthread cleanup. Once
+     * the last guest exits, it must not replace the process's exit status. */
+    if ((uint32_t)lifetime == 1) syscall(SYS_exit_group, exit_status);
     // The initial/fork-surviving host thread must retain guest SYS_exit status.
     if (process_thread) syscall(SYS_exit, exit_status);
     return NULL;
@@ -3043,6 +3486,7 @@ static void jump_start(void* entry, void* stack_top)
     userland = rvvm_create_userland("rv64");
     rvvm_user_thread_t* thread = safe_new_obj(rvvm_user_thread_t);
     thread->cpu = rvvm_create_user_thread(userland);
+    if (!thread->cpu) rvvm_fatal("Cannot allocate initial guest CPU");
     thread->refs = 1;
     thread->process_thread = true;
     syscall(SYS_rt_sigprocmask, SIG_SETMASK, NULL, &thread->signal_mask, 8);
@@ -3336,7 +3780,7 @@ RVVM_PUBLIC int rvvm_user_linux(int argc, char** argv, char** envp)
     size_t stack_guard = 1024 * 1024;
     user_fd_lock();
     uint8_t* stack_mapping = user_vma_map(NULL, STACK_SIZE + 2 * stack_guard, PROT_NONE,
-                                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_GROWSDOWN, -1, 0);
     user_fd_unlock();
     if (stack_mapping == MAP_FAILED) return -1;
     uint8_t* stack_buffer = stack_mapping + stack_guard;
