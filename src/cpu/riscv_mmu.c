@@ -203,11 +203,11 @@ static inline bool riscv_mmu_translate_sv32(rvvm_hart_t* vm, rvvm_addr_t vaddr, 
                         }
                     }
                     // Check access bits & translate
-                    if (likely(pte & access)) {
+                    if (likely(pte & (access & 0xE))) {
                         rvvm_addr_t vmask = bit_mask(bit_off);
                         rvvm_addr_t pmask = bit_mask(SV32_PHYS_BITS - bit_off) << bit_off;
                         rvvm_addr_t pte_shift = pte << 2;
-                        uint32_t pte_ad = pte | RISCV_PTE_ACCESSED | ((access & RISCV_MMU_WRITE) << 5);
+                        uint32_t pte_ad = pte | RISCV_PTE_ACCESSED | (access == RISCV_MMU_WRITE ? RISCV_PTE_DIRTY : 0);
                         if (unlikely(pte_shift & vmask & RISCV_PAGE_PNMASK)) {
                             // Misaligned page
                             return false;
@@ -271,11 +271,11 @@ static inline bool riscv_mmu_translate_rv64(rvvm_hart_t* vm, rvvm_addr_t vaddr, 
                         }
                     }
                     // Check access bits & translate
-                    if (likely(pte & access)) {
+                    if (likely(pte & (access & 0xE))) {
                         rvvm_addr_t vmask = bit_mask(bit_off);
                         rvvm_addr_t pmask = bit_mask(SV64_PHYS_BITS - bit_off) << bit_off;
                         rvvm_addr_t pte_shift = pte << 2;
-                        uint64_t pte_ad = pte | RISCV_PTE_ACCESSED | ((access & RISCV_MMU_WRITE) << 5);
+                        uint64_t pte_ad = pte | RISCV_PTE_ACCESSED | (access == RISCV_MMU_WRITE ? RISCV_PTE_DIRTY : 0);
                         if (unlikely((pte_shift & vmask) & RISCV_PAGE_PNMASK)) {
                             // Misaligned page
                             return false;
@@ -306,17 +306,126 @@ static inline bool riscv_mmu_translate_rv64(rvvm_hart_t* vm, rvvm_addr_t vaddr, 
 
 #endif
 
+#ifdef USE_RV64
+
+static bool riscv_mmu_gstage(rvvm_hart_t* vm, rvvm_addr_t gpa, rvvm_addr_t* paddr,
+                             uint8_t access, bool implicit);
+
+static bool riscv_mmu_hwalk(rvvm_hart_t* vm, rvvm_addr_t addr, rvvm_addr_t* paddr,
+                            rvvm_uxlen_t satp, uint8_t priv, uint8_t access, bool gstage)
+{
+    unsigned mode = satp >> 60;
+    if (!mode) {
+        *paddr = addr;
+        return true;
+    }
+    unsigned levels = mode == CSR_SATP_MODE_SV39 ? 3 : mode == CSR_SATP_MODE_SV48 ? 4 : 0;
+    if (!levels) return false;
+    unsigned addr_bits = levels * 9 + 12;
+    if (gstage ? (addr >> (addr_bits + 2)) != 0 : addr != (rvvm_addr_t)sign_extend(addr, addr_bits)) return false;
+    rvvm_addr_t table = (satp & bit_mask(44)) << 12;
+    rvvm_uxlen_t status = gstage ? vm->csr.status : vm->hypervisor.vsstatus;
+    for (unsigned level = levels; level-- > 0;) {
+        unsigned shift = 12 + level * 9;
+        unsigned index_bits = gstage && level == levels - 1 ? 11 : 9;
+        rvvm_addr_t pte_addr = table + (((addr >> shift) & bit_mask(index_bits)) << 3);
+        rvvm_addr_t host_pte_addr = pte_addr;
+        if (!gstage && !riscv_mmu_gstage(vm, pte_addr, &host_pte_addr, RISCV_MMU_READ, true)) return false;
+        void* ptr = riscv_phys_access(vm, host_pte_addr);
+        if (!ptr) {
+            vm->hypervisor.walk_access_fault = true;
+            return false;
+        }
+        for (;;) {
+            uint64_t pte = read_uint64_le(ptr);
+            // No Svnapot, reserved PTE bits, or invalid W-without-R encoding.
+            if (!(pte & RISCV_PTE_VALID) || (pte & (1ULL << 63)) || (pte & (bit_mask(7) << 54))
+                || ((pte & (RISCV_MMU_READ | RISCV_MMU_WRITE)) == RISCV_MMU_WRITE)) return false;
+            unsigned pbmt = (pte >> 61) & 3;
+            if (pbmt == 3 || (pbmt && (!(vm->csr.envcfg[RISCV_PRIV_MACHINE] & CSR_ENVCFG_PBMTE)
+                || (!gstage && !(vm->hypervisor.envcfg & CSR_ENVCFG_PBMTE))))) return false;
+            if (pte & RISCV_PTE_LEAF) {
+                bool user = !!(pte & RISCV_PTE_USER);
+                if (gstage) {
+                    if (!user) return false;
+                } else if (priv == RISCV_PRIV_USER ? !user
+                           : user && ((access == RISCV_MMU_EXEC && !vm->hypervisor.execute_load)
+                                      || !(status & CSR_STATUS_SUM))) return false;
+                if (!(pte & (access & 0xE))) return false;
+                rvvm_addr_t ppn = ((pte >> 10) & bit_mask(44)) << 12;
+                if (ppn & (bit_mask(shift) & ~RISCV_PAGE_MASK)) return false;
+                uint64_t updated = pte | RISCV_PTE_ACCESSED | (access == RISCV_MMU_WRITE ? RISCV_PTE_DIRTY : 0);
+                if (updated != pte) {
+                    if (!(vm->csr.envcfg[RISCV_PRIV_MACHINE] & CSR_ENVCFG_ADUE)
+                        || (!gstage && !(vm->hypervisor.envcfg & CSR_ENVCFG_ADUE))) return false;
+                    if (!gstage && !riscv_mmu_gstage(vm, pte_addr, &host_pte_addr, RISCV_MMU_WRITE, true)) return false;
+                    ptr = riscv_phys_access(vm, host_pte_addr);
+                    if (!ptr) {
+                        vm->hypervisor.walk_access_fault = true;
+                        return false;
+                    }
+                    if (!atomic_cas_uint64_le(ptr, pte, updated)) continue;
+                }
+                *paddr = ppn | (addr & bit_mask(shift));
+                return true;
+            }
+            if (!level || (pte & (RISCV_PTE_DIRTY | RISCV_PTE_ACCESSED | RISCV_PTE_USER)) || pbmt) return false;
+            table = ((pte >> 10) & bit_mask(44)) << 12;
+            break;
+        }
+    }
+    return false;
+}
+
+static bool riscv_mmu_gstage(rvvm_hart_t* vm, rvvm_addr_t gpa, rvvm_addr_t* paddr,
+                             uint8_t access, bool implicit)
+{
+    uint8_t gaccess = access;
+    if (!implicit && (access == RISCV_MMU_READ || (access & RISCV_MMU_CBO_FLAG))
+        && (vm->csr.status & CSR_STATUS_MXR)) {
+        gaccess |= RISCV_MMU_EXEC;
+    }
+    if (riscv_mmu_hwalk(vm, gpa, paddr, vm->hypervisor.gatp, RISCV_PRIV_USER, gaccess, true)) return true;
+    if (vm->hypervisor.walk_access_fault) return false;
+    vm->hypervisor.guest_fault = true;
+    vm->hypervisor.fault_gpa = gpa;
+    vm->hypervisor.implicit_fault = implicit;
+    vm->hypervisor.implicit_write = implicit && access == RISCV_MMU_WRITE;
+    return false;
+}
+
+#endif
+
 // Translate virtual address to physical with respect to current CPU mode
 static inline bool riscv_mmu_translate(rvvm_hart_t* vm, rvvm_addr_t vaddr, rvvm_addr_t* paddr, uint8_t access)
 {
     uint8_t priv = vm->priv_mode;
+    bool virt = vm->virt;
+    vm->hypervisor.guest_fault = false;
+    vm->hypervisor.walk_access_fault = false;
     // If MPRV is enabled, and we aren't fetching an instruction,
     // change effective privilege mode to STATUS.MPP
     if (unlikely((vm->csr.status & CSR_STATUS_MPRV) && (access != RISCV_MMU_EXEC))) {
         priv = bit_cut(vm->csr.status, 11, 2);
+        virt = !!(vm->csr.status & CSR_STATUS_MPV) && priv < RISCV_PRIV_MACHINE;
     }
+#ifdef USE_RV64
+    if (vm->hypervisor.loadstore) {
+        virt = true;
+        priv = !!(vm->hypervisor.status & CSR_HSTATUS_SPVP);
+    }
+    if (virt) {
+        uint8_t vsaccess = vm->hypervisor.execute_load ? RISCV_MMU_EXEC : access;
+        if ((vsaccess == RISCV_MMU_READ || (vsaccess & RISCV_MMU_CBO_FLAG))
+            && ((vm->csr.status | vm->hypervisor.vsstatus) & CSR_STATUS_MXR)) vsaccess |= RISCV_MMU_EXEC;
+        rvvm_addr_t gpa;
+        if (!riscv_mmu_hwalk(vm, vaddr, &gpa, vm->hypervisor.vsatp, priv, vsaccess, false)) return false;
+        return riscv_mmu_gstage(vm, gpa, paddr,
+                                vm->hypervisor.execute_load ? RISCV_MMU_EXEC : access, false);
+    }
+#endif
     // If MXR is enabled, reads from pages marked as executable-only should succeed
-    if (unlikely((vm->csr.status & CSR_STATUS_MXR) && (access == RISCV_MMU_READ))) {
+    if (unlikely((vm->csr.status & CSR_STATUS_MXR) && (access == RISCV_MMU_READ || (access & RISCV_MMU_CBO_FLAG)))) {
         access |= RISCV_MMU_EXEC;
     }
     if (priv < RISCV_PRIV_MACHINE) {
@@ -480,20 +589,40 @@ static void riscv_mmu_phys_fault(rvvm_hart_t* vm, rvvm_addr_t vaddr, uint32_t at
         uint8_t access = attr & 0xFF;
         uint32_t cause = RISCV_TRAP_INSN_FETCH;
         if (access == RISCV_MMU_READ) cause = RISCV_TRAP_LOAD_FAULT;
-        if (access == RISCV_MMU_WRITE) cause = RISCV_TRAP_STORE_FAULT;
+        if (access == RISCV_MMU_WRITE || (access & RISCV_MMU_CBO_FLAG)) cause = RISCV_TRAP_STORE_FAULT;
         riscv_trap(vm, cause, vaddr);
     }
 }
 
 static void riscv_mmu_pagefault(rvvm_hart_t* vm, rvvm_addr_t vaddr, uint32_t attr)
 {
+    if (vm->hypervisor.walk_access_fault) {
+        riscv_mmu_phys_fault(vm, vaddr, attr);
+        return;
+    }
     if (!(attr & RISCV_MMU_ATTR_NO_TRAP)) {
         uint8_t access = attr & 0xFF;
         uint32_t cause = RISCV_TRAP_INSN_PAGEFAULT;
         if (access == RISCV_MMU_READ) cause = RISCV_TRAP_LOAD_PAGEFAULT;
-        if (access == RISCV_MMU_WRITE) cause = RISCV_TRAP_STORE_PAGEFAULT;
+        if (access == RISCV_MMU_WRITE || (access & RISCV_MMU_CBO_FLAG)) cause = RISCV_TRAP_STORE_PAGEFAULT;
+        if (vm->hypervisor.guest_fault) {
+            cause = access == RISCV_MMU_READ ? RISCV_TRAP_LOAD_GUEST_PAGEFAULT
+                : (access == RISCV_MMU_WRITE || (access & RISCV_MMU_CBO_FLAG))
+                    ? RISCV_TRAP_STORE_GUEST_PAGEFAULT : RISCV_TRAP_INSN_GUEST_PAGEFAULT;
+        }
         riscv_trap(vm, cause, vaddr);
     }
+}
+
+static bool riscv_mmu_cbo_physical(rvvm_hart_t* vm, rvvm_addr_t paddr)
+{
+    if (riscv_phys_access(vm, paddr)) return true;
+    rvvm_addr_t block = paddr & ~(rvvm_addr_t)63;
+    vector_foreach (vm->machine->mmio_devs, i) {
+        rvvm_mmio_dev_t* region = vector_at(vm->machine->mmio_devs, i);
+        if (region->addr <= block && block + 64 <= region->addr + region->size) return true;
+    }
+    return false;
 }
 
 cold_path void* riscv_mmu_op_internal(rvvm_hart_t* vm, rvvm_addr_t vaddr, void* data, uint32_t attr)
@@ -563,6 +692,11 @@ cold_path void* riscv_mmu_op_internal(rvvm_hart_t* vm, rvvm_addr_t vaddr, void* 
 
     if (likely(riscv_mmu_translate(vm, vaddr, &paddr, mmu_access))) {
         if (unlikely(attr & RISCV_MMU_ATTR_PHYS)) {
+            if ((access & RISCV_MMU_CBO_FLAG) && ((paddr & ~SV64_PHYS_MASK)
+                || (!vm->userland && !riscv_mmu_cbo_physical(vm, paddr)))) {
+                riscv_mmu_phys_fault(vm, vaddr, attr);
+                return NULL;
+            }
             // Physical translation requested
             *(rvvm_addr_t*)data = paddr;
             return data;
@@ -571,7 +705,7 @@ cold_path void* riscv_mmu_op_internal(rvvm_hart_t* vm, rvvm_addr_t vaddr, void* 
         void* ptr = riscv_phys_access(vm, paddr);
         if (likely(ptr)) {
             // Physical address in main memory, cache address translation
-            riscv_tlb_put(vm, vaddr, ptr, access);
+            if (!vm->hypervisor.loadstore) riscv_tlb_put(vm, vaddr, ptr, access);
             if (likely(!(attr & RISCV_MMU_ATTR_PTR))) {
                 // Perform actual load/store on translated pointer
                 if (access == RISCV_MMU_WRITE) {

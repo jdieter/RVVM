@@ -147,6 +147,8 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define CSR_VSCAUSE        0x242 // Virtual supervisor trap cause
 #define CSR_VSTVAL         0x243 // Virtual supervisor trap value
 #define CSR_VSIP           0x244 // Virtual supervisor interrupts pending
+#define CSR_VSTIMECMP      0x24D // Virtual supervisor timer compare (Sstc)
+#define CSR_VSTIMECMPH     0x25D // Virtual supervisor timer compare high (Sstc, RV32)
 #define CSR_VSATP          0x280 // Virtual supervisor address translation and protection
 
 // Virtual Supervisor Indirect CSR Access (Sscsrind)
@@ -280,6 +282,8 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define CSR_ENVCFG_CBCFE   (1ULL << 6)
 #define CSR_ENVCFG_CBZE    (1ULL << 7)
 #define CSR_ENVCFG_STCE    (1ULL << 63)
+#define CSR_ENVCFG_PBMTE   (1ULL << 62)
+#define CSR_ENVCFG_ADUE    (1ULL << 61)
 
 #define CSR_MSECCFG_USEED  (1ULL << 8)
 #define CSR_MSECCFG_SSEED  (1ULL << 9)
@@ -309,6 +313,17 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 #define CSR_MSTATUS_MASK   0xF007FFFAAULL
 #define CSR_SSTATUS_MASK   0x3000DE722ULL
+#define CSR_HSTATUS_SPV    (1ULL << 7)
+#define CSR_HSTATUS_SPVP   (1ULL << 8)
+#define CSR_HSTATUS_HU     (1ULL << 9)
+#define CSR_HSTATUS_VTVM   (1ULL << 20)
+#define CSR_HSTATUS_VTW    (1ULL << 21)
+#define CSR_HSTATUS_VTSR   (1ULL << 22)
+#define CSR_STATUS_GVA     (1ULL << 38)
+#define CSR_STATUS_MPV     (1ULL << 39)
+#define CSR_HSTATUS_MASK   0x7003C0ULL
+#define CSR_HEDELEG_MASK   0xB1FFU
+#define CSR_HVIP_MASK      0x444U
 #define CSR_STATUS_FS_MASK 0x000006000ULL
 
 #define CSR_MEDELEG_MASK   0x0000B109U
@@ -349,7 +364,8 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 static forceinline bool riscv_fpu_is_enabled(rvvm_hart_t* vm)
 {
-    return bit_cut(vm->csr.status, 13, 2) != FS_OFF;
+    return bit_cut(vm->csr.status, 13, 2) != FS_OFF
+        && (!vm->virt || bit_cut(vm->hypervisor.vsstatus, 13, 2) != FS_OFF);
 }
 
 static forceinline void riscv_fpu_set_dirty(rvvm_hart_t* vm)
@@ -357,6 +373,7 @@ static forceinline void riscv_fpu_set_dirty(rvvm_hart_t* vm)
     if (unlikely(bit_cut(vm->csr.status, 13, 2) != FS_DIRTY)) {
         vm->csr.status |= (FS_DIRTY << 13);
     }
+    if (vm->virt) vm->hypervisor.vsstatus |= FS_DIRTY << 13;
 }
 
 /*
@@ -394,7 +411,7 @@ static forceinline bool riscv_csr_envcfg_enabled(rvvm_hart_t* vm, uint64_t mask)
     if (vm->priv_mode < RISCV_PRIV_MACHINE) {
         mask &= vm->csr.envcfg[RISCV_PRIV_MACHINE];
     }
-    // TODO: henvcfg delegation?
+    if (vm->virt) mask &= vm->hypervisor.envcfg;
     if (vm->priv_mode < RISCV_PRIV_SUPERVISOR) {
         mask &= vm->csr.envcfg[RISCV_PRIV_SUPERVISOR];
     }
@@ -407,7 +424,7 @@ static forceinline bool riscv_csr_counter_enabled(rvvm_hart_t* vm, uint32_t coun
     if (vm->priv_mode < RISCV_PRIV_MACHINE) {
         mask &= vm->csr.counteren[RISCV_PRIV_MACHINE];
     }
-    // TODO: hcounteren delegation?
+    if (vm->virt) mask &= vm->hypervisor.counteren;
     if (vm->priv_mode < RISCV_PRIV_SUPERVISOR) {
         mask &= vm->csr.counteren[RISCV_PRIV_SUPERVISOR];
     }

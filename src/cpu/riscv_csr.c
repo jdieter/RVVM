@@ -171,7 +171,12 @@ static inline bool riscv_csr_zero_h(rvvm_hart_t* vm, rvvm_uxlen_t* dest)
 static inline bool riscv_csr_counter(rvvm_hart_t* vm, rvvm_uxlen_t* dest, uint32_t counter)
 {
     if (riscv_csr_counter_enabled(vm, counter)) {
-        return riscv_csr_const(dest, rvtimer_get(&vm->machine->timer));
+        uint64_t value = rvtimer_get(&vm->machine->timer);
+        if (vm->virt && counter == CSR_TIME - CSR_CYCLE) value += vm->hypervisor.timedelta;
+        return riscv_csr_const(dest, value);
+    }
+    if (vm->virt && (vm->csr.counteren[RISCV_PRIV_MACHINE] & (1U << counter))) {
+        riscv_trap(vm, RISCV_TRAP_VIRTUAL_INSN, 0);
     }
     return false;
 }
@@ -207,8 +212,10 @@ static bool riscv_csr_misa(rvvm_hart_t* vm, rvvm_uxlen_t* dest, uint8_t op)
 #else
     misa |= riscv_mkmisa("imacbsu");
 #endif
+    if (vm->hypervisor.enabled) misa |= riscv_mkmisa("h");
     riscv_csr_helper(vm, &misa, dest, op);
 
+    if (vm->hypervisor.enabled) return true; // H keeps all execution modes RV64.
     if ((vm->csr.isa & CSR_MISA_RV64) && (misa & CSR_MISA_RV32)) {
         vm->csr.isa = CSR_MISA_RV32;
         riscv_update_xlen(vm);
@@ -247,21 +254,20 @@ static inline bool riscv_csr_status_xl_valid(uint8_t xl)
     return false;
 }
 
-static bool riscv_csr_status(rvvm_hart_t* vm, rvvm_uxlen_t* dest, uint64_t mask, uint8_t op)
+static bool riscv_csr_status_bank(rvvm_hart_t* vm, rvvm_uxlen_t* reg, rvvm_uxlen_t* dest, uint64_t mask, uint8_t op)
 {
-    rvvm_uxlen_t status     = vm->csr.status;
+    rvvm_uxlen_t status     = *reg;
     rvvm_uxlen_t old_status = status;
 
-    // Fixup XS and SD fields in status before reading
+    // No additional extension state is implemented; FS/VS independently feed SD.
     uint8_t fs = bit_cut(status, 13, 2);
     uint8_t vs = bit_cut(status, 9, 2);
-    uint8_t xs = EVAL_MAX(fs, vs);
-    status     = bit_replace(status, 15, 2, xs);
+    uint8_t dirty_state = EVAL_MAX(fs, vs);
+    status = bit_replace(status, 15, 2, 0);
 
     riscv_csr_helper_masked(vm, &status, dest, mask, op);
 
-    if (unlikely(xs == FS_DIRTY)) {
-        // XS is dirty, set SD bit
+    if (unlikely(dirty_state == FS_DIRTY)) {
         *dest |= riscv_csr_sd_bit(vm);
     }
 
@@ -269,10 +275,11 @@ static bool riscv_csr_status(rvvm_hart_t* vm, rvvm_uxlen_t* dest, uint64_t mask,
         // Validate WARL fields
         if (vm->machine->rv64) {
             // Validate UXL, SXL if machine is 64-bit
-            if (!riscv_csr_status_xl_valid(bit_cut(status, 32, 2))) {
+            if (vm->hypervisor.enabled || !riscv_csr_status_xl_valid(bit_cut(status, 32, 2))) {
                 status = bit_replace(status, 32, 2, CSR_STATUS_XL_RV64);
             }
-            if (!riscv_csr_status_xl_valid(bit_cut(status, 34, 2))) {
+            if (reg == &vm->csr.status
+                && (vm->hypervisor.enabled || !riscv_csr_status_xl_valid(bit_cut(status, 34, 2)))) {
                 status = bit_replace(status, 34, 2, CSR_STATUS_XL_RV64);
             }
         }
@@ -280,6 +287,7 @@ static bool riscv_csr_status(rvvm_hart_t* vm, rvvm_uxlen_t* dest, uint64_t mask,
             // Validate MPP
             status = bit_replace(status, 11, 2, RISCV_PRIV_USER);
         }
+        status = bit_replace(status, 15, 2, 0);
 
 #ifndef USE_FPU
         status = bit_replace(status, 13, 2, FS_OFF);
@@ -295,7 +303,48 @@ static bool riscv_csr_status(rvvm_hart_t* vm, rvvm_uxlen_t* dest, uint64_t mask,
             riscv_hart_check_interrupts(vm);
         }
 
-        vm->csr.status = status;
+        *reg = status;
+        if ((status ^ old_status) & (CSR_STATUS_SUM | CSR_STATUS_MXR | CSR_STATUS_MPRV
+                                     | CSR_STATUS_MPV | (3ULL << 11))) {
+            riscv_tlb_flush(vm);
+        }
+    }
+    return true;
+}
+
+static bool riscv_csr_status(rvvm_hart_t* vm, rvvm_uxlen_t* dest, uint64_t mask, uint8_t op)
+{
+    return riscv_csr_status_bank(vm, &vm->csr.status, dest, mask, op);
+}
+
+static bool riscv_csr_hgatp(rvvm_hart_t* vm, rvvm_uxlen_t* dest, uint8_t op)
+{
+    if (!vm->rv64) return false;
+    if (vm->priv_mode == RISCV_PRIV_SUPERVISOR && (vm->csr.status & CSR_STATUS_TVM)) return false;
+    rvvm_uxlen_t value = vm->hypervisor.gatp;
+    riscv_csr_helper(vm, &value, dest, op);
+    uint8_t mode = value >> 60;
+    if (mode != CSR_SATP_MODE_BARE && mode != CSR_SATP_MODE_SV39 && mode != CSR_SATP_MODE_SV48) return true;
+    // VMIDLEN=0 is architectural. x4 roots require 16 KiB alignment.
+    value &= (15ULL << 60) | (bit_mask(44) & ~3ULL);
+    if (value != vm->hypervisor.gatp) {
+        vm->hypervisor.gatp = value;
+        riscv_tlb_flush(vm);
+    }
+    return true;
+}
+
+static bool riscv_csr_vsatp(rvvm_hart_t* vm, rvvm_uxlen_t* dest, uint8_t op)
+{
+    if (!vm->rv64) return false;
+    rvvm_uxlen_t value = vm->hypervisor.vsatp;
+    riscv_csr_helper(vm, &value, dest, op);
+    uint8_t mode = value >> 60;
+    if (mode != CSR_SATP_MODE_BARE && mode != CSR_SATP_MODE_SV39 && mode != CSR_SATP_MODE_SV48) return true;
+    value &= (15ULL << 60) | bit_mask(44);
+    if (value != vm->hypervisor.vsatp) {
+        vm->hypervisor.vsatp = value;
+        riscv_tlb_flush(vm);
     }
     return true;
 }
@@ -319,7 +368,7 @@ static inline bool riscv_csr_topi(rvvm_hart_t* vm, rvvm_uxlen_t* dest, rvvm_uxle
 {
     if (vm->aia) {
         uint32_t pending = (riscv_interrupts_pending(vm) & mask);
-        uint32_t irq     = pending ? (bit_clz32(pending) ^ 31) : 0;
+        uint32_t irq     = riscv_interrupt_priority(pending);
         // Report IRQ as both pending and highest prio
         *dest = (!!irq) | (irq << 16);
         UNUSED(op);
@@ -574,6 +623,105 @@ static bool riscv_csr_indirect(rvvm_hart_t* vm, uint8_t priv_mode, uint32_t csri
 static forceinline bool riscv_csr_op_internal(rvvm_hart_t* vm, uint32_t csr_id, rvvm_uxlen_t* dest, uint8_t op)
 {
     switch (csr_id) {
+        case CSR_HSTATUS:
+            riscv_csr_helper_masked(vm, &vm->hypervisor.status, dest, CSR_HSTATUS_MASK, op);
+            *dest |= 2ULL << 32; // VSXL is fixed RV64 for now.
+            return vm->rv64;
+        case CSR_HEDELEG:
+            return riscv_csr_helper_masked(vm, &vm->hypervisor.edeleg, dest, CSR_HEDELEG_MASK, op);
+        case CSR_HIDELEG:
+            return riscv_csr_helper_masked(vm, &vm->hypervisor.ideleg, dest, CSR_HVIP_MASK, op);
+        case CSR_HIE:
+            return riscv_csr_ie(vm, dest, CSR_HVIP_MASK, op);
+        case CSR_HIP:
+            riscv_csr_ip(vm, dest, 4, op);
+            *dest |= (vm->csr.ip | riscv_interrupts_raised(vm)) & (CSR_HVIP_MASK & ~4U);
+            return true;
+        case CSR_HVIP:
+            riscv_csr_helper_masked(vm, &vm->csr.ip, dest, CSR_HVIP_MASK, op);
+            riscv_hart_check_interrupts(vm);
+            return true;
+        case CSR_HCOUNTEREN:
+            return riscv_csr_helper_masked(vm, &vm->hypervisor.counteren, dest, CSR_COUNTEREN_MASK, op);
+        case CSR_HTVAL:
+            return riscv_csr_helper(vm, &vm->hypervisor.tval, dest, op);
+        case CSR_HTINST:
+            return riscv_csr_helper(vm, &vm->hypervisor.tinst, dest, op);
+        case CSR_HGEIE:
+        case CSR_HGEIP:
+            return riscv_csr_zero(dest); // No hardware guest external interrupt files.
+        case CSR_HENVCFG:
+        case CSR_HTIMEDELTA: {
+            uint64_t* reg = csr_id == CSR_HENVCFG ? &vm->hypervisor.envcfg : &vm->hypervisor.timedelta;
+            uint64_t value = atomic_load_uint64_relax(reg);
+            uint64_t old_value = value;
+            uint64_t mask = CSR_MENVCFG_MASK | CSR_ENVCFG_PBMTE | CSR_ENVCFG_ADUE;
+            if (csr_id == CSR_HENVCFG) {
+                mask &= ~(CSR_ENVCFG_STCE | CSR_ENVCFG_PBMTE | CSR_ENVCFG_ADUE)
+                    | vm->csr.envcfg[RISCV_PRIV_MACHINE];
+                value &= mask;
+            }
+            riscv_csr_helper_l(vm, &value, dest, csr_id == CSR_HENVCFG ? mask : -1ULL, op);
+            atomic_store_uint64(reg, value);
+            if (csr_id == CSR_HENVCFG && ((old_value ^ value) & (CSR_ENVCFG_PBMTE | CSR_ENVCFG_ADUE))) {
+                riscv_tlb_flush(vm);
+            }
+            riscv_hart_check_interrupts(vm);
+            return true;
+        }
+        case CSR_VSTIMECMP: {
+            if (vm->priv_mode < RISCV_PRIV_MACHINE
+                && (!(vm->csr.envcfg[RISCV_PRIV_MACHINE] & CSR_ENVCFG_STCE)
+                    || !(vm->csr.counteren[RISCV_PRIV_MACHINE] & CSR_COUNTEREN_TM))) return false;
+            if (vm->virt && (!(vm->hypervisor.envcfg & CSR_ENVCFG_STCE)
+                || !(vm->hypervisor.counteren & CSR_COUNTEREN_TM))) {
+                riscv_trap(vm, RISCV_TRAP_VIRTUAL_INSN, 0);
+                return false;
+            }
+            uint64_t value = atomic_load_uint64_relax(&vm->hypervisor.vstimecmp);
+            riscv_csr_helper_l(vm, &value, dest, -1ULL, op);
+            atomic_store_uint64(&vm->hypervisor.vstimecmp, value);
+            riscv_hart_check_interrupts(vm);
+            return true;
+        }
+        case CSR_HGATP:
+            return riscv_csr_hgatp(vm, dest, op);
+        case CSR_VSSTATUS:
+            return riscv_csr_status_bank(vm, &vm->hypervisor.vsstatus, dest, CSR_SSTATUS_MASK, op);
+        case CSR_VSIE: {
+            rvvm_uxlen_t value = vm->csr.ie >> 1;
+            riscv_csr_helper_masked(vm, &value, dest, vm->hypervisor.ideleg >> 1, op);
+            vm->csr.ie = (vm->csr.ie & ~vm->hypervisor.ideleg) | ((value << 1) & vm->hypervisor.ideleg);
+            riscv_hart_check_interrupts(vm);
+            return true;
+        }
+        case CSR_VSIP: {
+            rvvm_uxlen_t value = (vm->csr.ip | riscv_interrupts_raised(vm)) >> 1;
+            // Only VSSIP is writable through vsip; VSTIP/VSEIP are read-only.
+            rvvm_uxlen_t old = value;
+            riscv_csr_helper_masked(vm, &value, dest, vm->hypervisor.ideleg >> 1, op);
+            rvvm_uxlen_t writable = vm->hypervisor.ideleg & 4;
+            vm->csr.ip = (vm->csr.ip & ~writable) | ((value << 1) & writable);
+            *dest = old & (vm->hypervisor.ideleg >> 1);
+            riscv_hart_check_interrupts(vm);
+            return true;
+        }
+        case CSR_VSTVEC:
+            return riscv_csr_tvec(vm, &vm->csr.tvec[RISCV_CSR_VS], dest, op);
+        case CSR_VSSCRATCH:
+            return riscv_csr_helper(vm, &vm->csr.scratch[RISCV_CSR_VS], dest, op);
+        case CSR_VSEPC:
+            return riscv_csr_epc(vm, &vm->csr.epc[RISCV_CSR_VS], dest, op);
+        case CSR_VSCAUSE:
+            return riscv_csr_helper(vm, &vm->csr.cause[RISCV_CSR_VS], dest, op);
+        case CSR_VSTVAL:
+            return riscv_csr_helper(vm, &vm->csr.tval[RISCV_CSR_VS], dest, op);
+        case CSR_VSATP:
+            return riscv_csr_vsatp(vm, dest, op);
+        case CSR_VSISELECT:
+            return riscv_csr_helper(vm, &vm->csr.iselect[RISCV_CSR_VS], dest, op);
+        case CSR_VSIREG:
+            return false; // No virtual AIA register file (GEILEN=0).
 #ifdef USE_FPU
         // User Floating-Point CSRs
         case CSR_FFLAGS:
@@ -662,19 +810,26 @@ static forceinline bool riscv_csr_op_internal(rvvm_hart_t* vm, uint32_t csr_id, 
 
         // Machine Trap Setup
         case CSR_MSTATUS:
-            return riscv_csr_status(vm, dest, CSR_MSTATUS_MASK, op);
+            return riscv_csr_status(vm, dest, CSR_MSTATUS_MASK
+                | (vm->hypervisor.enabled ? CSR_STATUS_MPV | CSR_STATUS_GVA : 0), op);
         case CSR_MSTATUSH:
             return riscv_csr_zero(dest); // We don't need upper half on rv32 for now
         case CSR_MISA:
             return riscv_csr_misa(vm, dest, op);
         case CSR_MEDELEG:
-            return riscv_csr_helper_masked(vm, &vm->csr.edeleg[RISCV_PRIV_MACHINE], dest, CSR_MEDELEG_MASK, op);
+            return riscv_csr_helper_masked(vm, &vm->csr.edeleg[RISCV_PRIV_MACHINE], dest,
+                CSR_MEDELEG_MASK | (vm->hypervisor.enabled ? 0xF004F6U : 0), op);
         case CSR_MIDELEG:
-            return riscv_csr_helper_masked(vm, &vm->csr.ideleg[RISCV_PRIV_MACHINE], dest, CSR_MIDELEG_MASK, op);
+            riscv_csr_helper_masked(vm, &vm->csr.ideleg[RISCV_PRIV_MACHINE], dest, CSR_MIDELEG_MASK, op);
+            if (vm->hypervisor.enabled) {
+                vm->csr.ideleg[RISCV_PRIV_MACHINE] |= CSR_HVIP_MASK;
+                *dest |= CSR_HVIP_MASK;
+            }
+            return true;
         case CSR_MIDELEGH:
             return riscv_csr_zero_h(vm, dest);
         case CSR_MIE:
-            return riscv_csr_ie(vm, dest, CSR_MEIP_MASK, op);
+            return riscv_csr_ie(vm, dest, CSR_MEIP_MASK | (vm->hypervisor.enabled ? CSR_HVIP_MASK : 0), op);
         case CSR_MIEH:
             return riscv_csr_zero_h(vm, dest);
         case CSR_MTVEC:
@@ -692,8 +847,12 @@ static forceinline bool riscv_csr_op_internal(rvvm_hart_t* vm, uint32_t csr_id, 
             return riscv_csr_helper(vm, &vm->csr.cause[RISCV_PRIV_MACHINE], dest, op);
         case CSR_MTVAL:
             return riscv_csr_helper(vm, &vm->csr.tval[RISCV_PRIV_MACHINE], dest, op);
+        case CSR_MTVAL2:
+            return riscv_csr_helper(vm, &vm->hypervisor.mtval2, dest, op);
+        case CSR_MTINST:
+            return riscv_csr_helper(vm, &vm->hypervisor.mtinst, dest, op);
         case CSR_MIP:
-            return riscv_csr_ip(vm, dest, CSR_MEIP_MASK, op);
+            return riscv_csr_ip(vm, dest, CSR_MEIP_MASK | (vm->hypervisor.enabled ? CSR_HVIP_MASK : 0), op);
         case CSR_MIPH:
             return riscv_csr_zero_h(vm, dest);
         case CSR_MTOPEI:
@@ -702,8 +861,20 @@ static forceinline bool riscv_csr_op_internal(rvvm_hart_t* vm, uint32_t csr_id, 
             return riscv_csr_topi(vm, dest, CSR_MEIP_MASK, op);
 
         // Machine Configuration
-        case CSR_MENVCFG:
-            return riscv_csr_helper_l(vm, &vm->csr.envcfg[RISCV_PRIV_MACHINE], dest, CSR_MENVCFG_MASK, op);
+        case CSR_MENVCFG: {
+            uint64_t previous = vm->csr.envcfg[RISCV_PRIV_MACHINE];
+            bool result = riscv_csr_helper_l(vm, &vm->csr.envcfg[RISCV_PRIV_MACHINE], dest, CSR_MENVCFG_MASK
+                | (vm->hypervisor.enabled ? CSR_ENVCFG_PBMTE | CSR_ENVCFG_ADUE : 0), op);
+            if (vm->hypervisor.enabled && previous != vm->csr.envcfg[RISCV_PRIV_MACHINE]) {
+                uint64_t mask = ~(CSR_ENVCFG_STCE | CSR_ENVCFG_PBMTE | CSR_ENVCFG_ADUE)
+                    | vm->csr.envcfg[RISCV_PRIV_MACHINE];
+                atomic_store_uint64(&vm->hypervisor.envcfg,
+                    atomic_load_uint64_relax(&vm->hypervisor.envcfg) & mask);
+                riscv_tlb_flush(vm);
+                riscv_hart_check_interrupts(vm);
+            }
+            return result;
+        }
         case CSR_MENVCFGH:
             return riscv_csr_helper_h(vm, &vm->csr.envcfg[RISCV_PRIV_MACHINE], dest, CSR_MENVCFG_MASK, op);
         case CSR_MSECCFG:
@@ -815,6 +986,29 @@ static forceinline bool riscv_csr_op_internal(rvvm_hart_t* vm, uint32_t csr_id, 
     return false;
 }
 
+static bool riscv_csr_hs_qualified(rvvm_hart_t* vm, uint32_t csr_id)
+{
+    switch (csr_id) {
+        case CSR_HSTATUS: case CSR_HEDELEG: case CSR_HIDELEG: case CSR_HIE:
+        case CSR_HCOUNTEREN: case CSR_HGEIE: case CSR_HTVAL: case CSR_HIP:
+        case CSR_HVIP: case CSR_HTINST: case CSR_HGEIP: case CSR_HENVCFG:
+        case CSR_HTIMEDELTA: case CSR_HGATP: case CSR_VSSTATUS: case CSR_VSIE:
+        case CSR_VSTVEC: case CSR_VSSCRATCH: case CSR_VSEPC: case CSR_VSCAUSE:
+        case CSR_VSTVAL: case CSR_VSIP: case CSR_VSATP: case CSR_VSISELECT:
+        case CSR_SSTATUS: case CSR_SIE: case CSR_STVEC: case CSR_SCOUNTEREN:
+        case CSR_SENVCFG: case CSR_SCOUNTINHIBIT: case CSR_SISELECT: case CSR_SSCRATCH:
+        case CSR_SEPC: case CSR_SCAUSE: case CSR_STVAL: case CSR_SIP: case CSR_SATP:
+            return true;
+        case CSR_VSTIMECMP: case CSR_STIMECMP:
+            return (vm->csr.envcfg[RISCV_PRIV_MACHINE] & CSR_ENVCFG_STCE)
+                && (vm->csr.counteren[RISCV_PRIV_MACHINE] & CSR_COUNTEREN_TM);
+        case CSR_SIREG: case CSR_STOPEI: case CSR_STOPI:
+            return !!vm->aia;
+        default:
+            return false;
+    }
+}
+
 bool riscv_csr_op(rvvm_hart_t* vm, uint32_t csr_id, rvvm_uxlen_t* dest, uint8_t op)
 {
     if (riscv_csr_readonly(csr_id)) {
@@ -824,9 +1018,43 @@ bool riscv_csr_op(rvvm_hart_t* vm, uint32_t csr_id, rvvm_uxlen_t* dest, uint8_t 
         }
     }
 
-    if (unlikely(riscv_csr_privilege(csr_id) > vm->priv_mode)) {
+    uint8_t required_priv = riscv_csr_privilege(csr_id);
+    if (!vm->hypervisor.enabled && (required_priv == RISCV_PRIV_HYPERVISOR
+        || csr_id == CSR_MTVAL2 || csr_id == CSR_MTINST)) return false;
+    if (vm->virt && (required_priv == RISCV_PRIV_HYPERVISOR
+        || (required_priv == RISCV_PRIV_SUPERVISOR && vm->priv_mode == RISCV_PRIV_USER))
+        && riscv_csr_hs_qualified(vm, csr_id)) {
+        riscv_trap(vm, RISCV_TRAP_VIRTUAL_INSN, 0);
+        return false;
+    }
+    // H and explicit VS CSRs use privilege encoding 2 but execute in HS.
+    if (!vm->virt && required_priv == RISCV_PRIV_HYPERVISOR) required_priv = RISCV_PRIV_SUPERVISOR;
+    if (unlikely(required_priv > vm->priv_mode)) {
         // Not privileged enough to access this CSR
         return false;
+    }
+
+    if (vm->virt) {
+        switch (csr_id) {
+            case CSR_SSTATUS: csr_id = CSR_VSSTATUS; break;
+            case CSR_SIE: csr_id = CSR_VSIE; break;
+            case CSR_STVEC: csr_id = CSR_VSTVEC; break;
+            case CSR_SSCRATCH: csr_id = CSR_VSSCRATCH; break;
+            case CSR_SEPC: csr_id = CSR_VSEPC; break;
+            case CSR_SCAUSE: csr_id = CSR_VSCAUSE; break;
+            case CSR_STVAL: csr_id = CSR_VSTVAL; break;
+            case CSR_SIP: csr_id = CSR_VSIP; break;
+            case CSR_STIMECMP: csr_id = CSR_VSTIMECMP; break;
+            case CSR_SISELECT: csr_id = CSR_VSISELECT; break;
+            case CSR_SIREG: csr_id = CSR_VSIREG; break;
+            case CSR_SATP:
+                if (vm->hypervisor.status & CSR_HSTATUS_VTVM) {
+                    riscv_trap(vm, RISCV_TRAP_VIRTUAL_INSN, 0);
+                    return false;
+                }
+                csr_id = CSR_VSATP;
+                break;
+        }
     }
 
     bool ret = riscv_csr_op_internal(vm, csr_id, dest, op);
@@ -839,14 +1067,14 @@ bool riscv_csr_op(rvvm_hart_t* vm, uint32_t csr_id, rvvm_uxlen_t* dest, uint8_t 
 
 void riscv_csr_init(rvvm_hart_t* vm)
 {
-    // Delegate exceptions from M to S
-    vm->csr.edeleg[RISCV_PRIV_HYPERVISOR] = 0xFFFFFFFF;
-    vm->csr.ideleg[RISCV_PRIV_HYPERVISOR] = 0xFFFFFFFF;
-
+    vm->hypervisor.enabled = vm->machine->rv64 && !vm->machine->userland && !rvvm_has_arg("nokvm");
+    if (vm->hypervisor.enabled) vm->csr.ideleg[RISCV_PRIV_MACHINE] |= CSR_HVIP_MASK;
     if (vm->rv64) {
 #ifdef USE_RV64
         vm->csr.status = 0xA00000000;
         vm->csr.isa    = CSR_MISA_RV64;
+        vm->hypervisor.vsstatus = 2ULL << 32;
+        vm->hypervisor.vstimecmp = -1ULL;
 #else
         rvvm_warn("Requested RV64 in RV32-only build");
 #endif

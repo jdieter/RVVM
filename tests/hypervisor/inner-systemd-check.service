@@ -1,0 +1,13 @@
+[Unit]
+Description=RVVM guest KVM systemd acceptance checks
+After=network.target systemd-udevd.service
+
+[Service]
+Type=oneshot
+ExecStart=/root/kvm-systemd-check
+TimeoutStartSec=1800
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

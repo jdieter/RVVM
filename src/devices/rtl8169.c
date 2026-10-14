@@ -296,18 +296,22 @@ static void rtl8169_ring_suspend(rvvm_snapshot_t* snap, rtl8169_ring_t* ring)
 
 static void rtl8169_update_irqs(rtl8169_dev_t* rtl8169)
 {
-    uint32_t isr = atomic_load_uint32_relax(&rtl8169->isr);
-    uint32_t imr = atomic_load_uint32_relax(&rtl8169->imr);
-    rvvm_pci_set_irq(rtl8169->func, 0, !!(isr & imr));
+    bool pending = !!(atomic_load_uint32_relax(&rtl8169->isr) & atomic_load_uint32_relax(&rtl8169->imr));
+    for (;;) {
+        rvvm_pci_set_irq(rtl8169->func, 0, pending);
+        // Receive workers and acknowledgments can cross while updating PCI.
+        atomic_fence_ex(ATOMIC_SEQ_CST);
+        bool current = !!(atomic_load_uint32_relax(&rtl8169->isr) & atomic_load_uint32_relax(&rtl8169->imr));
+        if (pending == current) break;
+        pending = current;
+    }
 }
 
 static void rtl8169_interrupt(rtl8169_dev_t* rtl8169, size_t irq)
 {
     uint32_t irqs = 1U << irq;
     atomic_or_uint32(&rtl8169->isr, irqs);
-    if (irqs & atomic_load_uint32_relax(&rtl8169->imr)) {
-        rvvm_pci_raise_irq(rtl8169->func, 0);
-    }
+    rtl8169_update_irqs(rtl8169);
 }
 
 /*

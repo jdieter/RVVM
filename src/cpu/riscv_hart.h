@@ -48,7 +48,12 @@ void riscv_send_aia_irq(rvvm_hart_t* vm, bool smode, uint32_t irq);
 // Hart interrupts that are raised externally
 static inline uint32_t riscv_interrupts_raised(rvvm_hart_t* vm)
 {
-    return atomic_load_uint32_relax(&vm->pending_irqs);
+    uint32_t irqs = atomic_load_uint32_relax(&vm->pending_irqs);
+    if (atomic_load_uint64_relax(&vm->hypervisor.envcfg) & (1ULL << 63)) {
+        uint64_t time = rvtimer_get(&vm->machine->timer) + atomic_load_uint64_relax(&vm->hypervisor.timedelta);
+        if (time >= atomic_load_uint64_relax(&vm->hypervisor.vstimecmp)) irqs |= 1U << 6;
+    }
+    return irqs;
 }
 
 // Signal the vCPU to check for timer interrupts
@@ -75,9 +80,12 @@ uint32_t riscv_get_aia_irq(rvvm_hart_t* vm, bool smode, bool claim);
 
 // Check interrupts after writing to ie/ip/status CSRs, or after sret/mret
 void riscv_hart_check_interrupts(rvvm_hart_t* vm);
+void riscv_hart_handle_irqs(rvvm_hart_t* vm);
+uint32_t riscv_interrupt_priority(uint32_t pending);
 
 // Correctly applies side-effects of switching privileges
 void riscv_switch_priv(rvvm_hart_t* vm, uint8_t priv_mode);
+void riscv_switch_virt(rvvm_hart_t* vm, bool virt);
 
 // Correctly applies side-effects of switching XLEN
 void riscv_update_xlen(rvvm_hart_t* vm);

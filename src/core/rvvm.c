@@ -219,7 +219,9 @@ static void rvvm_init_fdt(rvvm_machine_t* machine)
 #if defined(USE_FPU)
     rvvm_append_isa_string(machine, "fd");
 #endif
-    rvvm_append_isa_string(machine, riscv_exts);
+    rvvm_append_isa_string(machine, "c");
+    if (machine->rv64 && !rvvm_has_arg("nokvm")) rvvm_append_isa_string(machine, "h");
+    rvvm_append_isa_string(machine, riscv_exts + 1);
 }
 
 static void rvvm_prepare_fdt(rvvm_machine_t* machine)
@@ -300,11 +302,32 @@ static void rvvm_reset_machine_state(rvvm_machine_t* machine)
 
     // Reset CPUs
     rvvm_addr_t fdt_addr = rvvm_pass_fdt(machine);
+    // Standard OpenSBI fw_dynamic handoff. fw_jump/payload ignore a2.
+    rvvm_addr_t dynamic_info_addr = 0;
+    if (machine->kernel_file && machine->rv64 && fdt_addr >= machine->mem.addr
+        && fdt_addr - machine->mem.addr >= 64 && fdt_addr - machine->mem.addr <= machine->mem.size) {
+        dynamic_info_addr = fdt_addr - 64;
+        uint8_t* info = (uint8_t*)machine->mem.data + dynamic_info_addr - machine->mem.addr;
+        write_uint64_le(info, 0x4942534f);
+        write_uint64_le(info + 8, 2);
+        write_uint64_le(info + 16, machine->mem.addr + 0x200000);
+        write_uint64_le(info + 24, RISCV_PRIV_SUPERVISOR);
+        write_uint64_le(info + 32, 0);
+        write_uint64_le(info + 40, -1ULL);
+    }
     rvtimer_init(&machine->timer, rvvm_get_opt(machine, RVVM_OPT_TIME_FREQ));
     vector_foreach (machine->harts, i) {
         rvvm_hart_t* vm = vector_at(machine->harts, i);
         // Zero MIE, MPRV, etc
         vm->csr.status = 0;
+        bool h_enabled = vm->hypervisor.enabled;
+        memset(&vm->hypervisor, 0, sizeof(vm->hypervisor));
+        vm->hypervisor.enabled = h_enabled;
+        if (h_enabled) vm->csr.ideleg[RISCV_PRIV_MACHINE] |= CSR_HVIP_MASK;
+        if (h_enabled) vm->csr.status = 0xA00000000ULL;
+        vm->hypervisor.vsstatus = machine->rv64 ? 2ULL << 32 : 0;
+        vm->hypervisor.vstimecmp = -1ULL;
+        riscv_switch_virt(vm, false);
         // Set mcause to 0
         vm->csr.cause[RISCV_PRIV_MACHINE] = 0;
         // Invalidate reservation
@@ -314,6 +337,7 @@ static void rvvm_reset_machine_state(rvvm_machine_t* machine)
         vm->registers[RISCV_REG_X10] = i;
         // Pass FDT address in register a1
         vm->registers[RISCV_REG_X11] = fdt_addr;
+        if (machine->kernel_file && machine->rv64) vm->registers[RISCV_REG_X12] = dynamic_info_addr;
         // Jump to RESET_PC
         vm->registers[RISCV_REG_PC] = rvvm_get_opt(machine, RVVM_OPT_RESET_PC);
         // Switch into machine mode, flush icache
@@ -785,7 +809,8 @@ PUBLIC bool rvvm_machine_powered(rvvm_machine_t* machine)
 
 static void rvvm_snapshot_hart(rvvm_snapshot_t* snap, rvvm_hart_t* vm)
 {
-    rvvm_snapshot_section(snap, "riscv-hart");
+    // Distinct name rejects H snapshots on a CPU model without H.
+    rvvm_snapshot_section(snap, vm->hypervisor.enabled ? "h-riscv-hart-v1" : "riscv-hart");
     for (size_t i = 0; i < RISCV_REGS_MAX; ++i) {
         rvvm_snapshot_field(snap, vm->registers[i]);
     }
@@ -850,6 +875,23 @@ static void rvvm_snapshot_hart(rvvm_snapshot_t* snap, rvvm_hart_t* vm)
     rvvm_snapshot_field(snap, mtimecmp);
     rvvm_snapshot_field(snap, stimecmp);
     rvvm_snapshot_field(snap, vm->pending_irqs);
+    if (vm->hypervisor.enabled) {
+        rvvm_snapshot_field(snap, vm->virt);
+        rvvm_snapshot_field(snap, vm->hypervisor.status);
+        rvvm_snapshot_field(snap, vm->hypervisor.vsstatus);
+        rvvm_snapshot_field(snap, vm->hypervisor.edeleg);
+        rvvm_snapshot_field(snap, vm->hypervisor.ideleg);
+        rvvm_snapshot_field(snap, vm->hypervisor.counteren);
+        rvvm_snapshot_field(snap, vm->hypervisor.tval);
+        rvvm_snapshot_field(snap, vm->hypervisor.tinst);
+        rvvm_snapshot_field(snap, vm->hypervisor.vsatp);
+        rvvm_snapshot_field(snap, vm->hypervisor.gatp);
+        rvvm_snapshot_field(snap, vm->hypervisor.envcfg);
+        rvvm_snapshot_field(snap, vm->hypervisor.timedelta);
+        rvvm_snapshot_field(snap, vm->hypervisor.vstimecmp);
+        rvvm_snapshot_field(snap, vm->hypervisor.mtval2);
+        rvvm_snapshot_field(snap, vm->hypervisor.mtinst);
+    }
     if (!rvvm_snapshot_writing(snap)) {
         rvtimecmp_set(&vm->mtimecmp, mtimecmp);
         rvtimecmp_set(&vm->stimecmp, stimecmp);
@@ -1259,6 +1301,7 @@ PUBLIC rvvm_machine_t* rvvm_create_userland(const char* isa)
     machine->mem.size = (size_t)-0x1000ULL;
     machine->mem.data = (void*)0x1000;
     machine->rv64     = rv64;
+    machine->userland = true;
 
     // Set nanosecond machine timer precision by default
     rvvm_set_opt(machine, RVVM_OPT_TIME_FREQ, 1000000000ULL);

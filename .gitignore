@@ -26,6 +26,7 @@
 !/tests
 /tests/*
 !/tests/rocky
+!/tests/hypervisor
 
 # Explicitly track build system
 !/Makefile

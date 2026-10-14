@@ -125,6 +125,18 @@ void riscv_switch_priv(rvvm_hart_t* vm, uint8_t priv_mode)
     }
 }
 
+void riscv_switch_virt(rvvm_hart_t* vm, bool virt)
+{
+    if (vm->virt != virt) {
+        vm->virt = virt;
+        vm->lrsc = false;
+        // TLB entries and JIT dispatch lookups are keyed by virtual address.
+        // They must not survive a change between HS and VS address spaces.
+        riscv_tlb_flush(vm);
+        riscv_update_xlen(vm);
+    }
+}
+
 void riscv_update_xlen(rvvm_hart_t* vm)
 {
 #if defined(USE_RV64) && defined(USE_RV32)
@@ -155,6 +167,8 @@ static void riscv_trap_priv_helper(rvvm_hart_t* vm, uint8_t target_priv)
 {
     switch (target_priv) {
         case RISCV_PRIV_MACHINE:
+            // A trap can stay in M while replacing its effective MPRV context.
+            if (vm->csr.status & CSR_STATUS_MPRV) riscv_tlb_flush(vm);
             vm->csr.status = bit_replace(vm->csr.status, 11, 2, vm->priv_mode);
             vm->csr.status = bit_replace(vm->csr.status, 7, 1, bit_cut(vm->csr.status, 3, 1));
             vm->csr.status = bit_replace(vm->csr.status, 3, 1, 0);
@@ -185,7 +199,9 @@ void riscv_trap(rvvm_hart_t* vm, bitcnt_t cause, rvvm_uxlen_t tval)
         // Only one trap may be raised per CPU dispatch cycle
         return;
     }
-    if (cause >= RISCV_TRAP_INSN_PAGEFAULT && cause <= RISCV_TRAP_STORE_PAGEFAULT) {
+    if ((cause >= RISCV_TRAP_INSN_PAGEFAULT && cause <= RISCV_TRAP_STORE_PAGEFAULT)
+        || cause == RISCV_TRAP_INSN_GUEST_PAGEFAULT || cause == RISCV_TRAP_LOAD_GUEST_PAGEFAULT
+        || cause == RISCV_TRAP_STORE_GUEST_PAGEFAULT) {
         // Discard compiled JIT block torn by (likely recoverable) pagefault
         riscv_jit_discard(vm);
     } else {
@@ -201,19 +217,60 @@ void riscv_trap(rvvm_hart_t* vm, bitcnt_t cause, rvvm_uxlen_t tval)
     } else {
         // Target privilege mode
         uint8_t priv = RISCV_PRIV_MACHINE;
-        // Delegate to lower privilege mode if needed
-        while ((priv > vm->priv_mode) && (vm->csr.edeleg[priv] & (1 << cause))) {
-            priv--;
+        bool target_virt = false;
+        bool source_virt = vm->virt;
+        if (vm->priv_mode < RISCV_PRIV_MACHINE && (vm->csr.edeleg[RISCV_PRIV_MACHINE] & (1U << cause))) {
+            priv = RISCV_PRIV_SUPERVISOR;
+            target_virt = source_virt && (vm->hypervisor.edeleg & (1U << cause));
         }
+        uint8_t bank = target_virt ? RISCV_CSR_VS : priv;
         // Write exception info
-        vm->csr.epc[priv]   = vm->registers[RISCV_REG_PC];
-        vm->csr.cause[priv] = cause;
-        vm->csr.tval[priv]  = tval;
+        vm->csr.epc[bank]   = vm->registers[RISCV_REG_PC];
+        vm->csr.cause[bank] = cause;
+        vm->csr.tval[bank]  = tval;
         // Modify exception stack in csr.status
-        riscv_trap_priv_helper(vm, priv);
+        if (target_virt) {
+            rvvm_uxlen_t status = vm->hypervisor.vsstatus;
+            status = bit_replace(status, 8, 1, vm->priv_mode);
+            status = bit_replace(status, 5, 1, bit_cut(status, 1, 1));
+            vm->hypervisor.vsstatus = status & ~(rvvm_uxlen_t)2;
+        } else {
+            bool guest_pagefault = cause == RISCV_TRAP_INSN_GUEST_PAGEFAULT
+                || cause == RISCV_TRAP_LOAD_GUEST_PAGEFAULT || cause == RISCV_TRAP_STORE_GUEST_PAGEFAULT;
+            bool virtual_mprv = (vm->csr.status & CSR_STATUS_MPRV) && (vm->csr.status & CSR_STATUS_MPV)
+                && bit_cut(vm->csr.status, 11, 2) < RISCV_PRIV_MACHINE
+                && (cause == RISCV_TRAP_LOAD_PAGEFAULT || cause == RISCV_TRAP_STORE_PAGEFAULT
+                    || cause == RISCV_TRAP_LOAD_GUEST_PAGEFAULT || cause == RISCV_TRAP_STORE_GUEST_PAGEFAULT
+                    || cause == RISCV_TRAP_LOAD_FAULT || cause == RISCV_TRAP_STORE_FAULT
+                    || cause == RISCV_TRAP_LOAD_MISALIGN || cause == RISCV_TRAP_STORE_MISALIGN);
+            bool guest_address = (source_virt || vm->hypervisor.loadstore || virtual_mprv)
+                && (cause == RISCV_TRAP_INSN_PAGEFAULT || cause == RISCV_TRAP_LOAD_PAGEFAULT
+                    || cause == RISCV_TRAP_STORE_PAGEFAULT || guest_pagefault
+                    || cause == RISCV_TRAP_INSN_FETCH || cause == RISCV_TRAP_LOAD_FAULT
+                    || cause == RISCV_TRAP_STORE_FAULT || cause == RISCV_TRAP_LOAD_MISALIGN
+                    || cause == RISCV_TRAP_STORE_MISALIGN);
+            if (priv == RISCV_PRIV_MACHINE) {
+                vm->csr.status = bit_replace(vm->csr.status, 39, 1, source_virt);
+                vm->csr.status = bit_replace(vm->csr.status, 38, 1, guest_address);
+                vm->hypervisor.mtval2 = guest_pagefault ? vm->hypervisor.fault_gpa >> 2 : 0;
+                vm->hypervisor.mtinst = guest_pagefault && vm->hypervisor.implicit_fault
+                    ? 0x3000 | (vm->hypervisor.implicit_write ? 0x20 : 0) : 0;
+            } else {
+                vm->hypervisor.status = bit_replace(vm->hypervisor.status, 7, 1, source_virt);
+                vm->hypervisor.status = bit_replace(vm->hypervisor.status, 6, 1, guest_address);
+                vm->hypervisor.tval = guest_pagefault ? vm->hypervisor.fault_gpa >> 2 : 0;
+                vm->hypervisor.tinst = guest_pagefault && vm->hypervisor.implicit_fault
+                    ? 0x3000 | (vm->hypervisor.implicit_write ? 0x20 : 0) : 0;
+                if (source_virt) {
+                    vm->hypervisor.status = bit_replace(vm->hypervisor.status, 8, 1, vm->priv_mode);
+                }
+            }
+            riscv_trap_priv_helper(vm, priv);
+        }
+        riscv_switch_virt(vm, target_virt);
         // Jump to trap vector, switch to target priv
         riscv_switch_priv(vm, priv);
-        riscv_restart_at_pc(vm, vm->csr.tvec[priv] & (~3ULL));
+        riscv_restart_at_pc(vm, vm->csr.tvec[bank] & (~3ULL));
     }
 }
 
@@ -361,6 +418,11 @@ void riscv_hart_check_timer(rvvm_hart_t* vm)
         if (timer >= rvtimecmp_get(&vm->stimecmp) && riscv_interrupt_set(vm, RISCV_INTERRUPT_STIMER)) {
             riscv_restart_dispatch(vm);
         }
+        if ((atomic_load_uint64_relax(&vm->hypervisor.envcfg) & CSR_ENVCFG_STCE)
+            && timer + atomic_load_uint64_relax(&vm->hypervisor.timedelta)
+                >= atomic_load_uint64_relax(&vm->hypervisor.vstimecmp)) {
+            riscv_restart_dispatch(vm);
+        }
     }
 }
 
@@ -382,7 +444,18 @@ static inline rvvm_uxlen_t riscv_cause_irq_mask(rvvm_hart_t* vm)
     }
 }
 
-static void riscv_handle_irqs(rvvm_hart_t* vm)
+uint32_t riscv_interrupt_priority(uint32_t pending)
+{
+    // Platform interrupt IDs keep priority above the standard interrupt set.
+    if (pending & 0xFFFF0000U) return bit_clz32(pending) ^ 31;
+    static const uint8_t order[] = { 11, 3, 7, 9, 1, 5, 12, 10, 2, 6, 13 };
+    for (size_t i = 0; i < sizeof(order); ++i) {
+        if (pending & (1U << order[i])) return order[i];
+    }
+    return pending ? bit_clz32(pending) ^ 31 : 0;
+}
+
+void riscv_hart_handle_irqs(rvvm_hart_t* vm)
 {
     // IRQs that are pending & enabled by mie
     uint32_t pending_irqs = riscv_interrupts_pending(vm);
@@ -390,22 +463,27 @@ static void riscv_handle_irqs(rvvm_hart_t* vm)
         // Target privilege mode
         uint8_t  priv = RISCV_PRIV_MACHINE;
         uint32_t irqs = 0;
-
-        // Delegate pending IRQs from M to the highest possible mode
-        do {
-            irqs          = pending_irqs & ~vm->csr.ideleg[priv];
-            pending_irqs &= vm->csr.ideleg[priv];
-            if (irqs) {
-                break;
+        bool target_virt = false;
+        irqs = pending_irqs & ~vm->csr.ideleg[RISCV_PRIV_MACHINE];
+        if (!irqs) {
+            priv = RISCV_PRIV_SUPERVISOR;
+            pending_irqs &= vm->csr.ideleg[RISCV_PRIV_MACHINE];
+            irqs = pending_irqs & ~vm->hypervisor.ideleg;
+            if (!irqs) {
+                if (!vm->virt) return;
+                target_virt = true;
+                irqs = pending_irqs & vm->hypervisor.ideleg;
             }
-        } while (--priv);
+        }
+        if (!irqs) return;
 
         if (vm->priv_mode > priv) {
             // Target privilege mode is less privileged than current
             return;
         }
 
-        if (vm->priv_mode == priv && !((1 << vm->priv_mode) & vm->csr.status)) {
+        rvvm_uxlen_t status = target_virt ? vm->hypervisor.vsstatus : vm->csr.status;
+        if (vm->priv_mode == priv && (target_virt || !vm->virt) && !((1 << priv) & status)) {
             // Target privilege mode is equal, but IRQs are disabled in status CSR
             return;
         }
@@ -413,20 +491,40 @@ static void riscv_handle_irqs(rvvm_hart_t* vm)
         // Discard compiled JIT block torn by interrupt
         riscv_jit_discard(vm);
 
-        uint32_t irq = bit_clz32(irqs) ^ 31;
+        uint32_t irq = riscv_interrupt_priority(irqs);
+        uint8_t bank = target_virt ? RISCV_CSR_VS : priv;
         // Modify exception stack in csr.status
-        riscv_trap_priv_helper(vm, priv);
+        if (target_virt) {
+            // Virtual interrupt numbers 2/6/10 become VS interrupt 1/5/9.
+            irq--;
+            status = bit_replace(status, 8, 1, vm->priv_mode);
+            status = bit_replace(status, 5, 1, bit_cut(status, 1, 1));
+            vm->hypervisor.vsstatus = status & ~(rvvm_uxlen_t)2;
+        } else {
+            if (priv == RISCV_PRIV_MACHINE) {
+                vm->csr.status = bit_replace(vm->csr.status, 39, 1, vm->virt);
+                vm->csr.status &= ~CSR_STATUS_GVA;
+                vm->hypervisor.mtval2 = vm->hypervisor.mtinst = 0;
+            } else {
+                vm->hypervisor.status = bit_replace(vm->hypervisor.status, 7, 1, vm->virt);
+                if (vm->virt) vm->hypervisor.status = bit_replace(vm->hypervisor.status, 8, 1, vm->priv_mode);
+                vm->hypervisor.status &= ~(rvvm_uxlen_t)(1U << 6);
+                vm->hypervisor.tval = vm->hypervisor.tinst = 0;
+            }
+            riscv_trap_priv_helper(vm, priv);
+        }
+        riscv_switch_virt(vm, target_virt);
         // Switch privilege
         riscv_switch_priv(vm, priv);
         // Write exception info
-        vm->csr.epc[priv]   = vm->registers[RISCV_REG_PC];
-        vm->csr.cause[priv] = irq | riscv_cause_irq_mask(vm);
-        vm->csr.tval[priv]  = 0;
+        vm->csr.epc[bank]   = vm->registers[RISCV_REG_PC];
+        vm->csr.cause[bank] = irq | riscv_cause_irq_mask(vm);
+        vm->csr.tval[bank]  = 0;
         // Jump to trap vector
-        if (vm->csr.tvec[priv] & 1) {
-            vm->registers[RISCV_REG_PC] = (vm->csr.tvec[priv] & (~3ULL)) + (irq << 2);
+        if (vm->csr.tvec[bank] & 1) {
+            vm->registers[RISCV_REG_PC] = (vm->csr.tvec[bank] & (~3ULL)) + (irq << 2);
         } else {
-            vm->registers[RISCV_REG_PC] = vm->csr.tvec[priv] & (~3ULL);
+            vm->registers[RISCV_REG_PC] = vm->csr.tvec[bank] & (~3ULL);
         }
     }
     return;
@@ -455,7 +553,7 @@ void riscv_hart_run(rvvm_hart_t* vm)
             }
         }
 
-        riscv_handle_irqs(vm);
+        riscv_hart_handle_irqs(vm);
 
         // Run the hart
         riscv_run_till_event(vm);

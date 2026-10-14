@@ -214,6 +214,7 @@ struct rvvm_pci_function {
     uint32_t command;
     uint32_t status;
     uint32_t irq_line;
+    bool intx_asserted;
 
     // Bridge assignment
     uint32_t bridge_io;
@@ -249,6 +250,8 @@ struct rvvm_pci_bus {
 
     // Wired interrupts
     rvvm_irq_t irqs[PCI_BUS_IRQS];
+    uint32_t intx_refs[PCI_BUS_IRQS];
+    rvvm_lock_t irq_lock;
 
     // IO/MMIO window
     rvvm_addr_t io_base;
@@ -278,14 +281,28 @@ static inline rvvm_irq_t pci_func_intx_irq(rvvm_pci_func_t* func)
 }
 
 // Set INTx IRQ level
+static void pci_func_refresh_intx_locked(rvvm_pci_func_t* func)
+{
+    if (!func->irq_pin) return;
+    rvvm_pci_bus_t* bus = func->bus;
+    uint32_t pin = ((func->addr >> 3) + func->irq_pin + 3) & 3;
+    bool asserted = (atomic_load_uint32_relax(&func->status) & PCI_CMD_INTX)
+        && !(atomic_load_uint32_relax(&func->command) & PCI_CMD_INTX_OFF);
+    if (asserted != func->intx_asserted) {
+        if (asserted) bus->intx_refs[pin]++;
+        else bus->intx_refs[pin]--;
+        func->intx_asserted = asserted;
+    }
+    rvvm_irq_set(bus->irq_dev, bus->irqs[pin], bus->intx_refs[pin] != 0);
+}
+
 static void pci_func_set_intx(rvvm_pci_func_t* func, bool lvl)
 {
-    if (func->irq_pin && lvl != !!atomic_load_uint32_relax(&func->status)) {
+    // Serialize status and controller writes; all functions sharing a pin
+    // must keep it asserted until their last unmasked request is cleared.
+    rvvm_scoped_spin_lock (&func->bus->irq_lock) {
         atomic_store_uint32_relax(&func->status, lvl ? PCI_CMD_INTX : 0);
-        if (likely(!(atomic_load_uint32_relax(&func->command) & PCI_CMD_INTX_OFF))) {
-            // INTx enabled
-            rvvm_irq_set(func->bus->irq_dev, pci_func_intx_irq(func), lvl);
-        }
+        pci_func_refresh_intx_locked(func);
     }
 }
 
@@ -598,17 +615,9 @@ static void pci_func_cfg_write(rvvm_pci_func_t* func, size_t reg, uint32_t val)
     }
     switch (reg) {
         case PCI_REG_CMD: {
-            uint32_t prev = atomic_load_uint32_relax(&func->command);
-            atomic_store_uint32_relax(&func->command, val & PCI_CMD_VALID);
-            if ((val & ~prev) & PCI_CMD_INTX_OFF) {
-                // Disabled INTx interrupt
-                rvvm_irq_lower(func->bus->irq_dev, pci_func_intx_irq(func));
-            } else if ((prev & ~val) & PCI_CMD_INTX_OFF) {
-                // Enabled INTx interrupt
-                if (atomic_load_uint32_relax(&func->status) & PCI_CMD_INTX) {
-                    // Re-deliver INTx interrupt
-                    rvvm_irq_raise(func->bus->irq_dev, pci_func_intx_irq(func));
-                }
+            rvvm_scoped_spin_lock (&func->bus->irq_lock) {
+                atomic_store_uint32_relax(&func->command, val & PCI_CMD_VALID);
+                pci_func_refresh_intx_locked(func);
             }
             return;
         }
@@ -875,6 +884,7 @@ RVVM_PUBLIC void rvvm_pci_func_remove(rvvm_pci_func_t* func)
         // Lock and pause the vCPUs
         rvvm_scoped_lock (&bus->lock) {
             bool start = rvvm_pause_machine(bus->machine);
+            pci_func_set_intx(func, false);
             // Unmap function
             vector_at(bus->dev, idx)->func[func->addr & 0x07] = NULL;
             if (start) {
@@ -1048,8 +1058,27 @@ static void pci_ecam_suspend(rvvm_reg_dev_t* ecam, rvvm_snapshot_t* snap, bool r
                 }
             }
         }
+        if (resume) {
+            // Derived bookkeeping is not part of the snapshot format. The
+            // interrupt controller independently restores its saved level.
+            rvvm_scoped_spin_lock (&bus->irq_lock) {
+                memset(bus->intx_refs, 0, sizeof(bus->intx_refs));
+                vector_foreach (bus->dev, i) {
+                    rvvm_pci_dev_t* dev = vector_at(bus->dev, i);
+                    for (size_t fn_id = 0; fn_id < PCI_DEV_FUNCS; ++fn_id) {
+                        rvvm_pci_func_t* func = dev->func[fn_id];
+                        if (func) {
+                            func->intx_asserted = func->irq_pin && (func->status & PCI_CMD_INTX)
+                                && !(func->command & PCI_CMD_INTX_OFF);
+                            if (func->intx_asserted) {
+                                bus->intx_refs[((func->addr >> 3) + func->irq_pin + 3) & 3]++;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
-    UNUSED(resume);
 }
 
 static const rvvm_reg_type_t pci_ecam_type = {

@@ -88,6 +88,9 @@ BUILD_ASSERT(!(RVVM_TLB_SIZE & RVVM_TLB_MASK));
 
 #define RISCV_PRIVS_MAX             4
 
+// CSR bank index only: modern H never executes at privilege level 2.
+#define RISCV_CSR_VS                2
+
 #define RISCV_INTERRUPT_SSOFTWARE   0x1 // S-mode Software Interrupt (ACLINT-SSWI)
 #define RISCV_INTERRUPT_MSOFTWARE   0x3 // M-mode Software Interrupt (ACLINT-MSWI)
 #define RISCV_INTERRUPT_STIMER      0x5 // S-mode Timer Interrupt (Sstc)
@@ -106,10 +109,15 @@ BUILD_ASSERT(!(RVVM_TLB_SIZE & RVVM_TLB_MASK));
 #define RISCV_TRAP_STORE_FAULT      0x7 // Store Fault
 #define RISCV_TRAP_ECALL_UMODE      0x8 // Environment call from U-mode
 #define RISCV_TRAP_ECALL_SMODE      0x9 // Environment call from S-mode
+#define RISCV_TRAP_ECALL_VSMODE     0xA // Environment call from VS-mode
 #define RISCV_TRAP_ECALL_MMODE      0xB // Environment call from M-mode
 #define RISCV_TRAP_INSN_PAGEFAULT   0xC // Instruction fetch pagefault
 #define RISCV_TRAP_LOAD_PAGEFAULT   0xD // Load pagefault
 #define RISCV_TRAP_STORE_PAGEFAULT  0xF // Store pagefault
+#define RISCV_TRAP_INSN_GUEST_PAGEFAULT  0x14
+#define RISCV_TRAP_LOAD_GUEST_PAGEFAULT  0x15
+#define RISCV_TRAP_VIRTUAL_INSN          0x16
+#define RISCV_TRAP_STORE_GUEST_PAGEFAULT 0x17
 
 #if defined(USE_RV64)
 
@@ -226,6 +234,33 @@ struct align_cacheline rvvm_hart_t {
     uint8_t         priv_mode;
     bool            rv64;
 
+    // Virtualization is independent of the U/S/M privilege encoding.
+    bool virt;
+    struct {
+        bool enabled;
+        rvvm_uxlen_t status;
+        rvvm_uxlen_t vsstatus;
+        rvvm_uxlen_t edeleg;
+        rvvm_uxlen_t ideleg;
+        rvvm_uxlen_t counteren;
+        rvvm_uxlen_t tval;
+        rvvm_uxlen_t tinst;
+        rvvm_uxlen_t vsatp;
+        rvvm_uxlen_t gatp;
+        uint64_t envcfg;
+        uint64_t timedelta;
+        uint64_t vstimecmp;
+        rvvm_uxlen_t mtval2;
+        rvvm_uxlen_t mtinst;
+        rvvm_addr_t fault_gpa;
+        bool guest_fault;
+        bool walk_access_fault;
+        bool implicit_fault;
+        bool implicit_write;
+        bool loadstore;
+        bool execute_load;
+    } hypervisor;
+
     bool        trap;
     rvvm_addr_t trap_pc;
 
@@ -301,6 +336,7 @@ struct randomize_layout rvvm_machine_t {
     uint32_t running;
     uint32_t power_state;
     bool     rv64;
+    bool     userland;
 
     rvfile_t* fw_file;
     rvfile_t* kernel_file;

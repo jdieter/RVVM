@@ -43,6 +43,8 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define RISCV_MMU_READ     0x2
 #define RISCV_MMU_WRITE    0x4
 #define RISCV_MMU_EXEC     0x8
+#define RISCV_MMU_CBO_FLAG 0x10
+#define RISCV_MMU_CBO      (RISCV_MMU_READ | RISCV_MMU_WRITE | RISCV_MMU_CBO_FLAG)
 
 #define RISCV_PTE_VALID    0x1
 #define RISCV_PTE_LEAF     0xA
@@ -115,6 +117,12 @@ static forceinline bool riscv_mmu_op(rvvm_hart_t* vm, rvvm_addr_t vaddr, void* d
 static forceinline bool riscv_mmu_virt_translate(rvvm_hart_t* vm, rvvm_addr_t vaddr, rvvm_addr_t* paddr, uint8_t access)
 {
     return !!riscv_mmu_op_helper(vm, vaddr, paddr, RISCV_MMU_ATTR_PHYS | RISCV_MMU_ATTR_NO_TRAP, 0, access);
+}
+
+static forceinline bool riscv_mmu_cache_check(rvvm_hart_t* vm, rvvm_addr_t vaddr)
+{
+    rvvm_addr_t paddr;
+    return !!riscv_mmu_op_helper(vm, vaddr, &paddr, RISCV_MMU_ATTR_PHYS, 0, RISCV_MMU_CBO);
 }
 
 // Translate virtual address into a pointer (For atomics)

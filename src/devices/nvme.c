@@ -459,21 +459,55 @@ static inline uint32_t nvme_queue_enqueue(nvme_queue_t* queue)
     return tail;
 }
 
-static void nvme_queue_raise_irq(nvme_dev_t* nvme, nvme_queue_t* queue)
+static uint32_t nvme_pending_irqs(nvme_dev_t* nvme)
 {
-    uint32_t irq_reg = atomic_load_uint32_relax(&queue->data);
-    if (likely(irq_reg & NVME_CQ_FLAGS_IEN)) {
-        uint32_t irq_vec = irq_reg >> 16;
-        if (!(atomic_load_uint32_relax(&nvme->irq_mask) & bit_set32(irq_vec))) {
-            rvvm_pci_raise_irq(nvme->func, irq_vec);
+    uint32_t pending = 0;
+    for (size_t i = 0; i < STATIC_ARRAY_SIZE(nvme->cq); ++i) {
+        nvme_queue_t* queue = &nvme->cq[i];
+        uint32_t data = atomic_load_uint32_relax(&queue->data);
+        if ((data & NVME_CQ_FLAGS_IEN)
+            && atomic_load_uint32_relax(&queue->head) != atomic_load_uint32_relax(&queue->tail)) {
+            pending |= bit_set32(data >> 16);
         }
     }
+    return pending & ~atomic_load_uint32_relax(&nvme->irq_mask);
+}
+
+static void nvme_update_irqs(nvme_dev_t* nvme, nvme_queue_t* queue)
+{
+    uint32_t affected = bit_set32(atomic_load_uint32_relax(&queue->data) >> 16);
+    uint32_t pending = nvme_pending_irqs(nvme);
+    for (;;) {
+        // All lowers precede raises because legacy INTx is shared by vectors.
+        // A producer or ack can overtake either operation: validate both edges.
+        affected |= pending;
+        while (affected) {
+            uint32_t vector = bit_ctz32(affected);
+            rvvm_pci_lower_irq(nvme->func, vector);
+            affected &= ~bit_set32(vector);
+        }
+        affected = pending;
+        while (affected) {
+            uint32_t vector = bit_ctz32(affected);
+            rvvm_pci_raise_irq(nvme->func, vector);
+            affected &= ~bit_set32(vector);
+        }
+        atomic_fence_ex(ATOMIC_SEQ_CST);
+        uint32_t current = nvme_pending_irqs(nvme);
+        if (current == pending) return;
+        affected = pending;
+        pending = current;
+    }
+}
+
+static void nvme_queue_raise_irq(nvme_dev_t* nvme, nvme_queue_t* queue)
+{
+    nvme_update_irqs(nvme, queue);
 }
 
 static void nvme_queue_lower_irq(nvme_dev_t* nvme, nvme_queue_t* queue)
 {
-    uint32_t irq_vec = atomic_load_uint32_relax(&queue->data) >> 16;
-    rvvm_pci_lower_irq(nvme->func, irq_vec);
+    nvme_update_irqs(nvme, queue);
 }
 
 static void nvme_queue_reset(nvme_queue_t* queue)
@@ -496,11 +530,7 @@ static void nvme_check_masked_irqs(nvme_dev_t* nvme, uint32_t mask)
     for (size_t i = 0; i < STATIC_ARRAY_SIZE(nvme->cq); ++i) {
         nvme_queue_t* queue = &nvme->cq[i];
         if (mask & bit_set32(queue->data >> 16)) {
-            if (atomic_load_uint32_relax(&queue->head) != atomic_load_uint32_relax(&queue->tail)) {
-                nvme_queue_raise_irq(nvme, queue);
-            } else {
-                nvme_queue_lower_irq(nvme, queue);
-            }
+            nvme_queue_lower_irq(nvme, queue);
         }
     }
 }
@@ -521,8 +551,8 @@ static void nvme_reset(nvme_dev_t* nvme)
     }
     for (size_t qid = 0; qid < STATIC_ARRAY_SIZE(nvme->cq); ++qid) {
         nvme_queue_t* queue = &nvme->cq[qid];
-        nvme_queue_lower_irq(nvme, queue);
         nvme_queue_reset(queue);
+        nvme_queue_lower_irq(nvme, queue);
         if (qid) {
             nvme_queue_setup(queue, 0, 0, 0);
         }
@@ -729,6 +759,7 @@ static void nvme_delete_io_queue(nvme_dev_t* nvme, nvme_cmd_t* cmd, bool is_cq)
         nvme_complete_cmd(nvme, cmd, NVME_SC_BAD_QUEUE_ID);
     } else {
         if (is_cq) {
+            nvme_queue_reset(queue);
             nvme_queue_lower_irq(nvme, queue);
         }
         nvme_queue_setup(queue, 0, 0, 0);
