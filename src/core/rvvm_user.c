@@ -528,6 +528,7 @@ static const char* wrap_path(char* buffer, const char* path)
 #include "rvvm_user_vm_pause.h"
 #include "rvvm_user_service.h"
 #include "rvvm_user_signal.h"
+#include "rvvm_user_jit_memory.h"
 #include "rvvm_user_posix.h"
 #include "rvvm_user_ipc.h"
 #include "rvvm_user_io_extra.h"
@@ -3428,6 +3429,7 @@ static void* rvvm_user_thread_wrap(void* arg)
             }
             if (vm_mutation) user_vm_leave();
             }
+            if (vm_mutation || a7 == 164 || a7 == 261) rvvm_user_jit_pressure(cpu);
             if ((int64_t)a0 < 0) {
                 //rvvm_warn("Syscall %ld failed: %ld", a7, a0);
             }
@@ -3579,6 +3581,11 @@ static void jump_start(void* entry, void* stack_top)
     );
 #else
     userland = rvvm_create_userland("rv64");
+#if defined(__linux__) && defined(USE_JIT) && defined(USER_FAULT_META)
+    userland->user_memory_probe = user_jit_memory_probe;
+    userland->user_jit_enter = user_vm_enter;
+    userland->user_jit_leave = user_vm_leave;
+#endif
     rvvm_user_thread_t* thread = safe_new_obj(rvvm_user_thread_t);
     thread->cpu = rvvm_create_user_thread(userland);
     if (!thread->cpu) rvvm_fatal("Cannot allocate initial guest CPU");

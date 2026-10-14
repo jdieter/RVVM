@@ -4,11 +4,22 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include "core/rvvm.h"
 #include "rvjit/rvjit.h"
+#include "rvjit/rvjit_emit.h"
 #include "util/utils.h"
 
 static bool fail_realloc;
+static bool fail_calloc;
+void* __real_calloc(size_t, size_t);
+void* __wrap_calloc(size_t count, size_t size)
+{
+    if (fail_calloc) { fail_calloc = false; return NULL; }
+    return __real_calloc(count, size);
+}
 void* __real_realloc(void*, size_t);
 void* __wrap_realloc(void* p, size_t n)
 {
@@ -55,9 +66,101 @@ static void check_cache(bool split)
     free(hart);
 }
 
+static void load_block(rvjit_block_t* block, uintptr_t pc)
+{
+    rvjit_block_init(block);
+    block->phys_pc = block->virt_pc = pc;
+    block->pc_off = 4;
+    rvjit64_ld(block, 1, 2, 0);
+}
+
+static void check_metadata_growth(void)
+{
+    char* args[] = {"test-jit-oom"};
+    rvvm_set_args(1, args);
+    struct rlimit original;
+    assert(!getrlimit(RLIMIT_AS, &original) && original.rlim_cur == RLIM_INFINITY);
+    rvjit_block_t block = {0};
+    assert(rvjit_ctx_init(&block, 16U << 20));
+    rvjit_set_rv64(&block, true);
+    assert(rvjit_set_native_ptrs(&block, true));
+    size_t capacity = block.heap.faults.size;
+    size_t lookup = hashmap_capacity(&block.heap.blocks);
+    uintptr_t pc = 0x1000;
+    while (block.heap.faults.count < capacity) {
+        load_block(&block, pc);
+        if (hashmap_size(&block.heap.blocks) == lookup / 2
+            && hashmap_capacity(&block.heap.blocks) == lookup) {
+            size_t before = rvjit_ctx_memory_size(&block);
+            fail_calloc = true;
+            assert(!rvjit_block_finalize(&block) && !fail_calloc);
+            assert(!rvjit_block_lookup(&block, pc));
+            assert(rvjit_block_lookup(&block, 0x1000));
+            assert(rvjit_ctx_memory_size(&block) == before);
+            load_block(&block, pc);
+        }
+        assert(rvjit_block_finalize(&block));
+        pc += 4;
+    }
+    assert(block.heap.faults.count == capacity);
+    assert(hashmap_capacity(&block.heap.blocks) > lookup);
+    assert(rvjit_block_lookup(&block, 0x1000));
+    load_block(&block, pc);
+    size_t before = rvjit_ctx_memory_size(&block);
+
+    /* Limits lowered after startup retain the old cache and its metadata.
+     * A refused growth must not publish a partially described block. */
+    pid_t child = fork();
+    assert(child >= 0);
+    if (!child) {
+        struct rlimit tight = {1, original.rlim_max};
+        assert(!setrlimit(RLIMIT_AS, &tight));
+        assert(!rvjit_block_finalize(&block));
+        assert(!rvjit_block_lookup(&block, pc));
+        assert(rvjit_block_lookup(&block, 0x1000));
+        assert(rvjit_ctx_memory_size(&block) == before);
+        _exit(0);
+    }
+    int status;
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status));
+    /* A finite limit with ample headroom must not restore the old metadata
+     * ceilings and compiler cache thrashing. */
+    child = fork();
+    assert(child >= 0);
+    if (!child) {
+        struct rlimit finite = {1U << 30, original.rlim_max};
+        assert(!setrlimit(RLIMIT_AS, &finite));
+        assert(rvjit_block_finalize(&block));
+        assert(block.heap.faults.size > capacity);
+        assert(rvjit_block_lookup(&block, 0x1000));
+        _exit(0);
+    }
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status));
+    fail_realloc = true;
+    assert(!rvjit_block_finalize(&block) && !fail_realloc);
+    assert(!rvjit_block_lookup(&block, pc));
+    assert(rvjit_ctx_memory_size(&block) == before);
+    load_block(&block, pc);
+    rvjit_func_t code = rvjit_block_finalize(&block);
+    assert(code && block.heap.faults.size > capacity);
+    assert(rvjit_ctx_memory_size(&block) > before);
+    const rvjit_fault_t* last = &block.heap.faults.data[block.heap.faults.count - 1];
+    assert(rvjit_fault_lookup(&block, (uintptr_t)block.heap.code + last->start) == last);
+    assert(last->guest_pc == pc + 4);
+    const rvjit_fault_t* first = &block.heap.faults.data[0];
+    assert(first->guest_pc == 0x1004);
+    assert(rvjit_fault_lookup(&block, (uintptr_t)block.heap.code + first->start) == first);
+    assert(rvjit_block_lookup(&block, 0x1000));
+    rvjit_flush_cache(&block);
+    assert(!rvjit_block_lookup(&block, pc));
+    assert(rvjit_ctx_memory_size(&block) > before);
+    rvjit_ctx_free(&block);
+}
+
 int main(void)
 {
     check_cache(false);
     check_cache(true);
+    check_metadata_growth();
     puts("PASS JIT allocation failure, W^X execution and cache accounting");
 }

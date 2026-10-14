@@ -186,6 +186,26 @@ unsupported. TODO.txt records the rationale and re-enablement requirements.
 
 ### Existing implementation regressions
 
+JIT metadata starts with a bounded reserve and grows fallibly. Under finite
+RLIMIT_AS, cache mappings and metadata share a process budget of 50% of the
+limit; growth accounts for temporary replacement buffers. At 80% mapped
+process virtual memory, contexts are freed when their owners leave generated
+code. They can resume JIT execution below 70%, avoiding repeated eviction and
+regrowth near the threshold. The kernel continues to enforce the real limit.
+The native fixtures check growth with a 1 GiB limit, preserved lookups/fault
+metadata, failed allocations, shared budgeting, reclamation and recovery.
+
+Pressure sampling uses a short-lived native helper with a private descriptor
+table. Tests verify sampling with exhausted descriptor slots and preservation
+of POSIX locks. Sampling is throttled to ten times per second for finite
+limits; missing procfs, denied unshare or exhausted native thread capacity
+disable the heuristic, while budgeting and kernel enforcement remain active.
+On glibc hosts, launch with a finite limit also bounds RVVM's native allocator
+to one arena to reduce unused virtual reservations. This does not change the
+guest allocator or its environment. Guest mappings can still consume enough
+address space to trigger eviction; finite-limit performance depends on that
+headroom rather than just the numerical limit.
+
 Run native tests with `bash tests/rocky/run-tests.sh`. To add guest tests, pass
 one or more emulator binaries; the runner requires Clang and LLD and exercises
 Sv39/Sv48 with JIT enabled and disabled:

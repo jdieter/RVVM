@@ -95,9 +95,12 @@ rvvm_addr_t riscv_hart_run_userland(rvvm_hart_t* vm)
     // Publish running before checking the flush request. The old unconditional
     // exchange ordered that store; a load alone could lose a concurrent wake.
     atomic_fence_ex(ATOMIC_SEQ_CST);
-    if (atomic_load_uint32(&vm->user_cache_flush) && atomic_swap_uint32(&vm->user_cache_flush, 0)) {
+    uint32_t flush = atomic_load_uint32(&vm->user_cache_flush)
+                   ? atomic_swap_uint32(&vm->user_cache_flush, 0) : 0;
+    if (flush) {
         riscv_jit_flush_cache(vm);
         riscv_tlb_flush(vm);
+        if (flush & 6) rvvm_user_jit_reclaim(vm);
     }
 #endif
     if (atomic_load_uint32(&vm->user_signal_pending)) {

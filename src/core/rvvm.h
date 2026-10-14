@@ -349,6 +349,12 @@ struct randomize_layout rvvm_machine_t {
     gdb_server_t* gdbstub;
 
     rvvm_addr_t opts[RVVM_OPTS_ARR_SIZE];
+#if defined(RVVM_USER_TEST) && defined(USER_FAULT_META) && defined(USE_JIT)
+    uint64_t (*user_memory_probe)(void);
+    void (*user_jit_enter)(void);
+    void (*user_jit_leave)(void);
+    bool user_jit_pressure;
+#endif
 
 #if defined(USE_FDT)
     // FDT nodes for device tree generation
@@ -362,5 +368,7 @@ void rvvm_append_isa_string(rvvm_machine_t* machine, const char* str);
 void rvvm_user_fork_lock(void);
 void rvvm_user_fork_unlock(void);
 void rvvm_user_fork_child(rvvm_hart_t* thread);
+void rvvm_user_jit_pressure(rvvm_hart_t* thread);
+void rvvm_user_jit_reclaim(rvvm_hart_t* thread);
 
 #endif

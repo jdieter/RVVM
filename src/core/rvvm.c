@@ -12,6 +12,12 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include <stdlib.h>
 #if defined(RVVM_USER_TEST) && defined(__linux__) && defined(USE_JIT)
 #include <sys/resource.h>
+#include <sys/syscall.h>
+#include <signal.h>
+#include <unistd.h>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 #endif
 
 #include <rvvm/rvvm.h>
@@ -1282,6 +1288,15 @@ PUBLIC bool rvvm_attach_msi_target(rvvm_machine_t* machine, const rvvm_mmio_dev_
 
 PUBLIC rvvm_machine_t* rvvm_create_userland(const char* isa)
 {
+#if defined(RVVM_USER_TEST) && defined(__linux__) && defined(USE_JIT) && defined(__GLIBC__)
+    struct rlimit host_limit;
+    if (!getrlimit(RLIMIT_AS, &host_limit) && host_limit.rlim_cur != RLIM_INFINITY) {
+        /* Native per-thread malloc arenas reserve large address ranges even
+         * when mostly empty. Keep that optional overhead out of a finite
+         * guest's headroom; its own allocator is unaffected. */
+        mallopt(M_ARENA_MAX, 1);
+    }
+#endif
     // TODO: Proper ISA string parsing
     bool rv64 = !isa || (rvvm_strfind(isa, "rv64") == isa);
     bool rv32 = isa && (rvvm_strfind(isa, "rv32") == isa);
@@ -1329,7 +1344,7 @@ PUBLIC void rvvm_flush_icache(rvvm_machine_t* machine, rvvm_addr_t addr, size_t 
 #ifdef USER_FAULT_META
                 rvvm_hart_t* hart = vector_at(machine->harts, i);
                 if (hart->userland) {
-                    atomic_store_uint32(&hart->user_cache_flush, 1);
+                    atomic_or_uint32(&hart->user_cache_flush, 1);
                     atomic_store_uint32(&hart->running, 0);
                     continue;
                 }
@@ -1356,6 +1371,153 @@ void rvvm_user_fork_child(rvvm_hart_t* thread)
     // their copied resources may contain locked state and must not be destroyed.
     vector_clear(thread->machine->harts);
     vector_push_back(thread->machine->harts, thread);
+}
+
+#if defined(RVVM_USER_TEST) && defined(__linux__) && defined(USE_JIT) && defined(USER_FAULT_META)
+static __thread uint64_t user_jit_signal_mask;
+
+static void user_jit_block_signals(uint64_t* old)
+{
+    uint64_t all = UINT64_MAX;
+    syscall(SYS_rt_sigprocmask, SIG_SETMASK, &all, old, 8);
+}
+
+static uint64_t user_jit_used(rvvm_machine_t* machine)
+{
+    uint64_t used = 0;
+    vector_foreach (machine->harts, i) {
+        uint64_t size = rvjit_ctx_memory_size(&vector_at(machine->harts, i)->jit);
+        if (size > UINT64_MAX - used) return UINT64_MAX;
+        used += size;
+    }
+    return used;
+}
+
+static void user_jit_request(rvvm_machine_t* machine, bool reclaim)
+{
+    machine->user_jit_pressure = reclaim;
+    vector_foreach (machine->harts, i) {
+        rvvm_hart_t* hart = vector_at(machine->harts, i);
+        atomic_or_uint32(&hart->user_cache_flush, reclaim ? 2 : 4);
+        atomic_store_uint32(&hart->running, 0);
+    }
+}
+
+static bool user_jit_room(rvvm_machine_t* machine, const struct rlimit* limit,
+                          uint64_t mapped, size_t peak)
+{
+    if (limit->rlim_cur == RLIM_INFINITY) return true;
+    uint64_t budget = limit->rlim_cur / 2;
+    uint64_t used = user_jit_used(machine);
+    uint64_t high = limit->rlim_cur / 5 * 4;
+    bool room = used <= budget && peak <= budget - used;
+    if (used > budget) user_jit_request(machine, true);
+    if (mapped && (mapped >= high || peak > high - mapped)) {
+        user_jit_request(machine, true);
+        return false;
+    }
+    return room && !machine->user_jit_pressure;
+}
+
+static bool user_jit_growth_begin(void* opaque, size_t peak)
+{
+    rvvm_hart_t* hart = opaque;
+    struct rlimit limit;
+    /* A VM pause can park a peer inside malloc. Exclude such transitions
+     * before blocking signals and allocating under the process lock. */
+    if (hart->machine->user_jit_enter) hart->machine->user_jit_enter();
+    user_jit_block_signals(&user_jit_signal_mask);
+    if (getrlimit(RLIMIT_AS, &limit)) {
+        syscall(SYS_rt_sigprocmask, SIG_SETMASK, &user_jit_signal_mask, NULL, 8);
+        if (hart->machine->user_jit_leave) hart->machine->user_jit_leave();
+        return false;
+    }
+    /* Probe before global_lock: descriptor operations take the fd guard
+     * before this lock, including the fork path. */
+    uint64_t mapped = limit.rlim_cur != RLIM_INFINITY && hart->machine->user_memory_probe
+                    ? hart->machine->user_memory_probe() : 0;
+    spin_lock(&global_lock);
+    if (user_jit_room(hart->machine, &limit, mapped, peak)) return true;
+    spin_unlock(&global_lock);
+    syscall(SYS_rt_sigprocmask, SIG_SETMASK, &user_jit_signal_mask, NULL, 8);
+    if (hart->machine->user_jit_leave) hart->machine->user_jit_leave();
+    return false;
+}
+
+static void user_jit_growth_end(void* opaque)
+{
+    rvvm_hart_t* hart = opaque;
+    spin_unlock(&global_lock);
+    syscall(SYS_rt_sigprocmask, SIG_SETMASK, &user_jit_signal_mask, NULL, 8);
+    if (hart->machine->user_jit_leave) hart->machine->user_jit_leave();
+}
+
+static void user_jit_prepare(rvvm_hart_t* hart)
+{
+    if (hart->jit_enabled || !rvvm_get_opt(hart->machine, RVVM_OPT_JIT)) return;
+    struct rlimit limit;
+    size_t cache = rvvm_get_opt(hart->machine, RVVM_OPT_JIT_CACHE);
+    if (getrlimit(RLIMIT_AS, &limit)
+        || !user_jit_room(hart->machine, &limit, 0, rvjit_user_memory_size(cache))) return;
+    if (!rvjit_ctx_init(&hart->jit, cache)) return;
+    rvjit_set_rv64(&hart->jit, hart->rv64);
+    if (!rvjit_set_native_ptrs(&hart->jit, true)) {
+        rvjit_ctx_free(&hart->jit);
+        return;
+    }
+    hart->jit.user_growth_begin = user_jit_growth_begin;
+    hart->jit.user_growth_end = user_jit_growth_end;
+    hart->jit.user_growth_opaque = hart;
+    hart->jit_enabled = true;
+}
+#endif
+
+void rvvm_user_jit_pressure(rvvm_hart_t* hart)
+{
+#if defined(RVVM_USER_TEST) && defined(__linux__) && defined(USE_JIT) && defined(USER_FAULT_META)
+    struct rlimit limit;
+    if (!rvvm_get_opt(hart->machine, RVVM_OPT_JIT)) return;
+    if (getrlimit(RLIMIT_AS, &limit)) return;
+    if (hart->machine->user_jit_enter) hart->machine->user_jit_enter();
+    uint64_t old;
+    user_jit_block_signals(&old);
+    uint64_t mapped = limit.rlim_cur != RLIM_INFINITY && hart->machine->user_memory_probe
+                    ? hart->machine->user_memory_probe() : 0;
+    spin_lock(&global_lock);
+    if (limit.rlim_cur == RLIM_INFINITY) {
+        if (hart->machine->user_jit_pressure) user_jit_request(hart->machine, false);
+    } else if ((mapped && mapped >= limit.rlim_cur / 5 * 4)
+               || user_jit_used(hart->machine) > limit.rlim_cur / 2) {
+        user_jit_request(hart->machine, true);
+    } else if (mapped && mapped < limit.rlim_cur / 10 * 7) {
+        if (hart->machine->user_jit_pressure) user_jit_request(hart->machine, false);
+    }
+    spin_unlock(&global_lock);
+    syscall(SYS_rt_sigprocmask, SIG_SETMASK, &old, NULL, 8);
+    if (hart->machine->user_jit_leave) hart->machine->user_jit_leave();
+#else
+    UNUSED(hart);
+#endif
+}
+
+void rvvm_user_jit_reclaim(rvvm_hart_t* hart)
+{
+#if defined(RVVM_USER_TEST) && defined(__linux__) && defined(USE_JIT) && defined(USER_FAULT_META)
+    uint64_t old;
+    if (hart->machine->user_jit_enter) hart->machine->user_jit_enter();
+    user_jit_block_signals(&old);
+    spin_lock(&global_lock);
+    /* Only the owning thread calls this, after generated code has returned. */
+    riscv_jit_flush_cache(hart);
+    if (hart->jit_enabled) rvjit_ctx_free(&hart->jit);
+    hart->jit_enabled = false;
+    if (!hart->machine->user_jit_pressure) user_jit_prepare(hart);
+    spin_unlock(&global_lock);
+    syscall(SYS_rt_sigprocmask, SIG_SETMASK, &old, NULL, 8);
+    if (hart->machine->user_jit_leave) hart->machine->user_jit_leave();
+#else
+    UNUSED(hart);
+#endif
 }
 
 PUBLIC rvvm_hart_t* rvvm_create_user_thread(rvvm_machine_t* machine)
@@ -1392,7 +1554,7 @@ PUBLIC rvvm_hart_t* rvvm_create_user_thread(rvvm_machine_t* machine)
                 /* Code caches are optional. Bound their aggregate reservation
                  * under a finite host limit so they cannot exhaust the space
                  * needed for guest stacks and native thread bookkeeping. */
-                uint64_t budget = limit.rlim_cur / 4;
+                uint64_t budget = limit.rlim_cur / 2;
                 uint64_t cache = rvjit_user_memory_size(rvvm_get_opt(machine, RVVM_OPT_JIT_CACHE));
                 vector_foreach (machine->harts, i) {
                     uint64_t used = rvjit_ctx_memory_size(&vector_at(machine->harts, i)->jit);
@@ -1401,7 +1563,13 @@ PUBLIC rvvm_hart_t* rvvm_create_user_thread(rvvm_machine_t* machine)
                 prepare = cache <= budget;
             }
 #endif
-            if (prepare) riscv_hart_prepare(thread);
+            if (prepare) {
+#if defined(RVVM_USER_TEST) && defined(__linux__) && defined(USE_JIT) && defined(USER_FAULT_META)
+                user_jit_prepare(thread);
+#else
+                riscv_hart_prepare(thread);
+#endif
+            }
 #if defined(USE_JIT)
             if (thread->jit_enabled && !rvjit_set_native_ptrs(&thread->jit, true)) {
                 rvjit_ctx_free(&thread->jit);

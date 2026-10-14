@@ -20,6 +20,9 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#if defined(__linux__) && defined(USER_FAULT_META) && defined(RVVM_USER_TEST)
+#include <sys/resource.h>
+#endif
 
 #if defined(RVJIT_ARM64) && defined(__APPLE__) && __ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__ >= 110000
 /*
@@ -206,21 +209,38 @@ size_t rvjit_ctx_memory_size(const rvjit_block_t* block)
 {
     size_t size = block->heap.size;
     if (block->heap.code != block->heap.data) size += block->heap.size;
-    if (block->heap.blocks.data) size += hashmap_used_mem(&block->heap.blocks);
-    if (block->heap.block_links.data) size += hashmap_used_mem(&block->heap.block_links);
-#ifdef USER_FAULT_META
-    size += block->heap.faults.size * sizeof(rvjit_fault_t);
+#if defined(USER_FAULT_META) && defined(RVVM_USER_TEST)
+    if (block->native_ptrs) {
+        /* Other guest threads can create a context while this one's tables
+         * grow. Read one published size, not transient pointer/mask pairs. */
+        size += atomic_load_uint64_relax(&block->user_metadata_size);
+    } else
 #endif
+    {
+        if (block->heap.blocks.data) size += hashmap_used_mem(&block->heap.blocks);
+        if (block->heap.block_links.data) size += hashmap_used_mem(&block->heap.block_links);
+#ifdef USER_FAULT_META
+        size += block->heap.faults.size * sizeof(rvjit_fault_t);
+#endif
+    }
     if (block->heap.dirty_pages) size += (block->heap.dirty_mask + 1) * sizeof(uint32_t);
     if (block->heap.jited_pages) size += (block->heap.dirty_mask + 1) * sizeof(uint32_t);
     return size;
 }
 
 #if defined(USER_FAULT_META) && defined(RVVM_USER_TEST)
+static void rvjit_user_metadata_account(rvjit_block_t* block)
+{
+    size_t size = block->heap.faults.size * sizeof(rvjit_fault_t)
+                + hashmap_used_mem(&block->heap.blocks)
+                + hashmap_used_mem(&block->heap.block_links);
+    atomic_store_uint64_relax(&block->user_metadata_size, size);
+}
+
 static size_t rvjit_user_fault_capacity(void)
 {
-    /* Preserve the capacity of the former vector preallocation: rounding it
-     * down recycles the cache sooner and recompiles otherwise reusable code. */
+    /* Preserve the capacity of the former vector preallocation. This is an
+     * initial reserve; unconstrained processes may grow it fallibly. */
     size_t capacity = 2;
     while (capacity < RVJIT_USER_FAULT_CAPACITY) capacity += capacity / 2;
     return capacity;
@@ -247,8 +267,8 @@ bool rvjit_set_native_ptrs(rvjit_block_t* block, bool native_ptrs)
 #if defined(USER_FAULT_META) && defined(RVVM_USER_TEST)
     if (native_ptrs && !block->native_ptrs
         && block->heap.faults.size < rvjit_user_fault_capacity()) {
-        /* Allocate userspace lookup/fault tables before guest limits tighten.
-         * Recycle the code cache instead of growing these tables afterward. */
+        /* Reserve enough metadata to keep compiling after guest limits
+         * tighten. Allocation failure still permits interpreted execution. */
         size_t capacity = RVJIT_USER_FAULT_CAPACITY * 2;
         size_t fault_capacity = rvjit_user_fault_capacity();
         rvjit_fault_t* faults = calloc(fault_capacity, sizeof(*faults));
@@ -270,6 +290,7 @@ bool rvjit_set_native_ptrs(rvjit_block_t* block, bool native_ptrs)
         block->heap.block_links.data = links;
         block->heap.block_links.mask = capacity - 1;
     }
+    if (native_ptrs) rvjit_user_metadata_account(block);
 #endif
     block->native_ptrs = native_ptrs;
     return true;
@@ -315,6 +336,82 @@ static bool rvjit_lookup_put(hashmap_t* map, size_t key, size_t value)
     }
     return false;
 }
+
+#if defined(USER_FAULT_META) && defined(RVVM_USER_TEST)
+static bool rvjit_lookup_grow(hashmap_t* map)
+{
+    size_t size = hashmap_capacity(map);
+    if (size > SIZE_MAX / (2 * sizeof(hashmap_cell_t))) return false;
+    hashmap_t grown = {.data = calloc(size * 2, sizeof(hashmap_cell_t)),
+                       .mask = size * 2 - 1};
+    if (!grown.data) return false;
+    hashmap_foreach (map, key, value) {
+        if (!rvjit_lookup_put(&grown, key, value)) {
+            free(grown.data);
+            return false;
+        }
+    }
+    free(map->data);
+    *map = grown;
+    return true;
+}
+
+static bool rvjit_user_metadata_room(rvjit_block_t* block)
+{
+    size_t count = vector_size(block->heap.faults);
+    size_t added = vector_size(block->faults);
+    size_t capacity = vector_capacity(block->heap.faults);
+    bool faults_full = added > capacity - count;
+    bool blocks_full = hashmap_size(&block->heap.blocks) >= hashmap_capacity(&block->heap.blocks) / 2;
+    if (!faults_full && !blocks_full) return true;
+    if (faults_full) {
+        if (added > SIZE_MAX - count) return false;
+        while (capacity < count + added) {
+            if (capacity > SIZE_MAX / (2 * sizeof(rvjit_fault_t))) return false;
+            capacity *= 2;
+        }
+    }
+    /* Account for replacement buffers while the old buffers still exist.
+     * The process guard serializes growth with other contexts and creation. */
+    size_t peak = faults_full ? capacity * sizeof(rvjit_fault_t) : 0;
+    if (blocks_full) {
+        size_t maps = hashmap_used_mem(&block->heap.blocks) + hashmap_used_mem(&block->heap.block_links);
+        if (maps > (SIZE_MAX - peak) / 2) return false;
+        peak += maps * 2;
+    }
+    if (block->user_growth_begin) {
+        if (!block->user_growth_begin(block->user_growth_opaque, peak)) return false;
+    } else {
+#ifdef __linux__
+        struct rlimit limit;
+        size_t used = rvjit_ctx_memory_size(block);
+        if (getrlimit(RLIMIT_AS, &limit)) return false;
+        if (limit.rlim_cur != RLIM_INFINITY
+            && (used > limit.rlim_cur / 2 || peak > limit.rlim_cur / 2 - used)) return false;
+#else
+        return false;
+#endif
+    }
+    bool success = false;
+    if (faults_full) {
+        void* grown = realloc(block->heap.faults.data, capacity * sizeof(rvjit_fault_t));
+        if (!grown) goto out;
+        block->heap.faults.data = grown;
+        block->heap.faults.size = capacity;
+        rvjit_user_metadata_account(block);
+    }
+    if (blocks_full) {
+        if (!rvjit_lookup_grow(&block->heap.blocks)) goto out;
+        /* Deferred links are optional; retain the old table if growth fails. */
+        rvjit_lookup_grow(&block->heap.block_links);
+        rvjit_user_metadata_account(block);
+    }
+    success = true;
+out:
+    if (block->user_growth_end) block->user_growth_end(block->user_growth_opaque);
+    return success;
+}
+#endif
 
 static void rvjit_linker_cleanup(rvjit_block_t* block)
 {
@@ -424,10 +521,7 @@ rvjit_func_t rvjit_block_finalize(rvjit_block_t* block)
         return NULL;
     }
 #if defined(USER_FAULT_META) && defined(RVVM_USER_TEST)
-    if (block->native_ptrs && vector_size(block->faults) > vector_capacity(block->heap.faults) - vector_size(block->heap.faults))
-        return NULL;
-    if (block->native_ptrs && (hashmap_size(&block->heap.blocks) + 1) * 2
-        > hashmap_capacity(&block->heap.blocks)) return NULL;
+    if (block->native_ptrs && !rvjit_user_metadata_room(block)) return NULL;
 #endif
 
 #ifdef RVJIT_APPLE_SILICON

@@ -15,10 +15,18 @@ for name in test-exe-fd test-fd-lock test-fd-limits test-fork-cache test-process
         -ldl -lm -o "$build/$name"
     timeout 20 "$build/$name"
 done
-"$cc" "${flags[@]}" -DUSE_JIT -DUSER_FAULT_META -Wl,--wrap=realloc \
+"$cc" "${flags[@]}" -DUSE_JIT -DUSER_FAULT_META -Wl,--wrap=realloc -Wl,--wrap=calloc \
     "$root/tests/rocky/test-jit-oom.c" "$root"/src/rvjit/*.c "$root"/src/util/*.c \
     -ldl -lm -o "$build/test-jit-oom"
 timeout 20 "$build/test-jit-oom"
+"$cc" "${flags[@]}" -DUSE_JIT -DUSER_FAULT_META \
+    "$root/tests/rocky/test-jit-pressure.c" "$root"/src/rvjit/*.c "$root"/src/util/*.c \
+    -ldl -lm -o "$build/test-jit-pressure"
+timeout 20 "$build/test-jit-pressure"
+"$cc" "${flags[@]}" -DUSE_JIT -DUSER_FAULT_META \
+    "$root/tests/rocky/test-jit-memory-probe.c" "$root"/src/util/*.c \
+    -ldl -lm -o "$build/test-jit-memory-probe"
+timeout 20 "$build/test-jit-memory-probe"
 if [[ -f $root/compile_flags.txt ]] && grep -q -- '-DRVVM_STATIC_GLIBC_FORK' "$root/compile_flags.txt"; then
     "$cc" "${flags[@]}" -DRVVM_STATIC_GLIBC_FORK -fPIE -static-pie -Wl,--wrap=_Fork \
         "$root/tests/rocky/test-host-fork.c" -o "$build/test-host-fork"

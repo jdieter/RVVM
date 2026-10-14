@@ -152,6 +152,12 @@ typedef struct {
 
 typedef struct {
     rvjit_heap_t heap;
+#if defined(USER_FAULT_META) && defined(RVVM_USER_TEST)
+    uint64_t user_metadata_size;
+    bool (*user_growth_begin)(void*, size_t);
+    void (*user_growth_end)(void*);
+    void* user_growth_opaque;
+#endif
 
     uint8_t* code;
     size_t   size;
