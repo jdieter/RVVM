@@ -332,6 +332,65 @@ partial output and interruptions. Do not count a comment or an unsupported
 device on the test host as proof of an emulator bug. Record unsupported
 interfaces explicitly with the applicable ABI and reason.
 
+Cross-process descriptor inspection coordination
+------------------------------------------------
+kcmp (guest syscall 272) intentionally returns ENOSYS for every argument
+combination and object type. Partial host delegation can expose private
+descriptors and report incorrect guest object identities. The removed
+handler's caller-side descriptor guard could not freeze an independent
+target's table: metadata discovery followed by kernel lookup could race
+target pin relocation or exec. Bridge-memory access also requires stronger
+permissions than some native kcmp comparisons. Failing discovery must not
+silently disable private-descriptor filtering.
+
+Confirmed kcmp failures on dev, with passing native references:
+test-kcmp-cross-process.c checks both cases. With kcmp-deny-metadata.c denying
+process_vm_readv and ptrace but allowing kcmp, the inherited-file control
+comparison succeeds while a closed guest descriptor in the child produces
+a native-object comparison instead of EBADF. All four guest modes fail;
+the native probe passes under the same filter. Discovery failure must not
+be treated as proof that a target descriptor is public.
+
+KCMP_VM also reports different address spaces for a CLONE_VM | CLONE_VFORK
+child and its original guest parent. Native returns equality. The worker
+backend implements shared guest memory through different host address
+spaces, so raw host object identity is not a correct guest identity. Audit
+other kcmp object types against their actual guest sharing model before
+re-enabling kcmp; obtain kernel authorization for the original task IDs.
+Correct support needs authoritative guest identities for each object type
+and descriptor coordination across independent processes, exec and PID
+namespaces, while preserving native permission and error precedence.
+Keep internal host kcmp use for open-file-description identity checks; this
+policy disables only the guest syscall.
+
+pidfd_getfd (guest syscall 438) intentionally returns ENOSYS for every argument
+combination. Forwarding could duplicate an emulator-private executable pin or
+VM control descriptor into the guest. The removed implementation checked a
+remote metadata snapshot and then called Linux without locking an independent
+target's descriptor table. Its older-kernel fdinfo fallback also depended on
+readable procfs and a spare descriptor slot; discovery failure bypassed private
+descriptor filtering. PIDFD_GET_INFO on newer kernels did not fix remote
+relocation/exec races. pidfd_open and pidfd_send_signal remain implemented.
+
+Re-enable pidfd_getfd only with authoritative target identity and descriptor
+coordination across independent processes, forks, exec and PID namespaces.
+Preserve kernel permission/error precedence and distinguish native targets
+from emulated targets. Do not assume the caller and target hide the same FD
+number or identify a private open file description merely by its inode.
+
+Regression coverage: independent guest processes concurrently relocating
+pins and executing another image; CLONE_FILES sharing versus private tables;
+restricted bridge-memory access; pidfds received by SCM_RIGHTS; old kernels
+without PIDFD_GET_INFO at exhausted soft/hard NOFILE limits and without
+procfs. Compare errno and acquired file identity with native behavior.
+test-pidfd-getfd.S enforces unconditional ENOSYS, including valid pidfds,
+invalid arguments and NOFILE=0, and checks that the other pidfd operations
+still work. These policy checks do not establish future forwarding correctness.
+test-kcmp.S enforces unconditional ENOSYS for all eight object types, invalid
+PIDs/types, inaccessible epoll-slot pointers and NOFILE=0. The file, epoll,
+remote-pin and shared-VM native oracles remain in test-kcmp-cross-process.c
+for future implementation; they are not passing guest acceptance coverage.
+
 Signal and instruction conformance audit
 ---------------------------------------
 Audit requirement: passing glibc and current regressions does not establish

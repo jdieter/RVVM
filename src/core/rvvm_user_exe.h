@@ -54,7 +54,7 @@ static unsigned user_exe_fd_args(unsigned nr)
         case 210: case 211: case 212: case 213: case 223: case 242: case 243: case 264:
         case 265: case 267: case 269: case 276: case 281: case 285: case 286: case 287:
         case 263: case 451:
-        case 291: case 424: case 437: case 439: case 441: case 452:
+        case 291: case 424: case 437: case 439: case 441: case 443: case 452:
             mask = 1;
             break;
     }

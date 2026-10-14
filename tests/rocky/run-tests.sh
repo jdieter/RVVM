@@ -25,7 +25,7 @@ if [[ -f $root/compile_flags.txt ]] && grep -q -- '-DRVVM_STATIC_GLIBC_FORK' "$r
     timeout 20 "$build/test-host-fork"
 fi
 if (($#)); then
-    for guest in test-clone-flags test-clone-files test-fork-cache test-clone-thread test-clone-thread-private test-thread-exit test-vfork test-vfork-nofile test-vfork-concurrent test-openat2 test-seccomp test-jit-limits test-fpu-tininess test-mmap-huge test-mprotect-errors test-proc-exe; do
+    for guest in test-clone-flags test-clone-files test-fork-cache test-clone-thread test-clone-thread-private test-thread-exit test-vfork test-vfork-nofile test-vfork-concurrent test-openat2 test-seccomp test-pidfd-getfd test-kcmp test-jit-limits test-fpu-tininess test-mmap-huge test-mprotect-errors test-proc-exe; do
         "${RISCV_CC:-clang}" --target=riscv64-linux-gnu -march=rv64gc -mabi=lp64d \
             -fuse-ld="${RISCV_LD:-lld}" -nostdlib -static -Wl,--build-id=none \
             "$root/tests/rocky/$guest.S" -o "$build/$guest"

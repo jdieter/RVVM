@@ -537,6 +537,7 @@ static const char* wrap_path(char* buffer, const char* path)
 #include "rvvm_user_fs_watch.h"
 #include "rvvm_user_system_control.h"
 #include "rvvm_user_exe.h"
+#include "rvvm_user_host_delegation.h"
 #include "rvvm_user_exec.h"
 #include "user_ptrace/user_ptrace_proc.h"
 #include "rvvm_user_cpu.h"
@@ -2128,6 +2129,92 @@ static void* rvvm_user_thread_wrap(void* arg)
             else {
             if (vm_mutation) user_vm_enter();
             switch (a7) {
+                case 58: // vhangup
+                    a0 = errno_ret(USER_SYSCALL(SYS_vhangup, 0, 0, 0, 0, 0, 0));
+                    break;
+                case 89: // acct
+                    a0 = user_host_path_call(SYS_acct, a0, 0, 0, 0, 0);
+                    break;
+                case 106: // delete_module: names refer to modules in the running host kernel
+                    a0 = errno_ret(USER_SYSCALL(SYS_delete_module, a0, a1, 0, 0, 0, 0));
+                    break;
+                case 142: // reboot: the host kernel enforces capabilities and PID namespaces
+                    a0 = errno_ret(USER_SYSCALL(SYS_reboot, a0, a1, a2, a3, 0, 0));
+                    break;
+                case 170: // settimeofday: Linux LP64 timeval/timezone ABI
+                    a0 = errno_ret(USER_SYSCALL(SYS_settimeofday, a0, a1, 0, 0, 0, 0));
+                    break;
+                case 224: // swapon
+                    a0 = user_host_path_call(SYS_swapon, a0, a1, 0, 0, 0);
+                    break;
+                case 225: // swapoff
+                    a0 = user_host_path_call(SYS_swapoff, a0, 0, 0, 0, 0);
+                    break;
+                case 41: // pivot_root
+                    a0 = user_host_path_call(SYS_pivot_root, a0, a1, 0, 0, 0);
+                    break;
+                case 268: // setns: change the calling kernel thread's namespaces
+                    a0 = user_host_fd_call(SYS_setns, a0, a1, 0);
+                    break;
+                case 272: // kcmp
+                    // Host object identities and remote private pins differ from the guest.
+                    a0 = -UAPI_ENOSYS;
+                    break;
+                case 428: // open_tree
+                    a0 = user_host_path_call(SYS_open_tree, a0, a1, a2, 0, 0);
+                    break;
+                case 429: // move_mount
+                    a0 = user_host_path_call(SYS_move_mount, a0, a1, a2, a3, a4);
+                    break;
+                case 430: // fsopen
+                    a0 = errno_ret(USER_SYSCALL(SYS_fsopen, a0, a1, 0, 0, 0, 0));
+                    break;
+                case 431: // fsconfig
+                    a0 = user_host_fsconfig(a0, a1, to_str(a2), to_ptr(a3), a4);
+                    break;
+                case 432: // fsmount
+                    a0 = user_host_fd_call(SYS_fsmount, a0, a1, a2);
+                    break;
+                case 433: // fspick
+                    a0 = user_host_path_call(SYS_fspick, a0, a1, a2, 0, 0);
+                    break;
+                case 438: // pidfd_getfd
+                    // Remote descriptor inspection cannot yet hide private pins reliably.
+                    a0 = -UAPI_ENOSYS;
+                    break;
+                case 442: // mount_setattr: kernel validates the extensible mount_attr structure
+                    a0 = user_host_mount_setattr(a0, to_str(a1), a2, to_ptr(a3), a4);
+                    break;
+                case 460: // lsm_set_self_attr: host LSM validates the fixed-width context records
+                    a0 = errno_ret(USER_SYSCALL(SYS_lsm_set_self_attr, a0, a1, a2, a3, 0, 0));
+                    break;
+                case 217: // add_key: the kernel owns payloads, keyrings and credentials
+                    a0 = errno_ret(USER_SYSCALL(SYS_add_key, a0, a1, a2, a3, a4, 0));
+                    break;
+                case 218: // request_key: retain host upcalls and interruptible waits
+                    a0 = errno_ret(USER_SYSCALL(SYS_request_key, a0, a1, a2, a3, 0, 0));
+                    break;
+                case 219: // keyctl: command-specific descriptor protection
+                    a0 = user_host_keyctl(a0, a1, a2, a3, a4);
+                    break;
+                case 60: // quotactl: preserve path-prefix handling and the kernel ABI
+                    a0 = user_host_quotactl(a0, to_str(a1), a2, a3);
+                    break;
+                case 443: // quotactl_fd
+                    a0 = user_host_quotactl_fd(a0, a1, a2, a3);
+                    break;
+                case 457: // statmount: fixed-width request and output structures
+                    a0 = errno_ret(USER_SYSCALL(SYS_statmount, a0, a1, a2, a3, 0, 0));
+                    break;
+                case 458: // listmount: kernel mount IDs belong to the real namespace
+                    a0 = errno_ret(USER_SYSCALL(SYS_listmount, a0, a1, a2, a3, 0, 0));
+                    break;
+                case 459: // lsm_get_self_attr: kernel credentials and security contexts
+                    a0 = errno_ret(USER_SYSCALL(SYS_lsm_get_self_attr, a0, a1, a2, a3, 0, 0));
+                    break;
+                case 461: // lsm_list_modules: kernel supplies active LSM IDs
+                    a0 = errno_ret(USER_SYSCALL(SYS_lsm_list_modules, a0, a1, a2, 0, 0, 0));
+                    break;
                 case 128: // restart_syscall: preserve a traced timed wait's original deadline
                     a0 = user_ptrace_restart_syscall();
                     break;
@@ -2489,7 +2576,8 @@ static void* rvvm_user_thread_wrap(void* arg)
                     a0 = errno_ret(fchdir(a0));
                     break;
                 case 51: // chroot: real kernel operation in binfmt mode
-                    a0 = prefix_path && *prefix_path ? -UAPI_ENOSYS
+                    // The identity prefix remains valid after the kernel changes root.
+                    a0 = prefix_path && *prefix_path && strcmp(prefix_path, "/") ? -UAPI_ENOSYS
                         : errno_ret(chroot(to_str(a0)));
                     break;
                 case 52: // fchmod

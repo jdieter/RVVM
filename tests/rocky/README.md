@@ -120,6 +120,70 @@ procfs views and core register/mapping notes remain audit/implementation work
 in TODO.txt. The fixed memory-budget probe measures a documented emulator
 accounting difference; it does not claim to isolate every resource limit.
 
+### Host delegation syscall probes
+
+`test-host-delegation.c` adds 11 cases for add_key, request_key, keyctl,
+quotactl/quotactl_fd, statmount/listmount, lsm_get_self_attr and
+lsm_list_modules. Use the same native-reference runner described above, with
+this fixture instead of test-linux-compat.c. Build with
+`gcc -O2 -Wall -Wextra -Werror -static`; Linux 6.12 headers provide the
+mount/LSM structure declarations even when the execution kernel is older.
+
+Tests create only process-local keys, revoke payload keys, query mount/LSM
+data and exercise quota-query errors. They do not change mount state, quotas
+or security labels. Keyctl buffer faults must retain EFAULT; commands taking
+descriptors must treat hidden pins as closed guest descriptors. Quota tests
+cover pathname lookup and invalid descriptor errors, including descriptor
+numbers used for private pins. They do not validate quota updates or a
+successful data query on a quota-enabled filesystem.
+
+The Linux 5.10 native reference cannot exercise the five newer syscall
+interfaces; supplement it with a newer native Linux reference compiled from
+identical source. Feature/permission denials remain explicit prerequisites.
+No known failures are allowed for this implemented batch.
+
+`test-host-state-delegation.c` covers the next 17 handlers: vhangup, acct,
+delete_module, reboot, settimeofday, swapon/swapoff, lsm_set_self_attr,
+pivot_root, setns and the seven newer mount operations.
+Compile and run it with the same flags and native-reference runner.
+
+Mount and pivot-root tests first unshare the mount namespace and make its
+mounts private. The UTS test changes a new namespace and then rejoins the
+original namespace. The vhangup success probe allocates its own PTY and
+session. No probe changes the host clock, swaps, modules, accounting settings
+or security labels. Those operations have permission/error coverage only.
+The reboot probe clears and verifies all effective capabilities and uses
+invalid magic values; it never requests a valid reboot with CAP_SYS_BOOT.
+
+Descriptor tests cover hidden pins, descriptor relocation,
+fsconfig command-dependent descriptors, and mount_setattr's embedded
+userns_fd. The latter also checks extensible request tails and no-op calls
+with inaccessible pathnames. There are 22 cases.
+Run successful namespace/mount probes as root
+on dev. Native feature/configuration gaps and missing capabilities remain
+SKIP prerequisites; a newer native reference must pass before guest runs
+count as verified.
+
+pidfd_getfd and kcmp intentionally return ENOSYS for all arguments until remote
+descriptor inspection can reliably hide emulator-private handles. The
+guest-only test-pidfd-getfd.S checks this policy and the continued operation
+of pidfd_open/pidfd_send_signal; it also checks getfd with NOFILE=0.
+test-kcmp.S covers all object types, malformed arguments and NOFILE=0.
+Both policy tests run in the existing regression suite.
+test-pidfd-getfd-conformance.c retains the four
+native behavioral oracles for future support; it is not a passing guest
+acceptance suite while the syscall is disabled. See TODO.txt for the reason
+and re-enablement requirements.
+
+`test-kcmp-cross-process.c` retains four native oracles: file and epoll
+comparisons, closed descriptors in an independent child, and KCMP_VM
+equality for CLONE_VM | CLONE_VFORK. Before disabling guest kcmp, the
+shared-VM case failed in all guest modes. The remote-pin case also failed
+under `kcmp-deny-metadata.c`, which denies process_vm_readv/ptrace while
+allowing kcmp: native passed, but RVVM compared a hidden child descriptor.
+These are future conformance probes, not guest acceptance while kcmp is
+unsupported. TODO.txt records the rationale and re-enablement requirements.
+
 ### Existing implementation regressions
 
 Run native tests with `bash tests/rocky/run-tests.sh`. To add guest tests, pass
