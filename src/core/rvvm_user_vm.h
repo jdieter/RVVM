@@ -137,6 +137,9 @@ static int user_vm_populate(struct user_vm* vm, struct user_vm_region* region, u
 {
     unsigned char* bytes = vm->scratch;
     uint64_t* entries = vm->pages;
+    /* Kernel copying can read accessible anonymous pages directly. Private
+     * files still need the proc-memory path to preserve beyond-EOF SIGBUS. */
+    bool direct = !region->file && (region->prot & PROT_READ);
         size_t valid = region->size;
         for (size_t offset = 0; offset < region->size;) {
             size_t count = (region->size - offset) / vm->page;
@@ -152,6 +155,11 @@ static int user_vm_populate(struct user_vm* vm, struct user_vm_region* region, u
                 while (run < vm->buffer_size / vm->page && p + run < count
                        && (region->file || (entries[p + run] & (UINT64_C(3) << 62)))) ++run;
                 size_t length = run * vm->page;
+                if (direct) {
+                    if (user_vm_write(region->backing, (void*)(source + position), length, position)) return -1;
+                    p += run;
+                    continue;
+                }
                 if (user_vm_read(vm->memory, bytes, length, source + position)) {
                     /* A file extent may end inside this batch. Retry a page
                      * at a time so its last valid page keeps the kernel's
@@ -271,6 +279,9 @@ static void user_vm_remove(struct user_vm* vm, uintptr_t address, size_t size)
 static int user_vm_sync_region(struct user_vm* vm, struct user_vm_region* region)
 {
     unsigned char *shared = vm->scratch, *original = vm->scratch + vm->buffer_size;
+    /* Aliases remain mapped while guest writers are paused. File baselines
+     * and inaccessible mappings retain their kernel-mediated comparison. */
+    bool direct = !region->file && (region->prot & PROT_READ);
         off_t position = region->offset;
         struct stat info;
         if (fstat(region->backing, &info)) return -1;
@@ -284,15 +295,17 @@ static int user_vm_sync_region(struct user_vm* vm, struct user_vm_region* region
             if (end > limit) end = limit;
             for (; start < end;) {
                 size_t length = end - start > (off_t)vm->buffer_size ? vm->buffer_size : (size_t)(end - start);
+                const unsigned char* comparison = direct
+                    ? (const unsigned char*)region->original + start - region->offset : original;
                 if (user_vm_read(region->backing, shared, length, start)
-                    || (region->baseline >= 0
+                    || (!direct && (region->baseline >= 0
                         ? user_vm_read(region->baseline, original, length, start)
                         : user_vm_read(vm->memory, original, length,
-                            (uintptr_t)region->original + start - region->offset)))
+                            (uintptr_t)region->original + start - region->offset))))
                     return -1;
-                if (memcmp(shared, original, length)) {
+                if (memcmp(shared, comparison, length)) {
                     for (size_t p = 0; p < length; p += vm->page) {
-                        if (memcmp(shared + p, original + p, vm->page)
+                        if (memcmp(shared + p, comparison + p, vm->page)
                             && user_vm_write(vm->memory, shared + p, vm->page,
                                 (uintptr_t)region->original + start - region->offset + p)) return -1;
                     }

@@ -5,7 +5,81 @@
 #include <stdbool.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <sys/resource.h>
 #include "core/rvvm_user_vm.h"
+
+static size_t virtual_bytes(void)
+{
+    FILE* stat = fopen("/proc/self/statm", "r");
+    size_t pages;
+    assert(stat && fscanf(stat, "%zu", &pages) == 1);
+    fclose(stat);
+    return pages * (size_t)sysconf(_SC_PAGESIZE);
+}
+
+static void test_protection_offsets(void)
+{
+    size_t page = sysconf(_SC_PAGESIZE);
+    char* memory = user_vma_map(NULL, page * 4, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    assert(memory != MAP_FAILED);
+    for (size_t i = 0; i < 4; ++i) memory[i * page] = 17 + i;
+    struct user_vm* vm = user_vm_prepare();
+    assert(vm && !user_vm_share(vm));
+    for (size_t i = 1; i < 4; ++i) assert(!user_vm_split(vm, (uintptr_t)memory + i * page));
+    int prot[] = {PROT_READ | PROT_WRITE, PROT_WRITE, PROT_NONE, PROT_READ};
+    for (size_t i = 0; i < vm->count; ++i) {
+        struct user_vm_region* region = vm->regions + i;
+        size_t index = (region->address - (uintptr_t)memory) / page;
+        assert(index < 4 && region->size == page && region->offset == index * page);
+        assert(!mprotect(region->original, page, prot[index]));
+        region->prot = prot[index];
+    }
+    pid_t child = fork();
+    assert(child >= 0);
+    if (!child) {
+        for (size_t i = 0; i < 4; ++i) memory[i * page] = 71 + i;
+        _exit(0);
+    }
+    int status;
+    assert(waitpid(child, &status, 0) == child && !status);
+    assert(!user_vm_restore(vm));
+    user_vm_destroy(vm);
+    assert(!mprotect(memory, page * 4, PROT_READ | PROT_WRITE));
+    for (size_t i = 0; i < 4; ++i) assert(memory[i * page] == 71 + i);
+    assert(!user_vma_unmap(memory, page * 4));
+}
+
+static void test_finite_address_space(void)
+{
+    size_t page = sysconf(_SC_PAGESIZE);
+    char* memory = user_vma_map(NULL, page * 16, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    assert(memory != MAP_FAILED);
+    memory[0] = 17;
+    struct rlimit saved;
+    assert(!getrlimit(RLIMIT_AS, &saved));
+    struct user_vm* vm = user_vm_prepare();
+    assert(vm);
+    size_t before = virtual_bytes();
+    struct rlimit limited = saved;
+    limited.rlim_cur = before + page;
+    assert(!setrlimit(RLIMIT_AS, &limited));
+    assert(!user_vm_share(vm) && virtual_bytes() == before);
+    memory[0] = 42;
+    assert(!user_vm_restore(vm) && memory[0] == 42);
+    assert(!setrlimit(RLIMIT_AS, &saved));
+    user_vm_destroy(vm);
+
+    vm = user_vm_prepare();
+    assert(vm);
+    limited.rlim_cur = virtual_bytes() - page;
+    assert(!setrlimit(RLIMIT_AS, &limited));
+    assert(user_vm_share(vm) == -1 && errno == ENOMEM && memory[0] == 42);
+    assert(!setrlimit(RLIMIT_AS, &saved));
+    user_vm_destroy(vm);
+    assert(!user_vma_unmap(memory, page * 16));
+}
 
 static void expect_sigbus(char* address)
 {
@@ -114,6 +188,8 @@ int main(void)
     assert(!user_vma_unmap(attachment + page, page));
     assert(!user_vma_owned_count);
     close(file);
+    test_protection_offsets();
+    test_finite_address_space();
     puts("PASS temporary shared views, file isolation, restored fork COW and SysV detach ownership");
     return 0;
 }
