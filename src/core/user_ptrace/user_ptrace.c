@@ -390,19 +390,28 @@ static struct bridge* allocate_bridge(void)
      * guest NOFILE/FSIZE limits must not prevent tracing state allocation. */
     size_t page = (size_t)sysconf(_SC_PAGESIZE);
     size_t length = page + sizeof(struct bridge);
-    user_fd_lock();
     spin_lock(&bridge_pool_lock);
-    if (!bridge_marker) {
-        int fd = syscall(SYS_memfd_create, "rvvm-ptrace-marker", 1);
-        if (fd >= 0) {
-            void* marker = mmap(NULL, page, PROT_NONE, MAP_SHARED, fd, 0);
-            if (marker != MAP_FAILED) bridge_marker = marker;
-            close(fd);
-        }
-    }
     void* marker = bridge_marker;
     spin_unlock(&bridge_pool_lock);
-    user_fd_unlock();
+    /* Only creating the marker needs the descriptor guard, for its transient
+     * memfd; the first bridge, at process start, does that. Guest thread
+     * creation gets here holding user_reaper_lock, which the fork path takes
+     * after the guard: taking the guard every time deadlocked the two. */
+    if (!marker) {
+        user_fd_lock();
+        spin_lock(&bridge_pool_lock);
+        if (!bridge_marker) {
+            int fd = syscall(SYS_memfd_create, "rvvm-ptrace-marker", 1);
+            if (fd >= 0) {
+                void* created = mmap(NULL, page, PROT_NONE, MAP_SHARED, fd, 0);
+                if (created != MAP_FAILED) bridge_marker = created;
+                close(fd);
+            }
+        }
+        marker = bridge_marker;
+        spin_unlock(&bridge_pool_lock);
+        user_fd_unlock();
+    }
     if (!marker) return NULL;
     void* region = mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     struct bridge* result = NULL;
