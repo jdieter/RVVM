@@ -20,7 +20,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#if defined(__linux__) && defined(USER_FAULT_META) && defined(RVVM_USER_TEST)
+#if defined(__linux__) && defined(RVVM_USER_TEST)
 #include <sys/resource.h>
 #endif
 
@@ -198,7 +198,7 @@ bool rvjit_ctx_init(rvjit_block_t* block, size_t size)
     hashmap_init(&block->heap.blocks, 64);
     hashmap_init(&block->heap.block_links, 64);
     vector_init(block->links);
-#ifdef USER_FAULT_META
+#ifdef RVVM_USER_TEST
     vector_init(block->faults);
     vector_init(block->heap.faults);
 #endif
@@ -209,7 +209,7 @@ size_t rvjit_ctx_memory_size(const rvjit_block_t* block)
 {
     size_t size = block->heap.size;
     if (block->heap.code != block->heap.data) size += block->heap.size;
-#if defined(USER_FAULT_META) && defined(RVVM_USER_TEST)
+#ifdef RVVM_USER_TEST
     if (block->native_ptrs) {
         /* Other guest threads can create a context while this one's tables
          * grow. Read one published size, not transient pointer/mask pairs. */
@@ -219,7 +219,7 @@ size_t rvjit_ctx_memory_size(const rvjit_block_t* block)
     {
         if (block->heap.blocks.data) size += hashmap_used_mem(&block->heap.blocks);
         if (block->heap.block_links.data) size += hashmap_used_mem(&block->heap.block_links);
-#ifdef USER_FAULT_META
+#ifdef RVVM_USER_TEST
         size += block->heap.faults.size * sizeof(rvjit_fault_t);
 #endif
     }
@@ -228,7 +228,7 @@ size_t rvjit_ctx_memory_size(const rvjit_block_t* block)
     return size;
 }
 
-#if defined(USER_FAULT_META) && defined(RVVM_USER_TEST)
+#ifdef RVVM_USER_TEST
 static void rvjit_user_metadata_account(rvjit_block_t* block)
 {
     size_t size = block->heap.faults.size * sizeof(rvjit_fault_t)
@@ -253,7 +253,7 @@ size_t rvjit_user_memory_size(size_t heap_size)
      * Reserve room for that fallback before committing optional JIT memory. */
     if (heap_size > SIZE_MAX / 2) return SIZE_MAX;
     size_t size = heap_size * 2;
-#if defined(USER_FAULT_META) && defined(RVVM_USER_TEST)
+#ifdef RVVM_USER_TEST
     size_t tables = rvjit_user_fault_capacity() * sizeof(rvjit_fault_t)
                   + RVJIT_USER_FAULT_CAPACITY * 4 * sizeof(hashmap_cell_t);
     if (tables > SIZE_MAX - size) return SIZE_MAX;
@@ -264,7 +264,7 @@ size_t rvjit_user_memory_size(size_t heap_size)
 
 bool rvjit_set_native_ptrs(rvjit_block_t* block, bool native_ptrs)
 {
-#if defined(USER_FAULT_META) && defined(RVVM_USER_TEST)
+#ifdef RVVM_USER_TEST
     if (native_ptrs && !block->native_ptrs
         && block->heap.faults.size < rvjit_user_fault_capacity()) {
         /* Reserve enough metadata to keep compiling after guest limits
@@ -308,7 +308,7 @@ void rvjit_init_memtracking(rvjit_block_t* block, size_t size)
 
 static void rvjit_clear_lookup(rvjit_block_t* block, hashmap_t* map)
 {
-#if defined(USER_FAULT_META) && defined(RVVM_USER_TEST)
+#ifdef RVVM_USER_TEST
     if (block->native_ptrs) {
         if (map->data) memset(map->data, 0, hashmap_used_mem(map));
         map->count = 0;
@@ -337,7 +337,7 @@ static bool rvjit_lookup_put(hashmap_t* map, size_t key, size_t value)
     return false;
 }
 
-#if defined(USER_FAULT_META) && defined(RVVM_USER_TEST)
+#ifdef RVVM_USER_TEST
 static bool rvjit_lookup_grow(hashmap_t* map)
 {
     size_t size = hashmap_capacity(map);
@@ -441,7 +441,7 @@ void rvjit_ctx_free(rvjit_block_t* block)
     hashmap_destroy(&block->heap.blocks);
     hashmap_destroy(&block->heap.block_links);
     vector_free(block->links);
-#ifdef USER_FAULT_META
+#ifdef RVVM_USER_TEST
     vector_free(block->faults);
     vector_free(block->heap.faults);
 #endif
@@ -494,7 +494,7 @@ static inline bool rvjit_page_needs_flush(rvjit_block_t* block, rvjit_addr_t add
 
 void rvjit_block_init(rvjit_block_t* block)
 {
-#ifdef USER_FAULT_META
+#ifdef RVVM_USER_TEST
     vector_clear(block->faults);
     block->fault_active = false;
     block->fault_failed = false;
@@ -507,7 +507,7 @@ void rvjit_block_init(rvjit_block_t* block)
 
 rvjit_func_t rvjit_block_finalize(rvjit_block_t* block)
 {
-#ifdef USER_FAULT_META
+#ifdef RVVM_USER_TEST
     // Never publish code whose fault metadata could not be recorded.
     if (block->fault_failed) return NULL;
 #endif
@@ -520,7 +520,7 @@ rvjit_func_t rvjit_block_finalize(rvjit_block_t* block)
         // The cache is full
         return NULL;
     }
-#if defined(USER_FAULT_META) && defined(RVVM_USER_TEST)
+#ifdef RVVM_USER_TEST
     if (block->native_ptrs && !rvjit_user_metadata_room(block)) return NULL;
 #endif
 
@@ -529,7 +529,7 @@ rvjit_func_t rvjit_block_finalize(rvjit_block_t* block)
 #endif
 
     memcpy(dest, block->code, block->size);
-#ifdef USER_FAULT_META
+#ifdef RVVM_USER_TEST
     vector_foreach(block->faults, i) {
         rvjit_fault_t entry = vector_at(block->faults, i);
         entry.start += block->heap.curr;
@@ -540,7 +540,7 @@ rvjit_func_t rvjit_block_finalize(rvjit_block_t* block)
     block->heap.curr += block->size;
 
     // Bound lookup collision chains without work in the execution path.
-#if defined(USER_FAULT_META) && defined(RVVM_USER_TEST)
+#ifdef RVVM_USER_TEST
     if (block->native_ptrs) {
         if (!rvjit_lookup_put(&block->heap.blocks, block->phys_pc, (size_t)code)) return NULL;
     } else
@@ -556,7 +556,7 @@ rvjit_func_t rvjit_block_finalize(rvjit_block_t* block)
         rvjit_addr_t k = vector_at(block->links, i).dest;
         size_t       v = vector_at(block->links, i).ptr;
         linked_blocks  = (void*)hashmap_get(&block->heap.block_links, k);
-#if defined(USER_FAULT_META) && defined(RVVM_USER_TEST)
+#ifdef RVVM_USER_TEST
         if (block->native_ptrs) {
             if (!linked_blocks) {
                 linked_blocks = calloc(1, sizeof(*linked_blocks));
@@ -594,7 +594,7 @@ rvjit_func_t rvjit_block_finalize(rvjit_block_t* block)
             rvjit_flush_icache(jptr, 8);
 #endif
         }
-#if defined(USER_FAULT_META) && defined(RVVM_USER_TEST)
+#ifdef RVVM_USER_TEST
         if (block->native_ptrs) vector_clear(*linked_blocks);
         else
 #endif
@@ -620,7 +620,7 @@ rvjit_func_t rvjit_block_finalize(rvjit_block_t* block)
 rvjit_func_t rvjit_block_lookup(rvjit_block_t* block, rvjit_addr_t phys_pc)
 {
     if (unlikely(rvjit_page_needs_flush(block, phys_pc))) {
-#if defined(USER_FAULT_META) && defined(RVVM_USER_TEST)
+#ifdef RVVM_USER_TEST
         /* Per-entry removal may shrink/reallocate the lookup table. Retain
          * its startup allocation when guest memory limits are exhausted. */
         if (block->native_ptrs) {
@@ -647,7 +647,7 @@ rvjit_func_t rvjit_block_lookup(rvjit_block_t* block, rvjit_addr_t phys_pc)
 
 void rvjit_flush_cache(rvjit_block_t* block)
 {
-#ifdef USER_FAULT_META
+#ifdef RVVM_USER_TEST
     vector_clear(block->heap.faults);
 #endif
     if (block->heap.curr > 0x10000) {
@@ -670,7 +670,7 @@ void rvjit_flush_cache(rvjit_block_t* block)
     rvjit_block_init(block);
 }
 
-#ifdef USER_FAULT_META
+#ifdef RVVM_USER_TEST
 const rvjit_fault_t* rvjit_fault_lookup(const rvjit_block_t* block, uintptr_t pc)
 {
     uintptr_t offset = pc - (uintptr_t)block->heap.code;

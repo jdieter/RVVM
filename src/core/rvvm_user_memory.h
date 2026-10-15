@@ -5,7 +5,6 @@
 /* Data protection stays with the host kernel. Execution needs its own map:
  * reading an instruction is not an executable access from the host's view. */
 #include "rvvm_user_exec_ranges.h"
-#ifdef USER_NATIVE_VFORK_POC
 struct user_exec_snapshot {
     struct user_exec_snapshot* next;
     size_t count, capacity;
@@ -136,11 +135,9 @@ static void user_exec_fork_child(void)
     user_native_exec_reader = NULL;
     user_exec_deferred = false;
 }
-#endif
 
 static bool user_exec_check(rvvm_addr_t addr)
 {
-#ifdef USER_NATIVE_VFORK_POC
     if (user_native_exec_reader) {
         for (;;) {
             /* Observe a quiescent writer, without acquiring its lock. The
@@ -169,7 +166,6 @@ static bool user_exec_check(rvvm_addr_t addr)
             if (consistent) return allowed;
         }
     }
-#endif
     spin_lock(&mmap_lock);
     bool allowed = user_exec_ranges_contains(addr);
     spin_unlock(&mmap_lock);
@@ -179,13 +175,11 @@ static bool user_exec_check(rvvm_addr_t addr)
 static void user_exec_update(uintptr_t start, size_t size, bool executable)
 {
     bool invalidated = user_exec_ranges_update(start, size, executable);
-#ifdef USER_NATIVE_VFORK_POC
     if (user_exec_native_readers && !user_exec_deferred && !user_exec_publish()) {
         /* The kernel mutation already committed. Continuing with stale
          * execute permission would be incorrect, as would replaying it. */
         syscall(SYS_exit_group, 127);
     }
-#endif
     if (invalidated) {
         uintptr_t first = start & ~(uintptr_t)4095;
         uintptr_t end = (start + size + 4095) & ~(uintptr_t)4095;
@@ -254,9 +248,7 @@ static void user_exec_partial(uintptr_t start, size_t size, int host_prot, bool 
  * security policy may refuse it; guest execution needs only READ. */
 static int user_exec_protect(void* addr, size_t size, int prot, bool executable)
 {
-#ifdef USER_NATIVE_VFORK_POC
     if (executable && !mprotect(addr, size, prot | PROT_READ | PROT_EXEC)) return 0;
-#endif
     return mprotect(addr, size, executable ? prot | PROT_READ : prot);
 }
 
@@ -321,10 +313,8 @@ static void user_exec_move_prepare(struct user_exec_move* move, uintptr_t addr, 
 static void user_exec_move_apply(struct user_exec_move* move, uintptr_t addr, size_t oldsize,
                                   size_t newsize, int flags, uintptr_t ret)
 {
-#ifdef USER_NATIVE_VFORK_POC
     bool deferred = user_exec_deferred;
     user_exec_deferred = true;
-#endif
     size_t span = oldsize ? oldsize : newsize;
         if (!(flags & MREMAP_DONTUNMAP)) user_exec_update(addr, oldsize, false);
         else rvvm_flush_icache(userland, addr, oldsize);
@@ -335,32 +325,26 @@ static void user_exec_move_apply(struct user_exec_move* move, uintptr_t addr, si
                 user_exec_update(ret + r.start, EVAL_MIN(r.end, newsize) - r.start, true);
         }
         if (newsize > span && move->executable_tail) user_exec_update(ret + span, newsize - span, true);
-#ifdef USER_NATIVE_VFORK_POC
     user_exec_deferred = deferred;
     if (!deferred && user_exec_native_readers && !user_exec_publish()) syscall(SYS_exit_group, 127);
-#endif
 }
 
 static rvvm_addr_t user_mremap(uintptr_t addr, size_t oldsize, size_t newsize, int flags, uintptr_t newaddr)
 {
     user_fd_lock();
     spin_lock(&mmap_lock);
-#ifdef USER_NATIVE_VFORK_POC
     if (!user_exec_reserve(vector_size(user_exec_ranges) + 4)) {
         spin_unlock(&mmap_lock);
         user_fd_unlock();
         return -ENOMEM;
     }
     user_exec_deferred = true;
-#endif
     struct user_exec_move move = ZERO_INIT;
     user_exec_move_prepare(&move, addr, oldsize, newsize);
     rvvm_addr_t ret = errno_ret((uintptr_t)user_vma_remap((void*)addr, oldsize, newsize, flags, (void*)newaddr));
     if (ret < (rvvm_addr_t)-4095) user_exec_move_apply(&move, addr, oldsize, newsize, flags, ret);
-#ifdef USER_NATIVE_VFORK_POC
     user_exec_deferred = false;
     if (user_exec_native_readers && !user_exec_publish()) syscall(SYS_exit_group, 127);
-#endif
     vector_free(move.ranges);
     spin_unlock(&mmap_lock);
     user_fd_unlock();

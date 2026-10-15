@@ -13,7 +13,9 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // Provides entry point to riscv_emulate_insn()
 #include "riscv_compressed.h"
 
-#if defined(RISCV64)
+#if defined(RISCV64) && defined(RISCV_USERLAND)
+#define riscv_run_interpreter func_opt_hot riscv64_user_run_interpreter
+#elif defined(RISCV64)
 #define riscv_run_interpreter func_opt_hot riscv64_run_interpreter
 #elif defined(RISCV32)
 #define riscv_run_interpreter riscv32_run_interpreter

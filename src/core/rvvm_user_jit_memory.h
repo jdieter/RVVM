@@ -2,7 +2,7 @@
 #ifndef RVVM_USER_JIT_MEMORY_H
 #define RVVM_USER_JIT_MEMORY_H
 
-#if defined(__linux__) && defined(USE_JIT) && defined(USER_FAULT_META)
+#if defined(__linux__) && defined(USE_JIT)
 #include <pthread.h>
 
 static void* user_jit_probe_worker(void* opaque)

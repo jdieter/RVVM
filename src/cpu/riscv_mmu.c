@@ -32,7 +32,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 #define RISCV_MMU_DEBUG_ACCESS (RISCV_MMU_READ | RISCV_MMU_EXEC | RISCV_MMU_WRITE)
 
-#ifdef USER_FAULT_META
+#ifdef RVVM_USER_TEST
 bool (*riscv_user_exec_check)(rvvm_addr_t);
 #endif
 
@@ -632,7 +632,7 @@ cold_path void* riscv_mmu_op_internal(rvvm_hart_t* vm, rvvm_addr_t vaddr, void* 
     uint8_t mmu_access = access;
     size_t size = attr >> 16;
 
-#ifdef USER_FAULT_META
+#ifdef RVVM_USER_TEST
     if (vm->userland && access == RISCV_MMU_EXEC && (vaddr & 1)) {
         riscv_mmu_misalign(vm, vaddr, attr);
         return NULL;
@@ -649,21 +649,21 @@ cold_path void* riscv_mmu_op_internal(rvvm_hart_t* vm, rvvm_addr_t vaddr, void* 
          * A host page fault then precedes the store, including across pages. */
         if (access == RISCV_MMU_WRITE) {
             switch (size) {
-                case 1: riscv_guest_store8(ptr, read_uint8(data)); break;
-                case 2: riscv_guest_store16(ptr, read_uint16_le_m(data)); break;
-                case 4: riscv_guest_store32(ptr, read_uint32_le_m(data)); break;
-                case 8: riscv_guest_store64(ptr, read_uint64_le_m(data)); break;
+                case 1: riscv_user_fault_store8(ptr, read_uint8(data)); break;
+                case 2: riscv_user_fault_store16(ptr, read_uint16_le_m(data)); break;
+                case 4: riscv_user_fault_store32(ptr, read_uint32_le_m(data)); break;
+                case 8: riscv_user_fault_store64(ptr, read_uint64_le_m(data)); break;
                 default:
-                    for (size_t i = 0; i < size; ++i) riscv_guest_store8((uint8_t*)ptr + i, ((uint8_t*)data)[i]);
+                    for (size_t i = 0; i < size; ++i) riscv_user_fault_store8((uint8_t*)ptr + i, ((uint8_t*)data)[i]);
             }
         } else {
             switch (size) {
-                case 1: write_uint8(data, riscv_guest_load8(ptr)); break;
-                case 2: write_uint16_le_m(data, riscv_guest_load16(ptr)); break;
-                case 4: write_uint32_le_m(data, riscv_guest_load32(ptr)); break;
-                case 8: write_uint64_le_m(data, riscv_guest_load64(ptr)); break;
+                case 1: write_uint8(data, riscv_user_fault_load8(ptr)); break;
+                case 2: write_uint16_le_m(data, riscv_user_fault_load16(ptr)); break;
+                case 4: write_uint32_le_m(data, riscv_user_fault_load32(ptr)); break;
+                case 8: write_uint64_le_m(data, riscv_user_fault_load64(ptr)); break;
                 default:
-                    for (size_t i = 0; i < size; ++i) ((uint8_t*)data)[i] = riscv_guest_load8((uint8_t*)ptr + i);
+                    for (size_t i = 0; i < size; ++i) ((uint8_t*)data)[i] = riscv_user_fault_load8((uint8_t*)ptr + i);
             }
         }
         riscv_tlb_put(vm, vaddr, ptr, access);

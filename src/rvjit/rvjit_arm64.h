@@ -1316,7 +1316,7 @@ static inline void rvjit_host_cmp_imm(rvjit_block_t* block, uint32_t insn, uint3
 // Emit load/store instruction with signed imm64 offset
 static inline void rvjit_host_loadstore(rvjit_block_t* block, uint32_t insn, uint32_t rd, uint32_t base, int64_t off)
 {
-#ifdef USER_FAULT_META
+#ifdef RVVM_USER_TEST
     bool guest = block->fault_active;
     block->fault_active = false; // Register spills are emulator accesses.
 #endif
@@ -1324,7 +1324,7 @@ static inline void rvjit_host_loadstore(rvjit_block_t* block, uint32_t insn, uin
         // Memory operands interpret register 31 as SP, not XZR.
         regid_t tmp = rvjit_claim_hreg(block);
         rvjit_arm64_load_imm(block, tmp, off);
-#ifdef USER_FAULT_META
+#ifdef RVVM_USER_TEST
         if (guest) rvjit_fault_record(block, 4);
 #endif
         rvjit_arm64_insn_ldst(block, insn, rd, tmp, 0);
@@ -1336,17 +1336,17 @@ static inline void rvjit_host_loadstore(rvjit_block_t* block, uint32_t insn, uin
     uint32_t off_s = off_i << shift;
     if (!(off - off_s)) {
         // Encode scaled positive offset directly into the instruction
-#ifdef USER_FAULT_META
+#ifdef RVVM_USER_TEST
         if (guest) rvjit_fault_record(block, 4);
 #endif
         rvjit_arm64_insn_ldst(block, insn, rd, base, off_i);
     } else if (off >= -256 && off <= 255) {
-#ifdef USER_FAULT_META
+#ifdef RVVM_USER_TEST
         if (guest) rvjit_fault_record(block, 4);
 #endif
         rvjit_arm64_insn_ldst_unscaled(block, rvjit_arm64_ldst_to_unscaled(insn), rd, base, off);
     } else if (rvjit_arm64_ldst_is_load(insn) && !rvjit_arm64_ldst_is_fp(insn)
-#ifdef USER_FAULT_META
+#ifdef RVVM_USER_TEST
                && !guest
 #endif
                && rd != RVJIT_HOST_REG_ZERO) {
@@ -1360,7 +1360,7 @@ static inline void rvjit_host_loadstore(rvjit_block_t* block, uint32_t insn, uin
         // XZR cannot hold an address: ADD/SUB immediate would overwrite SP.
         regid_t tmp = rvjit_claim_hreg(block);
         rvjit_host_addisp(block, tmp, base, off - off_s);
-#ifdef USER_FAULT_META
+#ifdef RVVM_USER_TEST
         if (guest) rvjit_fault_record(block, 4);
 #endif
         rvjit_arm64_insn_ldst(block, insn, rd, tmp, off_i);

@@ -141,7 +141,7 @@ override SRC_USE_TAP_LINUX := $(SRCDIR)/devices/tap_linux.c
 override SRC_USE_NET       := $(SRCDIR)/util/networking.c $(SRCDIR)/devices/tap_user.c
 override SRC_USE_JIT       := $(SRCDIR)/rvjit/rvjit.c $(SRCDIR)/rvjit/rvjit_emit.c
 override SRC_USE_RV32      := $(SRCDIR)/cpu/riscv32_interpreter.c
-override SRC_USE_RV64      := $(SRCDIR)/cpu/riscv64_interpreter.c
+override SRC_USE_RV64      := $(SRCDIR)/cpu/riscv64_interpreter.c $(SRCDIR)/cpu/riscv64_user_interpreter.c
 override SRC_USE_LIBRETRO  := $(SRCDIR)/bindings/libretro/libretro.c
 override SRC_USE_JNI       := $(SRCDIR)/bindings/jni/rvvm_jni.c
 
@@ -182,22 +182,20 @@ override bin_src_rvvm          := $(SRCDIR)/main.c
 override bin_src_rvvm_user     := $(SRCDIR)/rvvm_user_main.c
 override lib_src_rvvm_libretro := $(SRCDIR)/bindings/libretro/libretro.c
 
-# The userland emulator is Linux-only and assumes a 64-bit host address space,
-# build it solely on non-i386 Linux targets
+# The userland emulator is Linux-only. Its guest fault recovery, signal entry
+# and native VFORK need host assembly for arm64 or x86_64: build it there only.
 ifneq (,$(filter linux,$(OS)))
-ifeq (,$(filter i386,$(ARCH)))
+ifneq (,$(filter arm64 x86_64,$(ARCH)))
 override BIN_TARGETS        := $(BIN_TARGETS) rvvm_user
 override CPPFLAGS           := $(CPPFLAGS) -DRVVM_USER_TEST
 override bin_libs_rvvm_user := rvvm
 ifneq (,$(filter -static -static-pie,$(LDFLAGS)))
-ifneq (,$(filter arm64 x86_64,$(ARCH)))
 ifneq (,$(call check_compile,int main(void){_Static_assert(__GLIBC__ == 2 && __GLIBC_MINOR__ >= 34 && __GLIBC_MINOR__ <= 43$(COMMA) "glibc");return 0;},-include features.h,static-glibc-fork-34-43))
 # Keep libc's fork handlers while changing only its kernel creation step.
 # Audited through 2.43 against fork.c/_Fork.c (after 2.39, _Fork gained
 # abort()'s fork lock). Each newer glibc needs this audit first.
 override CPPFLAGS := $(CPPFLAGS) -DRVVM_STATIC_GLIBC_FORK
 override LDFLAGS := $(LDFLAGS) -Wl$(COMMA)--wrap=_Fork
-endif
 endif
 endif
 endif

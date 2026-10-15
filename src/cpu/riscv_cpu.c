@@ -14,6 +14,12 @@ void riscv_run_till_event(rvvm_hart_t* vm)
 {
     if (vm->rv64) {
 #ifdef USE_RV64
+#ifdef RVVM_USER_TEST
+        if (vm->userland) {
+            riscv64_user_run_interpreter(vm);
+            return;
+        }
+#endif
         riscv64_run_interpreter(vm);
 #endif
     } else {

@@ -35,7 +35,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define RISCV_AMO_I64  0x03
 #define RISCV_AMO_I128 0x04
 
-#if defined(USER_FAULT_META) && defined(RISCV64)
+#if defined(RISCV_USERLAND)
 #define USER_AMO(bits) \
 static uint##bits##_t riscv_user_amo##bits(void* ptr, unsigned op, uint##bits##_t val, uint##bits##_t exp) \
 { \
@@ -533,11 +533,9 @@ static forceinline void riscv_emulate_atomic_dwcas(rvvm_hart_t* vm, const uint32
 
 static slow_path func_opt_size void riscv_emulate_a_opc_amo(rvvm_hart_t* vm, const uint32_t insn)
 {
-#if defined(USER_FAULT_META) && defined(RISCV64)
-    if (vm->userland) {
-        riscv_user_atomic(vm, insn);
-        return;
-    }
+#if defined(RISCV_USERLAND)
+    riscv_user_atomic(vm, insn);
+    return;
 #endif
     switch (bit_ext_u32(insn, 12, 3)) {
         case RISCV_AMO_I8: // Zabha

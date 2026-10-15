@@ -532,7 +532,6 @@ static const char* wrap_path(char* buffer, const char* path)
 /* "/proc/<internal pid>[/...]" becomes "/proc/0[/...]": Linux has no PID 0
  * entry, so every path operation fails with its native ENOENT. Reads the
  * guest path fault-safely; returns whether out holds the rewritten path. */
-#ifdef USER_NATIVE_VFORK_POC
 static bool user_internal_task(long pid);
 static unsigned user_exe_local_pid(unsigned pid);
 
@@ -549,10 +548,8 @@ static bool user_proc_foreign(void)
     }
     return cached > 0;
 }
-#endif
 static bool user_internal_proc_path(char* out, const char* path)
 {
-#ifdef USER_NATIVE_VFORK_POC
     static const char prefix[] = "/proc/";
     size_t at = 0;
     for (; prefix[at]; ++at) if (user_peek_byte(path + at) != prefix[at]) return false;
@@ -568,21 +565,15 @@ static bool user_internal_proc_path(char* out, const char* path)
     if (user_path_copy(tail, path + at, sizeof(tail) - 8) < 0) return false;
     snprintf(out, UAPI_PATH_MAX, "/proc/0%s", tail);
     return true;
-#else
-    UNUSED(out); UNUSED(path);
-    return false;
-#endif
 }
 
 #include "user_ptrace/user_ptrace.h"
 #include "user_ptrace/user_ptrace_events.h"
 static uint32_t user_reaper_tid;
 static user_fd_mutex_t user_reaper_lock;
-#ifdef USER_NATIVE_VFORK_POC
 static void user_observer_fork_child(void);
 static void user_observer_release(bool wait);
 static bool user_observer_hidden(pid_t pid, bool reaped);
-#endif
 #include "rvvm_user_signal.h"
 #include "rvvm_user_jit_memory.h"
 #include "rvvm_user_posix.h"
@@ -692,7 +683,6 @@ static void user_fault_handler(int sig, siginfo_t* info, void* ucontext)
         return;
     }
     if (info->si_code > 0 && user_path_fault(ucontext)) return;
-#if defined(USER_FAULT_POC)
     rvvm_hart_t* fault_cpu = user_sig.cpu;
     ucontext_t* uc = ucontext;
 #if defined(__aarch64__)
@@ -700,7 +690,6 @@ static void user_fault_handler(int sig, siginfo_t* info, void* ucontext)
 #else
     uintptr_t host_pc = uc->uc_mcontext.gregs[REG_RIP];
 #endif
-#ifdef USER_FAULT_META
     extern const uintptr_t __start_rvvm_user_access[], __stop_rvvm_user_access[];
     bool jit_fault = false;
 #ifdef USE_JIT
@@ -739,29 +728,17 @@ static void user_fault_handler(int sig, siginfo_t* info, void* ucontext)
 #endif
     if (info->si_code > 0 && user_fault_armed && fault_cpu
         && (fault_cpu->user_fault_interpreted || jit_fault)) {
-#else
-    if (info->si_code > 0 && user_fault_armed && fault_cpu
-        && (fault_cpu->user_fault_interpreted
-#ifdef USE_JIT
-            || (host_pc >= (uintptr_t)fault_cpu->jit.heap.code
-                && host_pc < (uintptr_t)fault_cpu->jit.heap.code + fault_cpu->jit.heap.curr)
-#endif
-            )) {
-#endif
         user_defer_pending();
         user_sig.info = *info;
         user_sig.pending = sig;
         user_sig.synchronous = true;
         user_fault_save_fenv(uc);
         user_fault_armed = 0;
-#ifdef USER_NATIVE_VFORK_POC
         if (user_native_child_active) {
             user_native_jump_restore(user_native_fault_target);
         }
-#endif
         siglongjmp(user_fault_resume, 1);
     }
-#endif
     if (info->si_code <= 0 && user_sig.cpu) {
         user_signal_capture(sig, info, ucontext);
         return;
@@ -876,9 +853,7 @@ static void* user_thread_reaper(void* unused)
         sleep_ms(1);
     }
 }
-#ifdef USER_FAULT_META
 #include "rvvm_user_memory.h"
-#endif
 #ifdef __linux__
 static struct uapi_brk_heap brk_heap;
 
@@ -943,12 +918,7 @@ static void* rvvm_sys_brk(void* addr)
 
 static rvvm_hart_t* user_clone_cpu_mode(rvvm_hart_t* parent, bool interpreter)
 {
-#ifdef USER_NATIVE_VFORK_POC
     rvvm_hart_t* cpu = interpreter ? rvvm_create_user_thread_interpreter(userland) : rvvm_create_user_thread(userland);
-#else
-    UNUSED(interpreter);
-    rvvm_hart_t* cpu = rvvm_create_user_thread(userland);
-#endif
     if (!cpu) return NULL;
     for (size_t i = 1; i < 32; ++i)
         rvvm_write_cpu_reg(cpu, RVVM_REGID_X0 + i, rvvm_read_cpu_reg(parent, RVVM_REGID_X0 + i));
@@ -1153,10 +1123,8 @@ static int rvvm_sys_clone_impl(rvvm_user_thread_t* current, uint32_t flags, size
             if (initial_table != source_table) user_fd_table_fork_discard(initial_table);
             rvvm_user_fork_child(cpu);
             user_ptrace_fork(cpu);
-#ifdef USER_NATIVE_VFORK_POC
             user_exec_fork_child();
             user_observer_fork_child();
-#endif
             user_exe_process_link_init(false);
         }
         rvvm_user_fork_unlock();
@@ -1238,20 +1206,13 @@ static int rvvm_sys_clone(rvvm_user_thread_t* current, uint32_t flags, size_t st
 }
 
 #include "user_ptrace/user_ptrace_restart.h"
-#ifdef USER_NATIVE_VFORK_POC
 static bool user_kernel_dispatch(rvvm_hart_t*, long, long[6], long*);
 #include "rvvm_user_native_vfork.h"
-#endif
 
 static int rvvm_sys_vfork(rvvm_user_thread_t* current, uint32_t flags, size_t stack,
                           uint32_t* parent_tid, size_t tls, uint32_t* child_tid)
 {
-#ifdef USER_NATIVE_VFORK_POC
     return user_native_vfork(current, flags, stack, parent_tid, tls, child_tid);
-#else
-    UNUSED(current); UNUSED(flags); UNUSED(stack); UNUSED(parent_tid); UNUSED(tls); UNUSED(child_tid);
-    return -ENOSYS;
-#endif
 }
 
 #define UAPI_FUTEX_CMD_MASK    0x3F
@@ -1288,7 +1249,6 @@ static int rvvm_sys_futex(uint32_t* addr, int futex_op, uint32_t val, size_t val
 #endif
 }
 
-#ifdef USER_NATIVE_VFORK_POC
 /* An entry of a proc root as getpid() numbers it; a foreign proc (from an
  * ancestor PID namespace) lists NSpid last in each status. */
 static unsigned user_proc_entry_local(int dirfd, unsigned pid)
@@ -1311,7 +1271,6 @@ static unsigned user_proc_entry_local(int dirfd, unsigned pid)
     }
     return local;
 }
-#endif
 
 static int64_t rvvm_sys_getdents64(int fd, void* dirp, size_t size)
 {
@@ -1323,7 +1282,6 @@ static int64_t rvvm_sys_getdents64(int fd, void* dirp, size_t size)
     if (n >= 0) path[n] = 0;
     bool task_list = n >= 0 && sscanf(path, "/proc/%u/task%n", &pid, &end) == 1 && end && !path[end];
     bool proc_root = false;
-#ifdef USER_NATIVE_VFORK_POC
     /* The proc root lists internal tasks. Identify it by name and inode 1
      * without statfs, which a FUSE server would see. */
     struct stat st;
@@ -1336,7 +1294,6 @@ static int64_t rvvm_sys_getdents64(int fd, void* dirp, size_t size)
         if (length > 0) self[length] = 0;
         foreign = length > 0 && strtoul(self, NULL, 10) != (unsigned long)getpid();
     }
-#endif
     if (task_list || proc_root) {
         char buffer[4096];
         user_fd_lock();
@@ -1350,13 +1307,9 @@ static int64_t rvvm_sys_getdents64(int fd, void* dirp, size_t size)
                 struct uapi_linux_dirent64* entry = (void*)(buffer + pos);
                 bool recognized = false;
                 unsigned tid = strtoul(entry->d_name, NULL, 10);
-#ifdef USER_NATIVE_VFORK_POC
                 if (proc_root) recognized = tid && user_internal_task(foreign ? user_proc_entry_local(fd, tid) : tid);
                 bool visible = proc_root ? !recognized
                     : !tid || user_ptrace_guest_task(pid, tid, &recognized);
-#else
-                bool visible = !tid || user_ptrace_guest_task(pid, tid, &recognized);
-#endif
                 if (visible || !recognized) {
                     memmove(buffer + kept, entry, entry->d_reclen);
                     kept += entry->d_reclen;
@@ -1411,9 +1364,7 @@ static inline int rvvm_sys_prot(int prot)
      * guest execution permissions after an interrupted mapping transaction. */
     if (prot & UAPI_PROT_EXEC) {
         ret |= PROT_READ;
-#ifdef USER_NATIVE_VFORK_POC
         ret |= PROT_EXEC;
-#endif
     }
     ret |= prot & (PROT_GROWSDOWN | PROT_GROWSUP);
     return ret;
@@ -1431,13 +1382,11 @@ static rvvm_addr_t rvvm_sys_mmap(void* addr, size_t size, int prot, int flags, i
 
     user_fd_lock();
     spin_lock(&mmap_lock);
-#ifdef USER_NATIVE_VFORK_POC
     if (!user_exec_reserve(2)) {
         spin_unlock(&mmap_lock);
         user_fd_unlock();
         return -ENOMEM;
     }
-#endif
 #ifdef __linux__
     mmap_flags = flags & ~UAPI_MAP_HOST_UNSAFE;
 #else
@@ -1465,12 +1414,10 @@ static rvvm_addr_t rvvm_sys_mmap(void* addr, size_t size, int prot, int flags, i
 #else
     rvvm_addr_t ret = errno_ret((size_t)mmap(addr, size, rvvm_sys_prot(prot), mmap_flags, fd, offset));
 #endif
-#ifdef USER_FAULT_META
     if (ret < (rvvm_addr_t)-4095) {
         size_t page = user_vma_map_page(mmap_flags);
         user_exec_update(ret, (size + page - 1) & ~(page - 1), prot & UAPI_PROT_EXEC);
     }
-#endif
     spin_unlock(&mmap_lock);
     user_fd_unlock();
     return ret;
@@ -1479,17 +1426,13 @@ static rvvm_addr_t rvvm_sys_mmap(void* addr, size_t size, int prot, int flags, i
 static int rvvm_sys_munmap(void* addr, size_t size)
 {
     spin_lock(&mmap_lock);
-#ifdef USER_NATIVE_VFORK_POC
     if (!user_exec_reserve(2)) { spin_unlock(&mmap_lock); return -ENOMEM; }
-#endif
 #ifdef __linux__
     rvvm_addr_t ret = errno_ret(user_vma_unmap(addr, size));
 #else
     rvvm_addr_t ret = errno_ret(munmap(addr, size));
 #endif
-#ifdef USER_FAULT_META
     if (!ret) user_exec_update((uintptr_t)addr, size, false);
-#endif
     spin_unlock(&mmap_lock);
     return ret;
 }
@@ -1691,7 +1634,6 @@ static void* rvvm_user_thread_wrap(void* arg)
         user_ptrace_pending_signal(cpu);
         user_signal_deliver(cpu);
         rvvm_addr_t cause;
-#ifdef USER_FAULT_POC
         // The guest delivery path restores the host mask after building the frame.
         if (sigsetjmp(user_fault_resume, 0)) {
             user_fault_armed = 0;
@@ -1709,11 +1651,8 @@ static void* rvvm_user_thread_wrap(void* arg)
             continue;
         }
         user_fault_armed = 1;
-#endif
         cause = user_ptrace_run(cpu);
-#ifdef USER_FAULT_POC
         user_fault_armed = 0;
-#endif
         if (cause == (rvvm_addr_t)-1) continue;
         if (cause == 8) {
             user_ptrace_dispatch();
@@ -1761,7 +1700,6 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
 #ifdef __linux__
                 case 97: // unshare
-#ifdef USER_NATIVE_VFORK_POC
                     /* A user namespace needs a single-threaded caller, and
                      * the VFORK workers prepared for a new PID namespace are
                      * threads: enter the user namespace first. If the PID
@@ -1774,13 +1712,10 @@ static void* rvvm_user_thread_wrap(void* arg)
                         break;
                     }
                     user_observer_namespace(a0);
-#endif
                     a0 = user_fd_unshare(a0);
                     break;
                 case 281: // execveat: the kernel handles ELF/script dispatch through binfmt
-#ifdef USER_NATIVE_VFORK_POC
                     user_observer_release(true);
-#endif
                     a0 = user_binfmt_executable || getenv("RVVM_USER_BINFMT")
                        ? user_execveat(a0, to_str(a1), to_ptr(a2), to_ptr(a3),
                            uapi_translate_flags(a4, uapi_path_flags, STATIC_ARRAY_SIZE(uapi_path_flags), true))
@@ -1841,9 +1776,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 case 94: // exit_group
                     user_ptrace_exit(cpu);
-#ifdef USER_NATIVE_VFORK_POC
                     user_observer_release(false);
-#endif
                     _Exit(a0);
                     break;
                 case 96: // set_tid_address
@@ -1878,13 +1811,7 @@ static void* rvvm_user_thread_wrap(void* arg)
 #ifdef __linux__
                 case 216: // mremap
                     rvvm_info("sys_mremap(%lx, %lx, %lx, %lx, %lx)", a0, a1, a2, a3, a4);
-#ifdef USER_FAULT_META
                     a0 = user_mremap(a0, a1, a2, a3, a4);
-#else
-                    user_fd_lock();
-                    a0 = errno_ret((size_t)user_vma_remap(to_ptr(a0), a1, a2, a3, to_ptr(a4)));
-                    user_fd_unlock();
-#endif
                     break;
 #endif
                 case 220: // clone
@@ -1898,9 +1825,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 case 221: { // execve
                     rvvm_info("sys_execve(%lx, %lx, %lx)", a0, a1, a2);
-#ifdef USER_NATIVE_VFORK_POC
                     user_observer_release(true);
-#endif
                     /* With binfmt registered, the kernel handles scripts and
                      * redispatches RISC-V ELF files to this interpreter. */
                     if (user_binfmt_executable || getenv("RVVM_USER_BINFMT")) {
@@ -1915,16 +1840,13 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 case 226: // mprotect
                     rvvm_info("sys_mprotect(%lx, %lx, %x)", a0, a1, a2);
-#ifdef USER_FAULT_META
                     user_fd_lock();
                     spin_lock(&mmap_lock);
                     {
                         uintptr_t start = a0;
                         size_t size = a1;
                         rvvm_addr_t ret;
-#ifdef USER_NATIVE_VFORK_POC
                         if (!user_exec_reserve(2)) ret = -ENOMEM; else
-#endif
                         if (a2 & ~UAPI_PROT_VALID) ret = -EINVAL;
                         else if (user_vma_protect_span(&start, &size, a2)) ret = last_errno();
                         else {
@@ -1937,9 +1859,6 @@ static void* rvvm_user_thread_wrap(void* arg)
                     }
                     spin_unlock(&mmap_lock);
                     user_fd_unlock();
-#else
-                    a0 = errno_ret(mprotect(to_ptr(a0), a1, a2));
-#endif
                     break;
 #ifdef __linux__
                 case 233: // madvise
@@ -2022,7 +1941,6 @@ static void* rvvm_user_thread_wrap(void* arg)
         } else {
             if (cause == 3 && user_ptrace_break(cpu)) continue;
             // Boom!
-#ifdef USER_FAULT_META
             int signo = 0, code = 0;
             uintptr_t addr = rvvm_read_cpu_reg(cpu, RVVM_REGID_TVAL);
             switch (cause) {
@@ -2048,7 +1966,6 @@ static void* rvvm_user_thread_wrap(void* arg)
                 riscv_jit_discard(cpu);
                 continue;
             }
-#endif
             rvvm_warn("Exception %lx (tval %lx) at PC %lx, SP %lx",
                       rvvm_read_cpu_reg(cpu, RVVM_REGID_CAUSE),
                       rvvm_read_cpu_reg(cpu, RVVM_REGID_TVAL),
@@ -2153,7 +2070,7 @@ static void jump_start(void* entry, void* stack_top)
     );
 #else
     userland = rvvm_create_userland("rv64");
-#if defined(__linux__) && defined(USE_JIT) && defined(USER_FAULT_META)
+#if defined(__linux__) && defined(USE_JIT)
     userland->user_memory_probe = user_jit_memory_probe;
 #endif
     rvvm_user_thread_t* thread = safe_new_obj(rvvm_user_thread_t);
@@ -2420,11 +2337,9 @@ RVVM_PUBLIC int rvvm_user_linux(int argc, char** argv, char** envp)
         envp = environ;
     }
 
-#ifdef USER_FAULT_META
     user_exec_elf(&elf);
     user_exec_elf(&interp);
     riscv_user_exec_check = user_exec_check;
-#endif
 
     if (prefix_path && (!getcwd(path_buf, sizeof(path_buf)) || !path_wrapped(path_buf))) {
         if (chdir(prefix_path)) {
@@ -2460,10 +2375,8 @@ RVVM_PUBLIC int rvvm_user_linux(int argc, char** argv, char** envp)
         munmap(stack_mapping, STACK_SIZE + 2 * stack_guard);
         return -1;
     }
-#ifdef USER_FAULT_META
     if (user_exec_stack(&elf)) user_exec_protect(stack_buffer, STACK_SIZE, PROT_READ | PROT_WRITE, true);
     user_exec_update((uintptr_t)stack_buffer, STACK_SIZE, user_exec_stack(&elf));
-#endif
     free(elf.phdr_data);
     free(interp.phdr_data);
     void* stack_top = rvvm_user_init_stack(stack_buffer + STACK_SIZE, &desc);

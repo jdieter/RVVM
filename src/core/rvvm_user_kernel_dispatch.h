@@ -18,14 +18,11 @@ _Static_assert(sizeof(struct pollfd) == 8 && offsetof(struct pollfd, events) == 
  * through their worker. Lifecycle and mapping publication stay with callers. */
 static void user_wait_reaped(pid_t pid)
 {
-#ifdef USER_NATIVE_VFORK_POC
     /* A shared-mm child has no ordinary-fork cache of its own. */
     if (user_native_child_active) return;
-#endif
     user_fork_cache_reaped(pid);
 }
 
-#ifdef USER_NATIVE_VFORK_POC
 /* An init or subreaper guest's __WALL/__WCLONE waits for any child would
  * also select its direct observer: Linux can't exclude one child. Poll
  * with WNOHANG instead, report ECHILD once only internal tasks remain, and
@@ -46,18 +43,13 @@ static long user_wait_internal(struct user_observer* direct, bool nohang, unsign
     if (!user_observer_others(direct)) return -ECHILD;
     return nohang ? 0 : user_wait_backoff(delay);
 }
-#endif
 
 static long user_wait4(long a[6])
 {
     long ret, queued;
     bool started = false;
-#ifdef USER_NATIVE_VFORK_POC
     struct user_observer* direct = a[0] == -1 && (a[2] & (__WALL | __WCLONE)) ? user_observer_direct() : NULL;
     unsigned delay = 1;
-#else
-    const bool direct = false;
-#endif
     do {
         bool poll = user_ptrace_events_tracing() && !(a[2] & WNOHANG);
         uint32_t generation = poll ? user_ptrace_events_generation() : 0;
@@ -66,7 +58,6 @@ static long user_wait4(long a[6])
         if (user_ptrace_wait_ready(a[0], status, a[2], (void*)a[3], &queued)) return queued;
         ret = (long)errno_ret(USER_SYSCALL(SYS_wait4, a[0], status,
             a[2] | (poll || direct ? WNOHANG : 0), a[3], 0, 0));
-#ifdef USER_NATIVE_VFORK_POC
         if (user_observer_hidden(ret, ret > 0 && (WIFEXITED(*status) || WIFSIGNALED(*status)))) {
             ret = USER_PTRACE_WAIT_AGAIN;
             continue;
@@ -76,7 +67,6 @@ static long user_wait4(long a[6])
             ret = user_wait_internal(direct, a[2] & WNOHANG, &delay);
             if (ret == USER_PTRACE_WAIT_AGAIN) continue;
         }
-#endif
         if (ret > 0 && (WIFEXITED(*status) || WIFSIGNALED(*status))) user_wait_reaped(ret);
         if (started && ret == -EINTR) user_sig.syscall_unstarted = false;
         if (poll && !ret) {
@@ -93,12 +83,8 @@ static long user_waitid(long a[6])
 {
     long ret, queued;
     bool started = false;
-#ifdef USER_NATIVE_VFORK_POC
     struct user_observer* direct = a[0] == P_ALL && (a[3] & (__WALL | __WCLONE)) ? user_observer_direct() : NULL;
     unsigned delay = 1;
-#else
-    const bool direct = false;
-#endif
     do {
         bool poll = !(a[3] & WNOHANG) && (user_ptrace_events_tracing()
             || (a[3] & (WNOWAIT | WSTOPPED)) == (WNOWAIT | WSTOPPED));
@@ -110,7 +96,6 @@ static long user_waitid(long a[6])
         siginfo_t* native = poll ? &scratch : caller;
         ret = (long)errno_ret(USER_SYSCALL(SYS_waitid, (int)a[0], (unsigned)a[1],
             native, (int)a[3] | (poll || direct ? WNOHANG : 0), a[4], 0));
-#ifdef USER_NATIVE_VFORK_POC
         if (!ret && user_observer_hidden(native->si_pid, !(a[3] & WNOWAIT)
                 && (native->si_code == CLD_EXITED || native->si_code == CLD_KILLED
                     || native->si_code == CLD_DUMPED))) {
@@ -122,7 +107,6 @@ static long user_waitid(long a[6])
             ret = user_wait_internal(direct, a[3] & WNOHANG, &delay);
             if (ret == USER_PTRACE_WAIT_AGAIN) continue;
         }
-#endif
         if (!ret && native->si_pid && !(a[3] & WNOWAIT)
             && (native->si_code == CLD_EXITED || native->si_code == CLD_KILLED
                 || native->si_code == CLD_DUMPED)) user_wait_reaped(native->si_pid);
@@ -138,7 +122,6 @@ static long user_waitid(long a[6])
     return ret;
 }
 
-#ifdef USER_NATIVE_VFORK_POC
 /* Provision the observer before this process lowers its own NOFILE limit. */
 static void user_observer_limit(pid_t pid, long resource, void* limit)
 {
@@ -147,9 +130,7 @@ static void user_observer_limit(pid_t pid, long resource, void* limit)
         || uapi_extra_copy(&next, limit, sizeof(next), false)) return;
     user_observer_provision(next.rlim_cur, next.rlim_max);
 }
-#endif
 
-#ifdef USER_NATIVE_VFORK_POC
 /* A guest call naming one of RVVM's internal tasks, or the process group
  * each leads after setsid, finds no such process or child. */
 static long user_internal_target(long nr, const long* a)
@@ -174,15 +155,12 @@ static long user_internal_target(long nr, const long* a)
     }
     return user_internal_task(pid) || user_internal_task(thread) ? -ESRCH : 0;
 }
-#endif
 
 static bool user_kernel_dispatch(rvvm_hart_t* cpu, long nr, long a[6], long* result)
 {
     long host;
-#ifdef USER_NATIVE_VFORK_POC
     long hidden = user_internal_target(nr, a);
     if (hidden) { *result = hidden; return true; }
-#endif
     switch (nr) {
         case 95: *result = user_waitid(a); return true;
         case 117: *result = user_ptrace_request(a[0], a[1], a[2], a[3]); return true;
@@ -193,14 +171,12 @@ static bool user_kernel_dispatch(rvvm_hart_t* cpu, long nr, long a[6], long* res
         case 225: *result = user_host_path_call(SYS_swapoff, a[0], 0, 0, 0, 0); return true;
         case 41: *result = user_host_path_call(SYS_pivot_root, a[0], a[1], 0, 0, 0); return true;
         case 268:
-#ifdef USER_NATIVE_VFORK_POC
             /* Prepare only for a PID namespace: the workers are threads, and
              * entering a user namespace needs a single-threaded caller. */
             if (!(a[1] & CLONE_NEWUSER)) {
                 long type = a[1] ? a[1] : (long)ioctl((int)a[0], 0xb703 /* NS_GET_NSTYPE */);
                 if (type > 0 && (type & CLONE_NEWPID)) user_observer_namespace(CLONE_NEWPID);
             }
-#endif
             *result = user_host_fd_call(SYS_setns, a[0], a[1], 0); return true;
         case 428: *result = user_host_path_call(SYS_open_tree, a[0], a[1], a[2], 0, 0); return true;
         case 429: *result = user_host_path_call(SYS_move_mount, a[0], a[1], a[2], a[3], a[4]); return true;
@@ -363,9 +339,7 @@ static bool user_kernel_dispatch(rvvm_hart_t* cpu, long nr, long a[6], long* res
             host = nr == 176 ? SYS_getgid : SYS_getegid; break;
         case 163: *result = (long)errno_ret(USER_SYSCALL(SYS_prlimit64, 0, a[0], 0, a[1], 0, 0)); return true;
         case 164:
-#ifdef USER_NATIVE_VFORK_POC
             user_observer_limit(0, a[0], (void*)a[1]);
-#endif
             *result = (long)errno_ret(USER_SYSCALL(SYS_prlimit64, 0, a[0], a[1], 0, 0, 0)); return true;
         case 167: *result = uapi_extra_prctl(a[0], a[1], a[2], a[3], a[4]); return true;
         case 272: case 438: *result = -ENOSYS; return true;
@@ -512,9 +486,7 @@ static bool user_kernel_dispatch(rvvm_hart_t* cpu, long nr, long a[6], long* res
             *result = -ENOSYS; return true;
 #endif
         case 261:
-#ifdef USER_NATIVE_VFORK_POC
             user_observer_limit(a[0], a[1], (void*)a[2]);
-#endif
             host = SYS_prlimit64; break;
         case 266: host = SYS_clock_adjtime; break;
         case 267: host = SYS_syncfs; break;

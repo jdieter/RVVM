@@ -14,8 +14,12 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include <util/mem_ops.h>
 
 #include <cpu/riscv_csr.h>
-#ifdef USER_FAULT_META
+#ifdef RVVM_USER_TEST
 #include "riscv_user_access.h"
+#endif
+/* The userland interpreter, compiled with RISCV_USERLAND, marks each guest
+ * TLB access as a recoverable host fault site. Others use plain accesses. */
+#ifdef RISCV_USERLAND
 #define riscv_guest_load8 riscv_user_fault_load8
 #define riscv_guest_load16 riscv_user_fault_load16
 #define riscv_guest_load32 riscv_user_fault_load32
@@ -58,7 +62,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define RISCV_PAGE_SIZE    0x1000
 #define RISCV_PAGE_PNMASK  (~0xFFFULL)
 
-#ifdef USER_FAULT_META
+#ifdef RVVM_USER_TEST
 extern bool (*riscv_user_exec_check)(rvvm_addr_t);
 #endif
 
@@ -152,7 +156,7 @@ static forceinline void riscv_rmw_mmio_commit(rvvm_hart_t* vm, rvvm_addr_t vaddr
 
 static forceinline bool riscv_fetch_insn(rvvm_hart_t* vm, rvvm_addr_t vaddr, uint32_t* insn)
 {
-#ifdef USER_FAULT_META
+#ifdef RISCV_USERLAND
     if (unlikely(vaddr & 1)) {
         riscv_mmu_op_helper(vm, vaddr, NULL, 0, 0, RISCV_MMU_EXEC);
         return false;
@@ -230,19 +234,10 @@ static forceinline void riscv_load_u64(rvvm_hart_t* vm, rvvm_addr_t vaddr, regid
     const rvvm_addr_t       vpn   = vaddr >> RISCV_PAGE_SHIFT;
     const rvvm_tlb_entry_t* entry = &vm->tlb[vpn & RVVM_TLB_MASK];
     if (likely(entry->r == vpn && !(vaddr & 7))) {
-#ifdef USER_FAULT_META
+#ifdef RISCV_USERLAND
         vm->registers[reg] = riscv_user_fault_load64((const void*)(size_t)(entry->ptr + vaddr));
 #else
-#ifdef USER_FAULT_POC
-        vm->user_fault_pc = vm->registers[RISCV_REG_PC];
-        vm->user_fault_interpreted = 1;
-        __asm__ __volatile__("" ::: "memory");
-#endif
         vm->registers[reg] = read_uint64_le((const void*)(size_t)(entry->ptr + vaddr));
-#ifdef USER_FAULT_POC
-        __asm__ __volatile__("" ::: "memory");
-        vm->user_fault_interpreted = 0;
-#endif
 #endif
     } else {
         uint64_t tmp;
@@ -343,19 +338,10 @@ static forceinline void riscv_store_u64(rvvm_hart_t* vm, rvvm_addr_t vaddr, regi
     const rvvm_addr_t       vpn   = vaddr >> RISCV_PAGE_SHIFT;
     const rvvm_tlb_entry_t* entry = &vm->tlb[vpn & RVVM_TLB_MASK];
     if (likely(entry->w == vpn && !(vaddr & 7))) {
-#ifdef USER_FAULT_META
+#ifdef RISCV_USERLAND
         riscv_user_fault_store64((void*)(size_t)(entry->ptr + vaddr), vm->registers[reg]);
 #else
-#ifdef USER_FAULT_POC
-        vm->user_fault_pc = vm->registers[RISCV_REG_PC];
-        vm->user_fault_interpreted = 1;
-        __asm__ __volatile__("" ::: "memory");
-#endif
         write_uint64_le((void*)(size_t)(entry->ptr + vaddr), vm->registers[reg]);
-#ifdef USER_FAULT_POC
-        __asm__ __volatile__("" ::: "memory");
-        vm->user_fault_interpreted = 0;
-#endif
 #endif
     } else {
         uint64_t tmp;

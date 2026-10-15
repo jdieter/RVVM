@@ -293,9 +293,9 @@ TSAN_SUPPRESS static forceinline void riscv_cbo_zero(rvvm_hart_t* vm, rvvm_addr_
     // ThreadSanitizer doesn't recognize fences between non-atomic memset and AMO
     void* ptr = riscv_rmw_translate(vm, vaddr & ~63ULL, NULL, 64);
     if (ptr) {
-#ifdef USER_FAULT_META
+#ifdef RVVM_USER_TEST
         if (vm->userland) {
-            for (unsigned i = 0; i < 64; i += 8) riscv_guest_store64((uint8_t*)ptr + i, 0);
+            for (unsigned i = 0; i < 64; i += 8) riscv_user_fault_store64((uint8_t*)ptr + i, 0);
             return;
         }
 #endif

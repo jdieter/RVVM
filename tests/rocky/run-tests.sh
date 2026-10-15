@@ -15,15 +15,15 @@ for name in test-exe-fd test-fd-lock test-fd-limits test-fork-cache test-process
         -ldl -lm -o "$build/$name"
     timeout 20 "$build/$name"
 done
-"$cc" "${flags[@]}" -DUSE_JIT -DUSER_FAULT_META -Wl,--wrap=realloc -Wl,--wrap=calloc \
+"$cc" "${flags[@]}" -DUSE_JIT -Wl,--wrap=realloc -Wl,--wrap=calloc \
     "$root/tests/rocky/test-jit-oom.c" "$root"/src/rvjit/*.c "$root"/src/util/*.c \
     -ldl -lm -o "$build/test-jit-oom"
 timeout 20 "$build/test-jit-oom"
-"$cc" "${flags[@]}" -DUSE_JIT -DUSER_FAULT_META \
+"$cc" "${flags[@]}" -DUSE_JIT \
     "$root/tests/rocky/test-jit-pressure.c" "$root"/src/rvjit/*.c "$root"/src/util/*.c \
     -ldl -lm -o "$build/test-jit-pressure"
 timeout 20 "$build/test-jit-pressure"
-"$cc" "${flags[@]}" -DUSE_JIT -DUSER_FAULT_META \
+"$cc" "${flags[@]}" -DUSE_JIT \
     "$root/tests/rocky/test-jit-memory-probe.c" "$root"/src/util/*.c \
     -ldl -lm -o "$build/test-jit-memory-probe"
 timeout 20 "$build/test-jit-memory-probe"

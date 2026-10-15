@@ -1341,7 +1341,7 @@ PUBLIC void rvvm_flush_icache(rvvm_machine_t* machine, rvvm_addr_t addr, size_t 
     if (likely(machine)) {
         scoped_spin_lock (&global_lock) {
             vector_foreach (machine->harts, i) {
-#ifdef USER_FAULT_META
+#ifdef RVVM_USER_TEST
                 rvvm_hart_t* hart = vector_at(machine->harts, i);
                 if (hart->userland) {
                     atomic_or_uint32(&hart->user_cache_flush, 1);
@@ -1373,7 +1373,7 @@ void rvvm_user_fork_child(rvvm_hart_t* thread)
     vector_push_back(thread->machine->harts, thread);
 }
 
-#if defined(RVVM_USER_TEST) && defined(__linux__) && defined(USE_JIT) && defined(USER_FAULT_META)
+#if defined(RVVM_USER_TEST) && defined(__linux__) && defined(USE_JIT)
 static __thread uint64_t user_jit_signal_mask;
 
 static void user_jit_block_signals(uint64_t* old)
@@ -1474,7 +1474,7 @@ static void user_jit_prepare(rvvm_hart_t* hart)
 
 void rvvm_user_jit_pressure(rvvm_hart_t* hart)
 {
-#if defined(RVVM_USER_TEST) && defined(__linux__) && defined(USE_JIT) && defined(USER_FAULT_META)
+#if defined(RVVM_USER_TEST) && defined(__linux__) && defined(USE_JIT)
     struct rlimit limit;
     if (!rvvm_get_opt(hart->machine, RVVM_OPT_JIT)) return;
     if (getrlimit(RLIMIT_AS, &limit)) return;
@@ -1502,7 +1502,7 @@ void rvvm_user_jit_pressure(rvvm_hart_t* hart)
 
 void rvvm_user_jit_reclaim(rvvm_hart_t* hart)
 {
-#if defined(RVVM_USER_TEST) && defined(__linux__) && defined(USE_JIT) && defined(USER_FAULT_META)
+#if defined(RVVM_USER_TEST) && defined(__linux__) && defined(USE_JIT)
     uint64_t old;
     if (hart->machine->user_jit_enter) hart->machine->user_jit_enter();
     user_jit_block_signals(&old);
@@ -1525,7 +1525,9 @@ static rvvm_hart_t* user_thread_create(rvvm_machine_t* machine, bool interpreter
     if (likely(machine)) {
         rvvm_hart_t* thread = riscv_hart_init(machine);
         if (!thread) return NULL;
-#ifdef USER_NATIVE_VFORK_POC
+        // Before its first run, a traced thread may single-step.
+        thread->userland = true;
+#ifdef RVVM_USER_TEST
         thread->user_native_interpreter = interpreter;
 #endif
 
@@ -1567,7 +1569,7 @@ static rvvm_hart_t* user_thread_create(rvvm_machine_t* machine, bool interpreter
             }
 #endif
             if (prepare) {
-#if defined(RVVM_USER_TEST) && defined(__linux__) && defined(USE_JIT) && defined(USER_FAULT_META)
+#if defined(RVVM_USER_TEST) && defined(__linux__) && defined(USE_JIT)
                 user_jit_prepare(thread);
 #else
                 riscv_hart_prepare(thread);
@@ -1607,7 +1609,7 @@ PUBLIC rvvm_hart_t* rvvm_create_user_thread(rvvm_machine_t* machine)
     return user_thread_create(machine, false);
 }
 
-#ifdef USER_NATIVE_VFORK_POC
+#ifdef RVVM_USER_TEST
 rvvm_hart_t* rvvm_create_user_thread_interpreter(rvvm_machine_t* machine)
 {
     return user_thread_create(machine, true);

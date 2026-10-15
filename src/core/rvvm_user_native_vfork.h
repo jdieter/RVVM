@@ -1022,7 +1022,6 @@ static int user_native_child(void* opaque)
     /* Do not let inherited native robust-list cleanup traverse parent locks. */
     user_native_raw(SYS_set_robust_list, 0, 24, 0, 0, 0, 0);
     for (;;) {
-#ifdef USER_FAULT_POC
         if (user_native_jump_save(&request->fault_jump)) {
             user_fault_armed = 0;
             user_fault_restore_fenv();
@@ -1031,17 +1030,12 @@ static int user_native_child(void* opaque)
             rvvm_write_cpu_reg(cpu, RVVM_REGID_PC, cpu->user_fault_pc);
             user_fault_address(cpu);
         }
-#endif
         user_ptrace_checkpoint(cpu);
         user_ptrace_pending_signal(cpu);
         user_signal_deliver(cpu);
-#ifdef USER_FAULT_POC
         user_fault_armed = 1;
-#endif
         rvvm_addr_t cause = user_ptrace_run(cpu);
-#ifdef USER_FAULT_POC
         user_fault_armed = 0;
-#endif
         if (cause == (rvvm_addr_t)-1 && !atomic_load_uint32(&cpu->user_signal_pending)) continue;
         if (cause == (rvvm_addr_t)-1) continue;
         if (cause != 8) {
@@ -1200,14 +1194,12 @@ static long user_native_vfork_issue(struct user_native_vfork* request)
     uint_fast8_t saved_rounding = softfloat_roundingMode;
     uint_fast8_t saved_tininess = softfloat_detectTininess;
     uint_fast8_t saved_exceptions = softfloat_exceptionFlags;
-#ifdef USER_FAULT_POC
     sigjmp_buf saved_fault;
     memcpy(saved_fault, user_fault_resume, sizeof(saved_fault));
     sig_atomic_t saved_armed = user_fault_armed;
     uint32_t saved_control = user_fault_fp_control;
 #if defined(__aarch64__)
     uint32_t saved_status = user_fault_fp_status;
-#endif
 #endif
     int saved_errno = errno;
     uintptr_t* packet = (void*)((char*)request->native_stack + USER_NATIVE_STACK_SIZE - 2 * sizeof(uintptr_t));
@@ -1253,13 +1245,11 @@ static long user_native_vfork_issue(struct user_native_vfork* request)
     softfloat_roundingMode = saved_rounding;
     softfloat_detectTininess = saved_tininess;
     softfloat_exceptionFlags = saved_exceptions;
-#ifdef USER_FAULT_POC
     memcpy(user_fault_resume, saved_fault, sizeof(saved_fault));
     user_fault_armed = saved_armed;
     user_fault_fp_control = saved_control;
 #if defined(__aarch64__)
     user_fault_fp_status = saved_status;
-#endif
 #endif
     user_native_exec_reader = saved_reader;
     errno = saved_errno;

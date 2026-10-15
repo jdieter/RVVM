@@ -24,20 +24,11 @@ static THREAD_LOCAL unsigned depth;
 static THREAD_LOCAL uint32_t owner_tid;
 static THREAD_LOCAL uint32_t owner_marker;
 static THREAD_LOCAL void (*resume_table)(void);
-#ifndef USER_NATIVE_VFORK_POC
-struct user_fd_registration {
-    user_fd_mutex_t* lock;
-    struct robust_list_head* head;
-    struct robust_list* node;
-    struct robust_list* next;
-};
-#endif
 static THREAD_LOCAL struct user_fd_registration registrations[8];
 static THREAD_LOCAL unsigned registration_count;
 static bool user_fd_register(user_fd_mutex_t* lock);
 static void user_fd_owner_init(void);
 
-#ifdef USER_NATIVE_VFORK_POC
 void user_fd_context_save(user_fd_context_t* context)
 {
     context->selected = selected_guard;
@@ -59,7 +50,6 @@ void user_fd_context_load(const user_fd_context_t* context)
     memcpy(registrations, context->registrations, sizeof(registrations));
     registration_count = context->registration_count;
 }
-#endif
 
 bool user_fd_mutex_share(user_fd_mutex_t* lock)
 {

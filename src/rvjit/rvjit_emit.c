@@ -43,7 +43,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 void rvjit_emit_init(rvjit_block_t* block)
 {
-#ifdef USER_FAULT_META
+#ifdef RVVM_USER_TEST
     memset(block->fault_regs, REG_ILL, sizeof(block->fault_regs));
 #endif
     block->hreg_mask       = rvjit_native_default_hregmask();
@@ -94,7 +94,7 @@ static void rvjit_free_reg(rvjit_block_t* block, regid_t reg)
     if (block->regs[reg].hreg != REG_ILL) {
         rvjit_save_reg(block, reg);
         rvjit_free_hreg(block, block->regs[reg].hreg);
-#ifdef USER_FAULT_META
+#ifdef RVVM_USER_TEST
         if (reg < 32) block->fault_regs[block->regs[reg].hreg] = REG_ILL;
 #endif
         block->regs[reg].hreg = REG_ILL;
@@ -184,7 +184,7 @@ static regid_t rvjit_map_reg(rvjit_block_t* block, regid_t greg, regflags_t flag
 #endif
 
     if (flags & REG_DST) {
-#ifdef USER_FAULT_META
+#ifdef RVVM_USER_TEST
         if (greg < 32 && greg) block->fault_regs[block->regs[greg].hreg] = greg;
 #endif
         block->regs[greg].flags |= REG_DIRTY;
@@ -928,22 +928,10 @@ static void rvjit_tlb_lookup(rvjit_block_t* block, regid_t haddr, regid_t vaddr,
 
 static void rvjit_user_fault_sync(rvjit_block_t* block)
 {
-#if defined(USER_FAULT_POC) && !defined(USER_FAULT_META) && defined(RVJIT_NATIVE_64BIT)
-    for (regid_t i = 0; i < RVJIT_REGISTERS; ++i) {
-        rvjit_save_reg(block, i);
-        if (block->regs[i].flags & REG_DIRTY)
-            block->regs[i].flags = (block->regs[i].flags & ~REG_DIRTY) | REG_LOADED;
-    }
-    regid_t tmp = rvjit_claim_hreg(block);
-    rvjit_native_setregw(block, tmp, block->virt_pc + block->pc_off);
-    rvjit64_native_sd(block, tmp, VM_PTR_REG, offsetof(rvvm_hart_t, user_fault_pc));
-    rvjit_free_hreg(block, tmp);
-#else
     UNUSED(block);
-#endif
 }
 
-#ifdef USER_FAULT_META
+#ifdef RVVM_USER_TEST
 void rvjit_fault_record(rvjit_block_t* block, size_t length)
 {
     if (block->fault_failed) return;
@@ -967,7 +955,7 @@ void rvjit_fault_record(rvjit_block_t* block, size_t length)
 
 static inline void rvjit_fault_before_dest(rvjit_block_t* block, regid_t dest, bool store)
 {
-#ifdef USER_FAULT_META
+#ifdef RVVM_USER_TEST
     bool dirty = block->regs[dest].hreg != REG_ILL && (block->regs[dest].flags & REG_DIRTY);
     block->fault_ignore = !store && !dirty ? dest : REG_ILL;
 #else
@@ -977,8 +965,9 @@ static inline void rvjit_fault_before_dest(rvjit_block_t* block, regid_t dest, b
 
 static inline void rvjit_fault_begin(rvjit_block_t* block)
 {
-#ifdef USER_FAULT_META
-    block->fault_active = block->rv64;
+#ifdef RVVM_USER_TEST
+    // Only userland contexts (native pointers) recover from guest faults.
+    block->fault_active = block->rv64 && block->native_ptrs;
 #ifdef RVJIT_X86
     if (block->fault_active) rvjit_fault_record(block, 0);
 #endif
@@ -989,7 +978,7 @@ static inline void rvjit_fault_begin(rvjit_block_t* block)
 
 static inline void rvjit_fault_end(rvjit_block_t* block)
 {
-#ifdef USER_FAULT_META
+#ifdef RVVM_USER_TEST
 #ifdef RVJIT_X86
     if (block->fault_active) vector_at(block->faults, vector_size(block->faults) - 1).end = block->size;
 #endif

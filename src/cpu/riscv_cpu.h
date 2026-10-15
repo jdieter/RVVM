@@ -22,6 +22,9 @@ slow_path void riscv_illegal_insn(rvvm_hart_t* vm, const uint32_t insn);
 // Internal interpreter ISA switching
 void riscv32_run_interpreter(rvvm_hart_t* vm);
 void riscv64_run_interpreter(rvvm_hart_t* vm);
+#ifdef RVVM_USER_TEST
+void riscv64_user_run_interpreter(rvvm_hart_t* vm);
+#endif
 
 /*
  * JIT infrastructure

@@ -304,13 +304,13 @@ struct align_cacheline rvvm_hart_t {
     bool          jit_block_ends;
     bool          jit_skip_exec;
 #endif
-#ifdef USER_FAULT_POC
+#ifdef RVVM_USER_TEST
     uint64_t user_fault_pc;
     volatile uint32_t user_fault_interpreted;
     uint32_t user_cache_flush;
-#ifdef USER_NATIVE_VFORK_POC
-    bool user_native_interpreter;
 #endif
+#ifdef RVVM_USER_TEST
+    bool user_native_interpreter;
 #endif
 
     // AIA register files for M/S modes
@@ -352,7 +352,7 @@ struct randomize_layout rvvm_machine_t {
     gdb_server_t* gdbstub;
 
     rvvm_addr_t opts[RVVM_OPTS_ARR_SIZE];
-#if defined(RVVM_USER_TEST) && defined(USER_FAULT_META) && defined(USE_JIT)
+#if defined(RVVM_USER_TEST) && defined(USE_JIT)
     uint64_t (*user_memory_probe)(void);
     void (*user_jit_enter)(void);
     void (*user_jit_leave)(void);
@@ -373,7 +373,7 @@ void rvvm_user_fork_unlock(void);
 void rvvm_user_fork_child(rvvm_hart_t* thread);
 void rvvm_user_jit_pressure(rvvm_hart_t* thread);
 void rvvm_user_jit_reclaim(rvvm_hart_t* thread);
-#ifdef USER_NATIVE_VFORK_POC
+#ifdef RVVM_USER_TEST
 rvvm_hart_t* rvvm_create_user_thread_interpreter(rvvm_machine_t* machine);
 #endif
 

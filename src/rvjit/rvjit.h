@@ -113,7 +113,7 @@ typedef size_t   rvjit_addr_t;
 
 #define REG_ILL       0xFF // Register is not allocated
 
-#ifdef USER_FAULT_META
+#ifdef RVVM_USER_TEST
 #define RVJIT_USER_FAULT_CAPACITY (1U << 14)
 typedef struct {
     uint64_t guest_pc;
@@ -133,7 +133,7 @@ typedef struct {
     size_t    size;
     hashmap_t blocks;
     hashmap_t block_links;
-#ifdef USER_FAULT_META
+#ifdef RVVM_USER_TEST
     vector_t(rvjit_fault_t) faults;
 #endif
 
@@ -152,7 +152,7 @@ typedef struct {
 
 typedef struct {
     rvjit_heap_t heap;
-#if defined(USER_FAULT_META) && defined(RVVM_USER_TEST)
+#ifdef RVVM_USER_TEST
     uint64_t user_metadata_size;
     bool (*user_growth_begin)(void*, size_t);
     void (*user_growth_end)(void*);
@@ -177,7 +177,7 @@ typedef struct {
     regmask_t       hreg_mask;       // Bitmask of available non-clobbered host registers
     regmask_t       abireclaim_mask; // Bitmask of reclaimed abi-clobbered host registers to restore
     rvjit_reginfo_t regs[RVJIT_REGISTERS];
-#ifdef USER_FAULT_META
+#ifdef RVVM_USER_TEST
     vector_t(rvjit_fault_t) faults;
     uint8_t fault_regs[32];
     uint8_t fault_ignore;
@@ -199,7 +199,7 @@ typedef struct {
     uint8_t linkage;
 } rvjit_block_t;
 
-#ifdef USER_FAULT_META
+#ifdef RVVM_USER_TEST
 void rvjit_fault_record(rvjit_block_t* block, size_t length);
 const rvjit_fault_t* rvjit_fault_lookup(const rvjit_block_t* block, uintptr_t pc);
 #endif

@@ -8,7 +8,6 @@
 #include "cpu/riscv_csr.h"
 #include <ucontext.h>
 #include "rvvm_user_signal_state.h"
-#ifdef USER_FAULT_POC
 #include <setjmp.h>
 #include "cpu/riscv_cpu.h"
 static THREAD_LOCAL sigjmp_buf user_fault_resume;
@@ -49,7 +48,6 @@ static void user_fault_restore_fenv(void)
                      "r"((uint64_t)user_fault_fp_status));
 #endif
 }
-#endif
 
 struct user_sigstack { uint64_t sp; int32_t flags; uint32_t pad; uint64_t size; };
 struct user_siginfo {
@@ -115,15 +113,11 @@ static THREAD_LOCAL struct {
     bool syscall_unstarted;
     bool synchronous;
 } user_sig;
-#ifdef USER_NATIVE_VFORK_POC
 static THREAD_LOCAL bool user_native_child_active;
 #include "rvvm_user_native_jump.h"
-#endif
 static void* user_sigtramp;
 static void user_fault_handler(int, siginfo_t*, void*);
-#ifdef USER_FAULT_META
 static void user_exec_trampoline(void*);
-#endif
 
 /* No C instructions can be inserted into this check-to-syscall window.
  * The host handler redirects an interrupted entry to the EINTR return.
@@ -467,7 +461,6 @@ static void user_bad_signal_frame(int signo)
     user_sig.synchronous = true;
 }
 
-#ifdef USER_FAULT_POC
 static void user_fault_address(rvvm_hart_t* cpu)
 {
     /* x86 reports #GP for a noncanonical pointer as SI_KERNEL with no address.
@@ -511,7 +504,6 @@ static void user_fault_address(rvvm_hart_t* cpu)
     user_sig.info.si_addr = (void*)addr;
     user_sig.info.si_code = SEGV_MAPERR;
 }
-#endif
 
 static void user_signal_init(rvvm_hart_t* cpu, uint64_t mask)
 {
@@ -534,9 +526,7 @@ static void user_signal_init(rvvm_hart_t* cpu, uint64_t mask)
         if (user_sigtramp == MAP_FAILED) abort();
         memcpy(user_sigtramp, code, sizeof(code));
         if (mprotect(user_sigtramp, 4096, PROT_READ)) abort();
-#ifdef USER_FAULT_META
         user_exec_trampoline(user_sigtramp);
-#endif
     });
     user_apply_mask();
 }

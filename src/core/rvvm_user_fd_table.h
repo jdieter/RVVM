@@ -48,12 +48,8 @@ typedef struct user_fd_owner {
 static user_fd_mutex_t user_fd_owners_lock;
 static user_fd_owner_t* user_fd_owners;
 static __thread user_fd_owner_t user_fd_thread_owner;
-#ifdef USER_NATIVE_VFORK_POC
 static __thread user_fd_owner_t* user_fd_owner_override;
 #define user_fd_owner (*(user_fd_owner_override ? user_fd_owner_override : &user_fd_thread_owner))
-#else
-#define user_fd_owner user_fd_thread_owner
-#endif
 static void user_exe_relocation_held(void);
 
 static user_fd_table_t* user_fd_table_alloc(user_fd_guard_t* guard)

@@ -16,7 +16,6 @@
 #include <unistd.h>
 #include "user_fd_guard.h"
 
-#ifdef USER_NATIVE_VFORK_POC
 #include <sys/syscall.h>
 static THREAD_LOCAL long (*user_vma_executor)(long, long, long, long, long, long, long);
 static long user_vma_execute(long nr, long a, long b, long c, long d, long e, long f)
@@ -34,15 +33,6 @@ static long user_vma_execute(long nr, long a, long b, long c, long d, long e, lo
 #define user_vma_kernel_shmctl(a,b,c) ((int)user_vma_execute(SYS_shmctl,a,b,(long)(c),0,0,0))
 #define user_vma_kernel_shmat(a,b,c) ((void*)user_vma_execute(SYS_shmat,a,(long)(b),c,0,0,0))
 #define user_vma_kernel_shmdt(a) ((int)user_vma_execute(SYS_shmdt,(long)(a),0,0,0,0,0))
-#else
-#define user_vma_kernel_map mmap
-#define user_vma_kernel_unmap munmap
-#define user_vma_kernel_remap mremap
-#define user_vma_kernel_valid(fd) fcntl(fd,F_GETFD)
-#define user_vma_kernel_shmctl shmctl
-#define user_vma_kernel_shmat shmat
-#define user_vma_kernel_shmdt shmdt
-#endif
 
 struct user_vma_layout {
     uintptr_t limit, top, low;

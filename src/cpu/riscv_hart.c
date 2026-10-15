@@ -91,7 +91,7 @@ rvvm_addr_t riscv_hart_run_userland(rvvm_hart_t* vm)
 {
     vm->userland = true;
     atomic_store_uint32_ex(&vm->running, true, ATOMIC_RELAXED);
-#ifdef USER_FAULT_META
+#ifdef RVVM_USER_TEST
     // Publish running before checking the flush request. The old unconditional
     // exchange ordered that store; a load alone could lose a concurrent wake.
     atomic_fence_ex(ATOMIC_SEQ_CST);
@@ -101,9 +101,7 @@ rvvm_addr_t riscv_hart_run_userland(rvvm_hart_t* vm)
         riscv_jit_flush_cache(vm);
         riscv_tlb_flush(vm);
         if (flush & 6) {
-#ifdef USER_NATIVE_VFORK_POC
             if (!vm->user_native_interpreter)
-#endif
                 rvvm_user_jit_reclaim(vm);
         }
     }
