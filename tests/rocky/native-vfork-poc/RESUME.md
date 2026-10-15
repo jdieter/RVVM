@@ -1,3 +1,98 @@
+# Checkpoint: October 15, 2026, evening (Claude session)
+
+Branch `vfork-memory-poc` (base `rocky` cda8f13) now holds the whole
+native-vfork backend as signed commits; the sections below this one are
+history. Production (`rocky@10.32.36.218`) still runs `claude11`, built from
+`66403ae`; nothing after it is deployed. Rollback for that deployment:
+`sudo bash /var/tmp/rollback.sh` on the builder.
+
+## Commits after the deployed `66403ae`
+
+- `ce0fed8` generic mmap flags reach Linux; x86-only bits masked;
+  MAP_SHARED_VALIDATE reserves then replaces; mprotect rejects unknown
+  protection bits (`test-mmap-flags.c`).
+- `561205c` stopped mapping helpers get SIGCONT every 100ms (no kill
+  timeout: a tracer stop can't be told from a long populate); at
+  RLIMIT_NPROC the child serves its own mapping calls
+  (`test-nproc-mapping.c`, stop mode of `test-helper-death.c`).
+- `28ccc4e`, `4559a63` internal tasks (observer, intermediates, helpers)
+  are hidden from proc-root listings, `/proc/<pid>` paths and PID-argument
+  calls; `__WALL`/`__WCLONE` waits by an init or subreaper guest poll
+  instead of selecting the observer (`test-internal-hidden.c`,
+  `test-observer-visibility.c`).
+- `1eeee28` proc from an ancestor PID namespace (`GUEST_PROC=outer`).
+- `1743806` VFORK into a new PID namespace after unshare/setns
+  (`test-pidns-vfork.c`); unshare(NEWUSER|NEWPID) runs as two steps.
+- `bbb660e` static glibc fork recovery audited through 2.43.
+- `7872717` x86 CET: the fault jump restores the shadow stack
+  (`test-child-fault.c`; pass a fault count to stress it).
+- `959fc05` no more `USER_FAULT_META`/`USER_FAULT_POC`/
+  `USER_NATIVE_VFORK_POC`: the code is unconditional in userland files and
+  `RVVM_USER_TEST` in shared ones. Userland harts use a separate interpreter
+  instance (`riscv64_user_interpreter.c`, `RISCV_USERLAND`) with the fault
+  sites; JIT fault metadata needs native pointers (userland only). The
+  full-system emulator runs no userland fault tracking.
+- `10a07b1` a plain `make` builds a static-pie `rvvm_user` (dynamic PIE
+  without glibc-static) with `--wrap=_Fork` on that link only. New Makefile
+  hook: `bin_ldflags_<name>`. `rvvm_user` builds only on arm64/x86_64.
+- `30d4ae8` private-mm children (fork-like or private VFORK, including from
+  a shared-mm child) accept CLONE_FILES and CLONE_NEW* like an ordinary fork
+  (`test-child-fork-flags.c`; needs `GUEST_PIVOT=1` for namespaces).
+
+## Building and testing
+
+Build: `make` (or the production options: `make USE_GUI=0 USE_SOUND=0
+USE_LIB=1 USE_LTO=1 USE_NO_DLIB=1 USE_NO_LIBATOMIC=1 CFLAGS='-O3 -fPIE'
+LDFLAGS=-static-pie`). No defines are needed. Static glibc fork recovery is
+enabled automatically for static links with glibc 2.34-2.43.
+
+Latest ARM dev candidate: `claude31` (= `30d4ae8` plus a test-only change).
+All fixtures pass under `claude1/runall.sh` except the four that need their
+own launchers (fake-root, observer-adoption, observer-private-files,
+parent-tid-early-stop); helper death passes in kill and stop modes; the
+regular suite passes 30/30. On x86_64 (i7-12700H, kernel 7.2.9, glibc 2.43)
+the same fixtures pass with a CET shadow stack enabled, except
+`test-exec-errors` (the host's qemu-riscv64 binfmt intercepts self-exec) and
+`test-observer-visibility`, which fail the same way without the shadow stack
+and pass on ARM; not investigated on x86.
+
+Full-system check: the Rocky 10.3 SBC image
+(`Rocky-10-SBC-Generic-10.3-20261014.0.riscv64.raw.xz`, LekKit's 2026.01
+`fw_payload.bin`, `-m 4G -smp 4 -nogui -nonet`) boots to a login prompt on
+`rvvm` from both `rocky` and this branch; only `rngd` fails (no hardware
+RNG). On the x86 laptop, one run each:
+
+| | rocky | this branch |
+|---|---|---|
+| login prompt | 50.3 s | 49.8 s |
+| 300 x `/bin/true` | 2.67 s | 2.72 s |
+| `sha256sum /usr/bin/*` | 2.32 s | 2.38 s |
+| Python sum of squares, 3M | 2.66 s | 1.74 s |
+
+Single runs, not profiled. The `rocky` build was a default build, so it had
+no fault tracking either: the Python difference is unexplained. Read this
+as evidence of no regression, not of a speedup.
+
+## Known gaps
+
+- `/proc/<pid>/task/<tid>/children` contents and proc lookups relative to
+  an open proc directory descriptor still show internal tasks.
+- A process that inherits a near-zero NOFILE hard limit can't provision the
+  observer, so VFORK cases that need it fail (EMFILE). Lowering the limit
+  inside the guest works: the observer is provisioned first.
+- Mixed-TID VFORK when the pinned `/proc` belongs to a descendant or
+  unrelated PID namespace returns ESRCH rather than guessing a PID.
+- unshare(CLONE_NEWUSER|CLONE_NEWPID) runs as two steps. If the PID step
+  fails, the user namespace stays entered.
+- A tracer-stopped mapping helper is resumed but never timed out.
+- A shared-mm child can't create threads (EAGAIN), and its clones can't
+  combine CLONE_VM with CLONE_FILES or namespaces (EINVAL). CLONE_FS is
+  unsupported for any fork, as before.
+- A dynamically linked `rvvm_user` (no glibc-static) has no private-mm
+  VFORK (EOPNOTSUPP): only a static link redirects libc's `_Fork`.
+- Not yet run: the kernel build and package builds on dev, or another
+  production deployment.
+
 # Checkpoint: October 15, 2026 (Claude session)
 
 Latest ARM candidate `claude8`: source `/var/tmp/rvvm-native-vfork-poc-20261013/claude8/src.tar.gz`
