@@ -544,7 +544,18 @@ static void* user_native_service(void* opaque)
      * parent peers must resume as soon as that snapshot has been taken. */
     user_fd_table_enter(request->source_table);
     user_fd_lock();
-    request->child_table = user_fd_table_copy_guard(request->source_table, true);
+    user_fd_table_t* source = request->source_table;
+    if (request->private_thread && (request->flags & UAPI_CLONE_FILES)) {
+        /* As an ordinary CLONE_FILES fork: the child's mm copy uses this
+         * table, so share its locks and wait slots before the clone. */
+        if (user_fd_waits_init(source) && user_fd_mutex_share(&source->guard->lock)
+            && user_fd_mutex_share(&source->lock)) {
+            atomic_add_uint32(source->refs, 1);
+            request->child_table = source;
+        }
+    } else {
+        request->child_table = user_fd_table_copy_guard(source, true);
+    }
     if (request->child_table) {
         uint64_t address;
         user_fd_owner_marker(&address, &request->child_guard.marker);
@@ -1272,8 +1283,14 @@ static void user_native_vfork_finish(struct user_native_vfork* request)
 static bool user_native_vfork_flags(uint32_t* flags)
 {
     *flags &= ~UAPI_CLONE_IGNORED_FLAGS;
-    const uint32_t allowed = 0xff | UAPI_CLONE_OPTIONAL_FLAGS | UAPI_CLONE_VM | UAPI_CLONE_VFORK | UAPI_CLONE_PIDFD;
+    /* As for an ordinary fork, a private-mm child may share files or enter
+     * new namespaces. A shared-mm child keeps a private descriptor copy. */
+    const uint32_t private_only = UAPI_CLONE_FILES | CLONE_NEWCGROUP | CLONE_NEWIPC | CLONE_NEWNET
+        | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUSER | CLONE_NEWUTS;
+    const uint32_t allowed = 0xff | UAPI_CLONE_OPTIONAL_FLAGS | UAPI_CLONE_VM | UAPI_CLONE_VFORK
+        | UAPI_CLONE_PIDFD | private_only;
     return !(*flags & ~allowed)
+        && !((*flags & UAPI_CLONE_VM) && (*flags & private_only))
         && !((*flags & UAPI_CLONE_PIDFD) && (*flags & UAPI_CLONE_PARENT_SETTID));
 }
 
