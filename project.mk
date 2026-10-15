@@ -179,7 +179,10 @@ override BIN_TARGETS := rvvm
 override LIB_TARGETS := rvvm # TODO: rvvm_libretro FTBFS
 
 override bin_src_rvvm          := $(SRCDIR)/main.c
-override bin_src_rvvm_user     := $(SRCDIR)/rvvm_user_main.c
+# The userland syscall layer is rvvm_user's alone: keeping it out of librvvm
+# keeps its static-glibc fork code out of the dynamic rvvm and librvvm links.
+override bin_src_rvvm_user     := $(SRCDIR)/rvvm_user_main.c $(SRCDIR)/core/rvvm_user.c \
+                                  $(wildcard $(SRCDIR)/core/user_ptrace/*.c)
 override lib_src_rvvm_libretro := $(SRCDIR)/bindings/libretro/libretro.c
 
 # The userland emulator is Linux-only. Its guest fault recovery, signal entry
