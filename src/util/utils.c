@@ -24,6 +24,11 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include <stdio.h>
 #include <string.h>
 
+#if defined(HOST_TARGET_POSIX)
+#include <errno.h>
+#include <unistd.h>
+#endif
+
 PUSH_OPTIMIZATION_SIZE
 
 /*
@@ -791,7 +796,27 @@ static void log_print(const char* prefix, const char* fmt, const void* argv)
         }
     }
     rvvm_strlcpy(buffer + pos, log_has_colors() ? "\033[0m\n" : "\n", sizeof(buffer) - pos);
+#if defined(HOST_TARGET_POSIX)
+    /*
+     * Any thread may log. A stdio stream lock held by a thread that a raw
+     * fork leaves behind would stay locked in the child forever, so write
+     * the formatted line directly, as unbuffered stderr would
+     */
+    int    saved_errno = errno;
+    size_t len         = rvvm_strlen(buffer);
+    size_t done        = 0;
+    while (done < len) {
+        ssize_t ret = write(STDERR_FILENO, buffer + done, len - done);
+        if (ret > 0) {
+            done += ret;
+        } else if (ret == 0 || errno != EINTR) {
+            break;
+        }
+    }
+    errno = saved_errno;
+#else
     fputs(buffer, stderr);
+#endif
 }
 
 #if defined(USE_DEBUG)

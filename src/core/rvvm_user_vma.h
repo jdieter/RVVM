@@ -10,11 +10,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/random.h>
 #include <sys/mman.h>
 #include <sys/shm.h>
 #include <unistd.h>
 #include "user_fd_guard.h"
+#include "user_proc_read.h"
 
 #include <sys/syscall.h>
 static THREAD_LOCAL long (*user_vma_executor)(long, long, long, long, long, long, long);
@@ -396,7 +396,8 @@ static void* user_vma_map_raw(void* addr, size_t size, int prot, int flags, int 
     uintptr_t top = __atomic_load_n(&user_vma_cursor, __ATOMIC_RELAXED);
     if (!top) {
         uint32_t random = 0;
-        if (getrandom(&random, sizeof(random), 0) != sizeof(random))
+        /* Raw: glibc 2.41+ getrandom allocates vDSO state under a process lock. */
+        if (syscall(SYS_getrandom, &random, sizeof(random), 0) != sizeof(random))
             random = (uint32_t)((uintptr_t)&random >> 4);
         uintptr_t window = (user_vma_layout.top - user_vma_layout.low) / 16;
         if (window > (UINT64_C(64) << 30)) window = UINT64_C(64) << 30;
@@ -532,28 +533,35 @@ static void* user_vma_shmat(int id, void* addr, int flags)
  * have replaced an interior page with mmap; keep that replacement owned.
  * Compare kernel mapping identities, so a native allocation reusing a detached
  * hole cannot accidentally become guest memory on the next vfork. */
+struct user_vma_fragment { uintptr_t start, end; unsigned long offset, inode; unsigned major, minor; };
+
+static bool user_vma_shmdt_fragment(const char* line, struct user_vma_fragment* range)
+{
+    return sscanf(line, "%lx-%lx %*s %lx %x:%x %lu", &range->start, &range->end,
+                  &range->offset, &range->major, &range->minor, &range->inode) == 6;
+}
+
 static int user_vma_shmdt(void* addr)
 {
-    struct fragment { uintptr_t start, end; unsigned long offset, inode; unsigned major, minor; };
-    struct fragment *fragments = NULL;
+    struct user_vma_fragment *fragments = NULL;
     size_t count = 0;
-    FILE* maps = fopen("/proc/thread-self/maps", "re");
-    if (!maps) return -1;
+    /* No stdio: a raw fork would copy its stream list lock held by a peer. */
+    struct user_proc_reader maps;
+    if (!user_proc_open(&maps, "/proc/thread-self/maps")) return -1;
     char line[4096];
-    while (fgets(line, sizeof(line), maps)) {
-        struct fragment range;
-        if (sscanf(line, "%lx-%lx %*s %lx %x:%x %lu", &range.start, &range.end,
-            &range.offset, &range.major, &range.minor, &range.inode) != 6
+    while (user_proc_line(&maps, line, sizeof(line))) {
+        struct user_vma_fragment range;
+        if (!user_vma_shmdt_fragment(line, &range)
             || !strstr(line, "/SYSV") || (!range.inode && !range.major && !range.minor)
             || range.start < (uintptr_t)addr || range.start - (uintptr_t)addr != range.offset) continue;
         void* grown = realloc(fragments, (count + 1) * sizeof(*fragments));
-        if (!grown) { fclose(maps); free(fragments); return -1; }
+        if (!grown) { user_proc_close(&maps); free(fragments); return -1; }
         fragments = grown;
         fragments[count++] = range;
     }
     if (count > SIZE_MAX / 2 || !user_vma_reserve(count * 2)) {
         int error = count > SIZE_MAX / 2 ? ENOMEM : errno;
-        fclose(maps);
+        user_proc_close(&maps);
         free(fragments);
         errno = error;
         return -1;
@@ -561,13 +569,14 @@ static int user_vma_shmdt(void* addr)
     int ret = user_vma_kernel_shmdt(addr), saved = errno;
     if (!ret) {
         for (size_t i = 0; i < count; ++i) {
-            struct fragment old = fragments[i];
+            struct user_vma_fragment old = fragments[i];
             uintptr_t cursor = old.start;
-            rewind(maps);
-            while (fgets(line, sizeof(line), maps)) {
-                struct fragment current;
-                if (sscanf(line, "%lx-%lx %*s %lx %x:%x %lu", &current.start, &current.end,
-                    &current.offset, &current.major, &current.minor, &current.inode) != 6
+            /* Rewind the same view, as rewind(3) did: keep the descriptor. */
+            syscall(SYS_lseek, maps.fd, 0, SEEK_SET);
+            maps.cursor = maps.available = 0;
+            while (user_proc_line(&maps, line, sizeof(line))) {
+                struct user_vma_fragment current;
+                if (!user_vma_shmdt_fragment(line, &current)
                     || current.inode != old.inode || current.major != old.major || current.minor != old.minor
                     || current.end <= old.start || current.start >= old.end) continue;
                 uintptr_t start = current.start > old.start ? current.start : old.start;
@@ -579,7 +588,7 @@ static int user_vma_shmdt(void* addr)
             if (cursor < old.end) user_vma_forget(cursor, old.end - cursor);
         }
     }
-    fclose(maps);
+    user_proc_close(&maps);
     free(fragments);
     errno = saved;
     return ret;
