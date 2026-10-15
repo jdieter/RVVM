@@ -385,6 +385,24 @@ static void* user_vma_map_raw(void* addr, size_t size, int prot, int flags, int 
         if (ret == MAP_FAILED || user_vma_range((uintptr_t)ret, span)) return ret;
         user_vma_kernel_unmap(ret, span);
     }
+#ifdef MAP_SHARED_VALIDATE
+    if ((flags & 0x0f) == MAP_SHARED_VALIDATE) {
+        /* Linux validates every flag of this type, and MAP_FIXED_NOREPLACE is
+         * outside its legacy set: placing the mapping that way would fail
+         * where the guest's call succeeds. Reserve the range, then replace
+         * only that reservation, keeping the guest's own flags. */
+        void* reserved = user_vma_map_raw(NULL, size, PROT_NONE,
+            MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | (flags & (MAP_HUGETLB | (63U << 26))), -1, 0);
+        if (reserved == MAP_FAILED) return reserved;
+        void* ret = user_vma_kernel_map(reserved, size, prot, flags | MAP_FIXED, fd, offset);
+        if (ret == MAP_FAILED) {
+            int error = errno;
+            user_vma_kernel_unmap(reserved, span);
+            errno = error;
+        }
+        return ret;
+    }
+#endif
     uintptr_t top = __atomic_load_n(&user_vma_cursor, __ATOMIC_RELAXED);
     if (!top) {
         uint32_t random = 0;

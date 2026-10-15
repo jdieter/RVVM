@@ -888,6 +888,9 @@ static void* rvvm_sys_brk(void* addr)
 #define UAPI_CLONE_CHILD_SETTID   0x01000000
 
 #define UAPI_CLONE_THREAD_FLAGS 0x00050f00 // VM, FS, FILES, SIGHAND, THREAD, SYSVSEM
+/* Linux mprotect rejects bits outside READ/WRITE/EXEC/SEM/GROWSDOWN/GROWSUP. */
+#define UAPI_PROT_VALID (0x7 | 0x8 | 0x01000000 | 0x02000000)
+
 #define UAPI_CLONE_IGNORED_FLAGS 0x80400000 // IO, DETACHED
 #define UAPI_CLONE_OPTIONAL_FLAGS (UAPI_CLONE_SETTLS | UAPI_CLONE_PARENT_SETTID \
     | UAPI_CLONE_CHILD_CLEARTID | UAPI_CLONE_CHILD_SETTID)
@@ -1291,6 +1294,17 @@ static int64_t rvvm_sys_getdents64(int fd, void* dirp, size_t size)
 
 #define UAPI_MAP_ILLEGAL         0xE00000
 
+/* RV64 uses the generic Linux mmap flag values, as do the aarch64 and x86_64
+ * hosts, except x86's MAP_32BIT and MAP_ABOVE4G, unused bits on RISC-V. Pass
+ * the rest to Linux so it applies its own rules: legacy types ignore unknown
+ * bits, MAP_SHARED_VALIDATE rejects them, and POPULATE/LOCKED/GROWSDOWN/STACK
+ * /SYNC/DROPPABLE and hugetlb sizes take effect. */
+#if defined(__x86_64__)
+#define UAPI_MAP_HOST_UNSAFE     0x0000C0
+#else
+#define UAPI_MAP_HOST_UNSAFE     0
+#endif
+
 #ifndef MAP_ANON
 #define MAP_ANON MAP_ANONYMOUS
 #endif
@@ -1316,9 +1330,11 @@ static rvvm_addr_t rvvm_sys_mmap(void* addr, size_t size, int prot, int flags, i
 {
     rvvm_info("sys_mmap(%lx, %lx, %x, %x, %d, %lx)", (size_t)addr, size, prot, flags, fd, offset);
     int mmap_flags = 0;
+#ifndef __linux__
     if (flags & UAPI_MAP_ILLEGAL) {
         return -UAPI_EINVAL;
     }
+#endif
 
     user_fd_lock();
     spin_lock(&mmap_lock);
@@ -1329,6 +1345,9 @@ static rvvm_addr_t rvvm_sys_mmap(void* addr, size_t size, int prot, int flags, i
         return -ENOMEM;
     }
 #endif
+#ifdef __linux__
+    mmap_flags = flags & ~UAPI_MAP_HOST_UNSAFE;
+#else
     if (flags & UAPI_MAP_SHARED) mmap_flags |= MAP_SHARED;
     if (flags & UAPI_MAP_PRIVATE) mmap_flags |= MAP_PRIVATE;
     if (flags & UAPI_MAP_ANON) mmap_flags |= MAP_ANON;
@@ -1344,14 +1363,11 @@ static rvvm_addr_t rvvm_sys_mmap(void* addr, size_t size, int prot, int flags, i
     if (flags & UAPI_MAP_FIXED) {
         // This flag has destructive semantics...
         mmap_flags |= MAP_FIXED;
-#ifndef __linux__
         munmap(addr, size);
-#endif
     }
+#endif
 
 #ifdef __linux__
-    if (flags & 0x4000) mmap_flags |= MAP_NORESERVE;
-    if (flags & 0x40000) mmap_flags |= MAP_HUGETLB | (flags & (63U << 26));
     rvvm_addr_t ret = errno_ret((size_t)user_vma_map(addr, size, rvvm_sys_prot(prot), mmap_flags, fd, offset));
 #else
     rvvm_addr_t ret = errno_ret((size_t)mmap(addr, size, rvvm_sys_prot(prot), mmap_flags, fd, offset));
@@ -1804,7 +1820,8 @@ static void* rvvm_user_thread_wrap(void* arg)
 #ifdef USER_NATIVE_VFORK_POC
                         if (!user_exec_reserve(2)) ret = -ENOMEM; else
 #endif
-                        if (user_vma_protect_span(&start, &size, a2)) ret = last_errno();
+                        if (a2 & ~UAPI_PROT_VALID) ret = -EINVAL;
+                        else if (user_vma_protect_span(&start, &size, a2)) ret = last_errno();
                         else {
                             ret = errno_ret(mprotect(to_ptr(a0), a1, rvvm_sys_prot(a2)));
                             if (!ret) user_exec_update(start, size, a2 & UAPI_PROT_EXEC);

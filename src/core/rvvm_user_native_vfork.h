@@ -401,6 +401,7 @@ static void user_native_mapping_service(struct user_native_vfork* request)
             spin_lock(&mmap_lock);
             uintptr_t start = a[0]; size_t size = a[1];
             if (!user_exec_reserve(2)) request->mapping_result = -ENOMEM;
+            else if (a[2] & ~UAPI_PROT_VALID) request->mapping_result = -EINVAL;
             else if (user_vma_protect_span(&start, &size, a[2])) request->mapping_result = -errno;
             else {
                 request->mapping_result = user_native_mapping_kernel(SYS_mprotect, a[0], a[1],
