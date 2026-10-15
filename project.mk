@@ -191,9 +191,10 @@ override CPPFLAGS           := $(CPPFLAGS) -DRVVM_USER_TEST
 override bin_libs_rvvm_user := rvvm
 ifneq (,$(filter -static -static-pie,$(LDFLAGS)))
 ifneq (,$(filter arm64 x86_64,$(ARCH)))
-ifneq (,$(call check_compile,int main(void){_Static_assert(__GLIBC__ == 2 && __GLIBC_MINOR__ >= 34 && __GLIBC_MINOR__ <= 39$(COMMA) "glibc");return 0;},-include features.h,static-glibc-fork-34-39))
+ifneq (,$(call check_compile,int main(void){_Static_assert(__GLIBC__ == 2 && __GLIBC_MINOR__ >= 34 && __GLIBC_MINOR__ <= 43$(COMMA) "glibc");return 0;},-include features.h,static-glibc-fork-34-43))
 # Keep libc's fork handlers while changing only its kernel creation step.
-# Newer _Fork implementations add internal hooks and need separate validation.
+# Audited through 2.43 against fork.c/_Fork.c (after 2.39, _Fork gained
+# abort()'s fork lock). Each newer glibc needs this audit first.
 override CPPFLAGS := $(CPPFLAGS) -DRVVM_STATIC_GLIBC_FORK
 override LDFLAGS := $(LDFLAGS) -Wl$(COMMA)--wrap=_Fork
 endif

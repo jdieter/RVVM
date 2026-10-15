@@ -19,6 +19,14 @@ static __thread bool user_fork_native_saved;
 static __thread bool user_fork_recover_cow;
 pid_t __real__Fork(void);
 extern void __getrandom_fork_subprocess(void) __attribute__((weak));
+/* Newer glibc (2.43, not 2.39) _Fork holds abort()'s lock for reading across the clone, its
+ * argument saving the signal mask; aarch64 _Fork drops SME ZA state first.
+ * Weak, so older supported glibc without them still links. */
+extern void __abort_lock_rdlock(void*) __attribute__((weak));
+extern void __abort_lock_unlock(void*) __attribute__((weak));
+#if defined(__aarch64__)
+extern void __libc_arm_za_disable(void) __attribute__((weak));
+#endif
 
 /* Guest set_tid_address/set_robust_list replace the kernel registrations.
  * Save the native TCB locations once, before any guest syscall can do so. */
@@ -69,6 +77,11 @@ pid_t __wrap__Fork(void)
     int* tid = user_fork_native_tid;
     struct robust_list_head* robust = user_fork_native_robust;
     if (!tid || !robust) { errno = ENOTSUP; return -1; }
+#if defined(__aarch64__)
+    if (__libc_arm_za_disable) __libc_arm_za_disable();
+#endif
+    uint64_t abort_mask[2];
+    if (__abort_lock_rdlock) __abort_lock_rdlock(abort_mask);
     struct clone_args args = {
         .flags = CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID | extra,
         .child_tid = (uintptr_t)tid,
@@ -91,6 +104,11 @@ pid_t __wrap__Fork(void)
         robust->list.next = &robust->list;
         syscall(SYS_set_robust_list, robust, sizeof(*robust));
         if (__getrandom_fork_subprocess) __getrandom_fork_subprocess();
+    }
+    if (__abort_lock_unlock) {
+        int saved = errno;
+        __abort_lock_unlock(abort_mask);
+        errno = saved;
     }
     return pid;
 }
