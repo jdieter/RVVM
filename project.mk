@@ -179,9 +179,8 @@ override BIN_TARGETS := rvvm
 override LIB_TARGETS := rvvm # TODO: rvvm_libretro FTBFS
 
 override bin_src_rvvm          := $(SRCDIR)/main.c
-# The userland syscall layer is rvvm_user's alone: keeping it out of librvvm
-# keeps its static-glibc fork code out of the dynamic rvvm and librvvm links.
-# Its allocator replaces malloc for the whole program it is linked into.
+# The userland syscall layer is rvvm_user's alone. Its allocator replaces
+# malloc for the whole program it is linked into: keep both out of librvvm.
 override bin_src_rvvm_user     := $(SRCDIR)/rvvm_user_main.c $(SRCDIR)/core/rvvm_user.c \
                                   $(SRCDIR)/core/rvvm_user_malloc.c \
                                   $(wildcard $(SRCDIR)/core/user_ptrace/*.c)
@@ -199,28 +198,16 @@ override bin_libs_rvvm_user := rvvm
 # interpreter it runs inside chroots without the host's libraries.
 override CFLAGS := $(CFLAGS) -fPIE
 ifneq (,$(filter -static -static-pie,$(LDFLAGS)))
-override USER_STATIC := 1
+# A static link as requested.
 else ifneq (,$(filter -pie,$(LDFLAGS)))
 # An explicit dynamic PIE link.
 override bin_ldflags_rvvm_user := -pie
 else ifneq (,$(call check_compile,int main(void){return 0;},-fPIE -static-pie,static-pie))
-override USER_STATIC := 1
 override bin_ldflags_rvvm_user := -static-pie
 else
 override bin_ldflags_rvvm_user := -pie
 $(call log_warn,Cannot link static-pie (install glibc-static?): rvvm_user will be dynamic. It can \
-run guests directly but fails as a binfmt interpreter inside chroots such as mock. It also lacks \
-private-mm VFORK.)
-endif
-ifneq (,$(USER_STATIC))
-ifneq (,$(call check_compile,int main(void){_Static_assert(__GLIBC__ == 2 && __GLIBC_MINOR__ >= 34 && __GLIBC_MINOR__ <= 43$(COMMA) "glibc");return 0;},-include features.h,static-glibc-fork-34-43))
-# Keep libc's fork handlers while changing only its kernel creation step.
-# Audited through 2.43 against fork.c/_Fork.c (after 2.39, _Fork gained
-# abort()'s fork lock). Each newer glibc needs this audit first. Only the
-# userland code uses it, and only a static link redirects libc's call.
-override CPPFLAGS := $(CPPFLAGS) -DRVVM_STATIC_GLIBC_FORK
-override bin_ldflags_rvvm_user := $(bin_ldflags_rvvm_user) -Wl$(COMMA)--wrap=_Fork
-endif
+run guests directly but fails as a binfmt interpreter inside chroots such as mock.)
 endif
 endif
 endif

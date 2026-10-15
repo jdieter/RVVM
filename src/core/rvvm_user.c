@@ -1058,9 +1058,6 @@ static int rvvm_sys_clone_impl(rvvm_user_thread_t* current, uint32_t flags, size
         const uint32_t supported = 0xff | UAPI_CLONE_OPTIONAL_FLAGS | UAPI_CLONE_PIDFD
             | UAPI_CLONE_FILES | namespaces;
         if (flags & ~supported) return -UAPI_EINVAL;
-#ifndef RVVM_STATIC_GLIBC_FORK
-        if (flags & namespaces) return -ENOSYS;
-#endif
         if ((flags & UAPI_CLONE_PIDFD) && (flags & UAPI_CLONE_PARENT_SETTID))
             return -EINVAL;
         int publish[2] = {-1, -1};
@@ -1104,9 +1101,7 @@ static int rvvm_sys_clone_impl(rvvm_user_thread_t* current, uint32_t flags, size
         user_fd_mutex_lock(&user_reaper_lock);
         rvvm_user_fork_lock();
         user_ptrace_clone(cpu);
-        user_fork_namespaces = flags & namespaces;
-        pid_t pid = user_host_fork_files(flags & 0xff, shared_files);
-        user_fork_namespaces = 0;
+        pid_t pid = user_host_fork(flags & 0xff, (shared_files ? CLONE_FILES : 0) | (flags & namespaces));
         int fork_errno = errno;
         user_fork_cache_finish(fork_slot, pid);
         unsigned child_fd_depth = 0;

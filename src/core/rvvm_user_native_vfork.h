@@ -22,11 +22,7 @@ __asm__(".text\n.global user_native_clone3\n.hidden user_native_clone3\n"
  * PID namespace, as its init. */
 static int user_native_vfork_preflight(uint32_t flags)
 {
-#ifndef RVVM_STATIC_GLIBC_FORK
-    if (!(flags & UAPI_CLONE_VM)) return 0;
-#else
-    if (!(flags & UAPI_CLONE_VM) && (!user_fork_native_tid || !user_fork_native_robust)) return 0;
-#endif
+    if (!(flags & UAPI_CLONE_VM) && !user_host_fork_ready()) return 0;
     if (syscall(SYS_clone3, NULL, 0) != -1 || errno != EINVAL) return 0;
     struct stat active_pid, child_pid;
     /* In a new PID namespace the child's own TIDs, and those of any helper
@@ -129,11 +125,6 @@ struct user_native_vfork {
     long nested_result;
 };
 
-#ifdef RVVM_STATIC_GLIBC_FORK
-extern void _IO_list_lock(void);
-extern void _IO_list_unlock(void);
-extern void _IO_list_resetlock(void);
-
 static void user_native_cow_snapshot_lock(void)
 {
     spin_lock(&brk_lock);
@@ -141,14 +132,12 @@ static void user_native_cow_snapshot_lock(void)
     user_fd_mutex_lock(&user_exe_lock);
     user_fd_mutex_lock(&user_reaper_lock);
     rvvm_user_fork_lock();
-    _IO_list_lock();
-    user_malloc_fork_lock();
+    user_host_fork_lock();
 }
 
 static void user_native_cow_snapshot_unlock(void)
 {
-    user_malloc_fork_unlock();
-    _IO_list_unlock();
+    user_host_fork_unlock();
     rvvm_user_fork_unlock();
     user_fd_mutex_unlock(&user_reaper_lock);
     user_fd_mutex_unlock(&user_exe_lock);
@@ -164,12 +153,9 @@ static int user_native_cow_child(void* opaque)
         atomic_store_uint32(request->clone_marker, user_safe_raw(&pending, SYS_gettid, 0, 0, 0, 0, 0, 0));
     }
     /* Snapshot locks belong to vanished parent threads in this private mm.
-     * Unlock allocator state first, then let libc reset FILE/loader/NPTL
-     * state through its ordinary child recovery. */
-    user_malloc_fork_child();
-    _IO_list_resetlock();
-    user_fork_recover_cow = true;
-    if (fork() != 0) _exit(127);
+     * This TLS is the issuing thread's, or the one a shared-mm child
+     * borrows: either way the thread whose libc identity this child takes. */
+    user_host_fork_child();
     user_fake_default = request->credentials;
     user_fake_current = NULL;
     rvvm_user_thread_t* thread = request->private_thread;
@@ -221,7 +207,6 @@ static int user_native_cow_child(void* opaque)
     rvvm_user_thread_wrap(thread);
     _exit(127);
 }
-#endif
 
 static long user_native_raw(long nr, long a, long b, long c, long d, long e, long f)
 {
@@ -567,9 +552,7 @@ static void* user_native_service(void* opaque)
     memcpy(request->signals.actions, user_actions, sizeof(request->signals.actions));
     memcpy(request->signals.private_installed, user_private_installed,
            sizeof(request->signals.private_installed));
-#ifdef RVVM_STATIC_GLIBC_FORK
     if (request->private_thread) user_native_cow_snapshot_lock();
-#endif
     if (!request->private_thread) spin_lock(&mmap_lock);
     request->observer_next = user_native_requests;
     user_native_requests = request;
@@ -595,9 +578,7 @@ static void* user_native_service(void* opaque)
         user_fd_mutex_unlock(&request->observer->lock);
     }
     if (!request->private_thread) spin_unlock(&mmap_lock);
-#ifdef RVVM_STATIC_GLIBC_FORK
     if (request->private_thread) user_native_cow_snapshot_unlock();
-#endif
     spin_unlock(&user_action_lock);
     user_fd_unlock();
     if (!request->private_thread && atomic_load_uint32(request->clone_marker)) {
@@ -1214,10 +1195,7 @@ static long user_native_vfork_issue(struct user_native_vfork* request)
 #endif
     int saved_errno = errno;
     uintptr_t* packet = (void*)((char*)request->native_stack + USER_NATIVE_STACK_SIZE - 2 * sizeof(uintptr_t));
-    packet[0] = (uintptr_t)user_native_child;
-#ifdef RVVM_STATIC_GLIBC_FORK
-    if (request->private_thread) packet[0] = (uintptr_t)user_native_cow_child;
-#endif
+    packet[0] = (uintptr_t)(request->private_thread ? user_native_cow_child : user_native_child);
     packet[1] = (uintptr_t)request;
     struct {
         uint64_t flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls;

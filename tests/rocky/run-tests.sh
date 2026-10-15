@@ -30,11 +30,18 @@ timeout 20 "$build/test-jit-pressure"
     "$root/tests/rocky/test-jit-memory-probe.c" "$root"/src/util/*.c \
     -ldl -lm -o "$build/test-jit-memory-probe"
 timeout 20 "$build/test-jit-memory-probe"
-if [[ -f $root/compile_flags.txt ]] && grep -q -- '-DRVVM_STATIC_GLIBC_FORK' "$root/compile_flags.txt"; then
-    "$cc" "${flags[@]}" -DRVVM_STATIC_GLIBC_FORK -fPIE -static-pie -Wl,--wrap=_Fork \
-        "$root/tests/rocky/test-host-fork.c" -o "$build/test-host-fork"
-    timeout 20 "$build/test-host-fork"
-fi
+bash "$root/tests/rocky/check-libc-rule.sh"
+# Raw forks use only the public libc API: test dynamic and static links.
+for link in -pie -static-pie; do
+    if [[ $link == -static-pie ]] && ! echo 'int main(void){return 0;}' \
+        | "$cc" -fPIE -static-pie -x c - -o "$build/static-probe" 2>/dev/null; then
+        echo "SKIP static-pie test-host-fork: no static libc"
+        continue
+    fi
+    "$cc" "${flags[@]}" -fPIE $link "$root/tests/rocky/test-host-fork.c" \
+        "$root/src/core/rvvm_user_malloc.c" "$root"/src/util/*.c -ldl -lm -o "$build/test-host-fork"
+    timeout 60 "$build/test-host-fork"
+done
 if (($#)); then
     for guest in test-clone-flags test-clone-files test-fork-cache test-clone-thread test-clone-thread-private test-thread-exit test-vfork test-vfork-nofile test-vfork-concurrent test-openat2 test-seccomp test-pidfd-getfd test-kcmp test-jit-limits test-fpu-tininess test-mmap-huge test-mprotect-errors test-proc-exe; do
         "${RISCV_CC:-clang}" --target=riscv64-linux-gnu -march=rv64gc -mabi=lp64d \
