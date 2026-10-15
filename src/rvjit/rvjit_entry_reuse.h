@@ -2,6 +2,9 @@
 #ifndef RVJIT_ENTRY_REUSE_H
 #define RVJIT_ENTRY_REUSE_H
 #include <stdio.h>
+#if defined(__linux__) && defined(RVVM_USER_TEST)
+#include <unistd.h>
+#endif
 
 /* Reuse only an exact prefix of VM-register loads on a known backward edge.
  * All dirty guest registers are still saved before linking, so cold entries,
@@ -46,10 +49,21 @@ static size_t rvjit_entry_reuse(rvjit_block_t* block, uint8_t linkage, regmask_t
     if (skip) {
         block->reuse_links++;
         block->reuse_loads += skip / 4;
-        if (block->reuse_stats)
-            fprintf(stderr, "JIT reuse edge %llx -> %llx skip=%zu keep=%x\n",
-                    (unsigned long long)block->phys_pc, (unsigned long long)next,
-                    skip, (unsigned)*keep);
+        if (block->reuse_stats) {
+            char line[128];
+            int  len = snprintf(line, sizeof(line), "JIT reuse edge %llx -> %llx skip=%zu keep=%x\n",
+                                (unsigned long long)block->phys_pc, (unsigned long long)next,
+                                skip, (unsigned)*keep);
+            if (len > 0) {
+                size_t size = (size_t)len < sizeof(line) ? (size_t)len : sizeof(line) - 1;
+#if defined(__linux__) && defined(RVVM_USER_TEST)
+                // Any userland thread may compile: no stdio (rvvm_user_fork.h)
+                UNUSED(!write(STDERR_FILENO, line, size));
+#else
+                fwrite(line, 1, size, stderr);
+#endif
+            }
+        }
     }
     return skip;
 #else
