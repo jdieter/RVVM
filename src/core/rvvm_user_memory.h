@@ -193,6 +193,62 @@ static void user_exec_update(uintptr_t start, size_t size, bool executable)
     }
 }
 
+/* A failed mprotect may still have changed a prefix of the range: Linux
+ * applies VMAs in address order and stops at the first hole or failing VMA.
+ * Each changed VMA now has exactly the requested host protection; the one
+ * that failed does not. Without readable maps, fail closed: drop execute
+ * permission across a request that removed it, and never add it. */
+static void user_exec_partial(uintptr_t start, size_t size, int host_prot, bool executable)
+{
+    size_t page = user_vma_page();
+    if (!size || start % page || size > SIZE_MAX - page + 1) return;
+    uintptr_t end = start + ((size + page - 1) & ~(page - 1));
+    if (end < start) return;
+    int fd = open("/proc/thread-self/maps", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        if (!executable) user_exec_update(start, end - start, false);
+        return;
+    }
+    char buffer[4096], line[128];
+    size_t used = 0;
+    uintptr_t changed = start;
+    bool done = false;
+    ssize_t count = 0;
+    while (!done && (count = read(fd, buffer, sizeof(buffer))) != 0) {
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        for (ssize_t i = 0; i < count && !done; ++i) {
+            if (buffer[i] != '\n') {
+                if (used < sizeof(line) - 1) line[used++] = buffer[i];
+                continue;
+            }
+            line[used] = 0;
+            used = 0;
+            char* delimiter;
+            uintptr_t first = strtoull(line, &delimiter, 16);
+            if (*delimiter != '-') continue;
+            uintptr_t last = strtoull(delimiter + 1, &delimiter, 16);
+            if (last <= changed) continue;
+            int prot = 0;
+            if (delimiter[0] == ' ' && delimiter[1] && delimiter[2] && delimiter[3])
+                prot = (delimiter[1] == 'r' ? PROT_READ : 0) | (delimiter[2] == 'w' ? PROT_WRITE : 0)
+                     | (delimiter[3] == 'x' ? PROT_EXEC : 0);
+            if (first > changed
+                || prot != (host_prot & (PROT_READ | PROT_WRITE | PROT_EXEC))) done = true;
+            else changed = last < end ? last : end;
+            if (changed == end) done = true;
+        }
+    }
+    close(fd);
+    if (count < 0) {
+        if (!executable) user_exec_update(start, end - start, false);
+        return;
+    }
+    if (changed > start) user_exec_update(start, changed - start, executable);
+}
+
 static void user_exec_elf(const elf_desc_t* elf)
 {
     if (!elf->base || !elf->phdr_data) return;

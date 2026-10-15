@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #include <assert.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdint.h>
@@ -15,6 +16,7 @@ static char stack[128 * 1024];
 static unsigned char* code;
 static size_t page;
 static int kernel_only;
+static const char* self;
 
 static int kernel_exec(const void* address)
 {
@@ -42,10 +44,25 @@ static int child(void* unused)
     /* Linux has already removed execute permission before finding the hole. */
     _exit(((int (*)(void))code)() == 42 ? 97 : 98);
 }
+
+/* A read-only shared file page fails with EACCES after the first page has
+ * changed; the untouched page after it keeps its execute permission. */
+static int child_eacces(void* unused)
+{
+    (void)unused;
+    assert(mprotect(code, 3 * page, PROT_READ | PROT_WRITE) == -1 && errno == EACCES);
+    if (kernel_only) {
+        assert(!kernel_exec(code) && kernel_exec(code + 2 * page));
+        _exit(17);
+    }
+    if (((int (*)(void))(code + 2 * page))() != 42) _exit(96);
+    _exit(((int (*)(void))code)() == 42 ? 97 : 98);
+}
 int main(int argc, char** argv)
 {
     assert(argc == 1 || (argc == 2 && !strcmp(argv[1], "--kernel-only")));
     kernel_only = argc == 2;
+    self = argv[0];
     alarm(10);
     page = sysconf(_SC_PAGESIZE);
 #if defined(__riscv)
@@ -72,6 +89,26 @@ int main(int argc, char** argv)
         else assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGSEGV);
         assert(!munmap(code, 3 * page));
     }
+    int file = open(self, O_RDONLY | O_CLOEXEC);
+    assert(file >= 0);
+    for (unsigned i = 0; i < sizeof(modes) / sizeof(*modes); ++i) {
+        code = mmap(NULL, 3 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        assert(code != MAP_FAILED);
+        memcpy(code, instructions, sizeof(instructions));
+        memcpy(code + 2 * page, instructions, sizeof(instructions));
+        assert(mmap(code + page, page, PROT_READ, MAP_SHARED | MAP_FIXED, file, 0) == code + page);
+        __builtin___clear_cache((char*)code, (char*)code + 3 * page);
+        assert(!mprotect(code, page, PROT_READ | PROT_EXEC));
+        assert(!mprotect(code + 2 * page, page, PROT_READ | PROT_EXEC));
+        assert(((int (*)(void))code)() == 42 && ((int (*)(void))(code + 2 * page))() == 42);
+        pid_t pid = clone(child_eacces, stack + sizeof(stack), SIGCHLD | modes[i], NULL);
+        int status;
+        assert(pid > 0 && waitpid(pid, &status, 0) == pid);
+        if (kernel_only) assert(WIFEXITED(status) && WEXITSTATUS(status) == 17);
+        else assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGSEGV);
+        assert(!munmap(code, 3 * page));
+    }
+    close(file);
     puts(kernel_only ? "PASS kernel maps retain partial execute changes"
                      : "PASS failed mprotect retains partial execute changes");
 }

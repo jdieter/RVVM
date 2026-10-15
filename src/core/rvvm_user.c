@@ -1805,13 +1805,17 @@ static void* rvvm_user_thread_wrap(void* arg)
                     {
                         uintptr_t start = a0;
                         size_t size = a1;
-                        rvvm_addr_t ret =
+                        rvvm_addr_t ret;
 #ifdef USER_NATIVE_VFORK_POC
-                            !user_exec_reserve(2) ? -ENOMEM :
+                        if (!user_exec_reserve(2)) ret = -ENOMEM; else
 #endif
-                            user_vma_protect_span(&start, &size, a2)
-                            ? last_errno() : errno_ret(mprotect(to_ptr(a0), a1, rvvm_sys_prot(a2)));
-                        if (!ret) user_exec_update(start, size, a2 & UAPI_PROT_EXEC);
+                        if (user_vma_protect_span(&start, &size, a2)) ret = last_errno();
+                        else {
+                            ret = errno_ret(mprotect(to_ptr(a0), a1, rvvm_sys_prot(a2)));
+                            if (!ret) user_exec_update(start, size, a2 & UAPI_PROT_EXEC);
+                            else if (ret != (rvvm_addr_t)-EINVAL)
+                                user_exec_partial(start, size, rvvm_sys_prot(a2), a2 & UAPI_PROT_EXEC);
+                        }
                         a0 = ret;
                     }
                     spin_unlock(&mmap_lock);

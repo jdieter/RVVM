@@ -275,10 +275,15 @@ static void user_native_mapping_service(struct user_native_vfork* request)
             user_fd_lock();
             spin_lock(&mmap_lock);
             uintptr_t start = a[0]; size_t size = a[1];
-            request->mapping_result = !user_exec_reserve(2) ? -ENOMEM
-                : user_vma_protect_span(&start, &size, a[2]) ? -errno
-                : user_native_mapping_kernel(SYS_mprotect, a[0], a[1], rvvm_sys_prot(a[2]), 0, 0, 0);
-            if (!request->mapping_result) user_exec_update(start, size, a[2] & PROT_EXEC);
+            if (!user_exec_reserve(2)) request->mapping_result = -ENOMEM;
+            else if (user_vma_protect_span(&start, &size, a[2])) request->mapping_result = -errno;
+            else {
+                request->mapping_result = user_native_mapping_kernel(SYS_mprotect, a[0], a[1],
+                                                                     rvvm_sys_prot(a[2]), 0, 0, 0);
+                if (!request->mapping_result) user_exec_update(start, size, a[2] & PROT_EXEC);
+                else if (request->mapping_result != -EINVAL)
+                    user_exec_partial(start, size, rvvm_sys_prot(a[2]), a[2] & PROT_EXEC);
+            }
             spin_unlock(&mmap_lock);
             user_fd_unlock();
             break;
