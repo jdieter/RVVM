@@ -87,6 +87,10 @@ struct user_native_vfork {
     uint32_t service_state, service_stop;
     uint32_t operation, helper_pid, helper_alive, helper_state, helper_ready;
     bool helper_lost;
+    /* No helper could be created (RLIMIT_NPROC, task limits): the child runs
+     * its kernel operations itself. A stop of it then holds the mapping
+     * locks, as accepted for that limit. */
+    bool helper_self;
     long mapping_nr, mapping_args[6], mapping_result;
     long kernel_nr, kernel_args[6], kernel_result;
     char helper_stack[65536] __attribute__((aligned(16)));
@@ -241,17 +245,12 @@ static THREAD_LOCAL struct user_native_vfork* user_native_mapping_request;
 /* This process has the guest child's current kernel credentials, limits and
  * shared files/mm. It never uses native TLS, libc allocation or shared locks.
  * Guest death therefore cannot interrupt trusted parent bookkeeping. */
-static __attribute__((no_stack_protector)) int user_native_mapping_helper(void* opaque)
+/* Run kernel operations for the worker until it says stop. */
+static __attribute__((no_stack_protector)) void user_native_mapping_serve(struct user_native_vfork* request)
 {
-    struct user_native_vfork* request = opaque;
-    uint64_t mask = UINT64_MAX;
-    user_native_internal(SYS_rt_sigprocmask, SIG_SETMASK, (long)&mask, 0, 8, 0, 0);
-    if (user_native_internal(SYS_setsid, 0, 0, 0, 0, 0, 0) < 0) return 127;
-    atomic_store_uint32(&request->helper_ready, 1);
-    user_native_internal(SYS_futex, (long)&request->helper_ready, FUTEX_WAKE_PRIVATE, INT_MAX, 0, 0, 0);
     for (;;) {
         uint32_t state = atomic_load_uint32(&request->helper_state);
-        if (state == 3) return 0;
+        if (state == 3) return;
         if (state != 1) {
             user_native_internal(SYS_futex, (long)&request->helper_state, FUTEX_WAIT_PRIVATE, state, 0, 0, 0);
             continue;
@@ -261,6 +260,18 @@ static __attribute__((no_stack_protector)) int user_native_mapping_helper(void* 
         atomic_store_uint32(&request->helper_state, 2);
         user_native_internal(SYS_futex, (long)&request->helper_state, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0);
     }
+}
+
+static __attribute__((no_stack_protector)) int user_native_mapping_helper(void* opaque)
+{
+    struct user_native_vfork* request = opaque;
+    uint64_t mask = UINT64_MAX;
+    user_native_internal(SYS_rt_sigprocmask, SIG_SETMASK, (long)&mask, 0, 8, 0, 0);
+    if (user_native_internal(SYS_setsid, 0, 0, 0, 0, 0, 0) < 0) return 127;
+    atomic_store_uint32(&request->helper_ready, 1);
+    user_native_internal(SYS_futex, (long)&request->helper_ready, FUTEX_WAKE_PRIVATE, INT_MAX, 0, 0, 0);
+    user_native_mapping_serve(request);
+    return 0;
 }
 
 /* Fd-free kernel queries for recovery paths that may not hold the fd guard:
@@ -351,8 +362,10 @@ static long user_native_mapping_kernel(long nr, long a, long b, long c, long d, 
     memcpy(request->kernel_args, args, sizeof(args));
     atomic_store_uint32(&request->helper_state, 1);
     rvvm_futex_wake(&request->helper_state, 1);
-    while (atomic_load_uint32(&request->helper_state) != 2) {
-        if (!atomic_load_uint32(&request->helper_alive)) {
+    for (unsigned waits = 0; atomic_load_uint32(&request->helper_state) != 2; ++waits) {
+        /* A child that served itself is gone once VFORK has released. */
+        if (!atomic_load_uint32(&request->helper_alive)
+            || (request->helper_self && atomic_load_uint32(&request->service_stop))) {
             /* Contain the loss to the child, as if SIGKILL had arrived
              * during its syscall; it never observes the lost result. The
              * parent keeps running with metadata matching the kernel. */
@@ -360,6 +373,12 @@ static long user_native_mapping_kernel(long nr, long a, long b, long c, long d, 
             syscall(SYS_kill, request->child_owner.tid, SIGKILL);
             return user_native_mapping_outcome(nr, args);
         }
+        /* Nothing outside should stop a helper, and the parent's mapping
+         * locks wait on it: resume one stopped by job control. A tracer's
+         * stop is left to the tracer; a timeout cannot tell it from a long
+         * populate. Never continue the child itself. */
+        if (!request->helper_self && waits % 10 == 9)
+            syscall(SYS_kill, atomic_load_uint32(&request->helper_pid), SIGCONT);
         rvvm_futex_wait(&request->helper_state, 1, 10000000);
     }
     long ret = request->kernel_result;
@@ -375,11 +394,16 @@ static void user_native_mapping_finish(struct user_native_vfork* request)
     }
     atomic_store_uint32(&request->helper_state, 3);
     rvvm_futex_wake(&request->helper_state, 1);
-    syscall(SYS_kill, atomic_load_uint32(&request->helper_pid), SIGCONT);
     struct timespec timeout = {.tv_nsec = 10000000};
-    while (atomic_load_uint32(&request->helper_alive))
+    for (unsigned waits = 0; atomic_load_uint32(&request->helper_alive)
+         && !(request->helper_self && atomic_load_uint32(&request->service_stop)); ++waits) {
+        /* As in user_native_mapping_kernel: resume a helper stopped by job
+         * control so it can exit. */
+        if (!request->helper_self && waits % 10 == 0)
+            syscall(SYS_kill, atomic_load_uint32(&request->helper_pid), SIGCONT);
         syscall(SYS_futex, &request->helper_alive, FUTEX_WAIT,
                 atomic_load_uint32(&request->helper_alive), &timeout, NULL, 0);
+    }
 }
 
 static void user_native_mapping_service(struct user_native_vfork* request)
@@ -645,6 +669,7 @@ static long user_native_mapping(struct user_native_vfork* request, long nr, long
     atomic_store_uint32(&request->helper_state, 0);
     atomic_store_uint32(&request->helper_ready, 0);
     request->helper_lost = false;
+    request->helper_self = false;
     request->operation = 5;
     atomic_store_uint32(&request->service_state, 1);
     user_native_internal(SYS_futex, (long)&request->service_state, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0);
@@ -656,6 +681,26 @@ static long user_native_mapping(struct user_native_vfork* request, long nr, long
                     CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_PARENT_SETTID
                     | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID, request,
                     &request->helper_pid, NULL, &request->helper_alive);
+    if (pid < 0 && (errno == EAGAIN || errno == ENOMEM)) {
+        /* Linux would not need another task for this call. Serve the
+         * worker from this child, with every signal blocked meanwhile. */
+        request->helper_self = true;
+        atomic_store_uint32(&request->helper_pid, user_native_internal(SYS_gettid, 0, 0, 0, 0, 0, 0));
+        user_native_internal(SYS_futex, (long)&request->helper_ready, FUTEX_WAKE_PRIVATE, INT_MAX, 0, 0, 0);
+        request->operation = 2;
+        atomic_store_uint32(&request->service_state, 1);
+        user_native_internal(SYS_futex, (long)&request->service_state, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0);
+        user_native_mapping_serve(request);
+        atomic_store_uint32(&request->helper_alive, 0);
+        user_native_internal(SYS_futex, (long)&request->helper_alive, FUTEX_WAKE, INT_MAX, 0, 0, 0);
+        while (atomic_load_uint32(&request->service_state) != 2)
+            user_native_internal(SYS_futex, (long)&request->service_state, FUTEX_WAIT_PRIVATE, 1, 0, 0, 0);
+        long ret = request->mapping_result;
+        atomic_store_uint32(&request->service_state, 0);
+        user_native_internal(SYS_rt_sigprocmask, SIG_SETMASK, (long)&saved_mask, 0, 8, 0, 0);
+        request->operation = 1;
+        return ret;
+    }
     if (pid < 0) {
         int error = errno;
         atomic_store_uint32(&request->helper_alive, 0);
@@ -664,7 +709,8 @@ static long user_native_mapping(struct user_native_vfork* request, long nr, long
         user_native_internal(SYS_rt_sigprocmask, SIG_SETMASK, (long)&saved_mask, 0, 8, 0, 0);
         return -error;
     }
-    while (!atomic_load_uint32(&request->helper_ready)) {
+    for (unsigned waits = 0; !atomic_load_uint32(&request->helper_ready); ++waits) {
+        if (waits % 10 == 9) user_native_internal(SYS_kill, pid, SIGCONT, 0, 0, 0, 0);
         if (!atomic_load_uint32(&request->helper_alive)) {
             /* Killed before it could run anything. Contain it like a later
              * loss rather than return an errno this call never produces. */

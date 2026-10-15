@@ -4,7 +4,8 @@
  * terminate the parent. Afterwards execute permission at the target matches
  * the kernel: a remaining RWX mapping runs, a fresh RW mapping faults.
  * Natively there is no helper and every round completes normally. Usage:
- * test-helper-death [native helper-death-killer path] */
+ * test-helper-death [native helper-death-killer path [stop]]
+ * With stop, helpers are stopped instead: every round must still finish. */
 #define _GNU_SOURCE
 #include <assert.h>
 #include <errno.h>
@@ -27,6 +28,7 @@ static char stack[256 * 1024];
 static atomic_int child_pid, done, helpers_killed, finished, warm, phase;
 static atomic_int phase_kills[4], wanted;
 static volatile sig_atomic_t fault_signal;
+static int stop_mode, last_stopped;
 static uintptr_t target;
 static sigjmp_buf fault;
 
@@ -83,8 +85,10 @@ static void* killer(void* unused)
         list[n] = 0;
         int helper = atoi(list), current = atomic_load(&phase);
         if (helper <= 0 || current != atomic_load(&wanted)) continue;
-        if (atomic_load(&helpers_killed) & 1) kill(helper, SIGSTOP);
-        if (!kill(helper, SIGKILL)) {
+        if (stop_mode && helper == last_stopped) continue; /* once, as job control would */
+        last_stopped = helper;
+        if (!stop_mode && (atomic_load(&helpers_killed) & 1)) kill(helper, SIGSTOP);
+        if (!kill(helper, stop_mode ? SIGSTOP : SIGKILL)) {
             atomic_fetch_add(&phase_kills[current], 1);
             atomic_fetch_add(&helpers_killed, 1);
         }
@@ -124,7 +128,8 @@ int main(int argc, char** argv)
 {
     alarm(120);
     /* Optional native helper-death-killer also covers munmap/mmap windows. */
-    if (argc == 2) {
+    stop_mode = argc == 3 && !strcmp(argv[2], "stop");
+    if (argc == 2 || stop_mode) {
         char guest[16], phase_address[32], wanted_address[32];
         snprintf(guest, sizeof(guest), "%d", getpid());
         snprintf(phase_address, sizeof(phase_address), "%lx", (unsigned long)&phase);
@@ -132,7 +137,7 @@ int main(int argc, char** argv)
         pid_t external = fork();
         assert(external >= 0);
         if (!external) {
-            execl(argv[1], argv[1], guest, phase_address, wanted_address, NULL);
+            execl(argv[1], argv[1], guest, phase_address, wanted_address, stop_mode ? "stop" : NULL, NULL);
             _exit(127);
         }
     }
@@ -157,7 +162,10 @@ int main(int argc, char** argv)
         atomic_store(&done, 1);
         int status;
         assert(waitpid(pid, &status, 0) == pid);
-        if (atomic_load(&helpers_killed) != before
+        if (stop_mode) {
+            /* Stopped helpers are resumed: the child finishes normally. */
+            assert(WIFEXITED(status) && !WEXITSTATUS(status));
+        } else if (atomic_load(&helpers_killed) != before
             && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL) {
             /* Contained to the child, as if it had been killed in the call.
              * A helper killed after publishing its result costs nothing. */
@@ -195,7 +203,8 @@ int main(int argc, char** argv)
     }
     atomic_store(&finished, 1);
     assert(!pthread_join(thread, NULL));
-    printf("PASS parent survives helper SIGKILL; execute permission matches kernel "
+    printf("PASS parent survives helper %s; execute permission matches kernel ", stop_mode ? "SIGSTOP" : "SIGKILL");
+    printf(
            "(contained rounds=%d; kills during mmap=%d populate=%d mprotect=%d munmap=%d)\n", killed_rounds,
            atomic_load(&phase_kills[0]), atomic_load(&phase_kills[1]),
            atomic_load(&phase_kills[2]), atomic_load(&phase_kills[3]));

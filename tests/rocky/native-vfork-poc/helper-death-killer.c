@@ -4,7 +4,8 @@
  * targeted phase. A guest thread cannot observe the mmap/munmap windows:
  * emulator mapping locks serialize it with the operation. The guest's phase
  * variables are read with process_vm_readv (same UID, ptrace READ access).
- * Usage: helper-death-killer <guest-pid> <phase-address> <wanted-address> */
+ * Usage: helper-death-killer <guest-pid> <phase-address> <wanted-address> [stop]
+ * With stop, helpers are stopped instead of killed. */
 #define _GNU_SOURCE
 #include <signal.h>
 #include <stdio.h>
@@ -32,10 +33,12 @@ static int guest_int(pid_t guest, unsigned long address)
 
 int main(int argc, char** argv)
 {
-    if (argc != 4) return 2;
+    if (argc != 4 && !(argc == 5 && !strcmp(argv[4], "stop"))) return 2;
+    int signal_number = argc == 5 ? SIGSTOP : SIGKILL;
     pid_t guest = atoi(argv[1]);
     unsigned long phase = strtoul(argv[2], NULL, 16), wanted = strtoul(argv[3], NULL, 16);
     unsigned long kills[4] = {0};
+    int last_stopped = 0; /* stop each helper once, as job control would */
     char path[128], list[4096], helpers[4096];
     while (!kill(guest, 0)) {
         snprintf(path, sizeof(path), "/proc/%d/task/%d/children", guest, guest);
@@ -47,7 +50,11 @@ int main(int argc, char** argv)
             if (read_file(path, helpers, sizeof(helpers)) <= 0) continue;
             int helper = atoi(helpers), current = guest_int(guest, phase);
             if (helper > 0 && current >= 0 && current < 4 && current == guest_int(guest, wanted)
-                && !kill(helper, SIGKILL)) ++kills[current];
+                && !(signal_number == SIGSTOP && helper == last_stopped)
+                && !kill(helper, signal_number)) {
+                ++kills[current];
+                last_stopped = helper;
+            }
         }
     }
     fprintf(stderr, "killer: mmap=%lu populate=%lu mprotect=%lu munmap=%lu\n",
