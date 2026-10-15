@@ -15,6 +15,10 @@ struct user_observer {
     void* marker;
     size_t marker_size;
     int root, maps, smaps, owner_fd, children, cookie;
+    /* Pinned proc numbers PIDs in its mount's namespace, which may be an
+     * ancestor of the active one; owner_proc is the owner's PID there. */
+    bool nested;
+    unsigned long owner_proc;
     struct stat identity;
     char input[4096], line[256];
 };
@@ -106,6 +110,95 @@ static bool user_observer_lines(struct user_observer* observer, int fd, bool cow
     return false;
 }
 
+/* Read a numeric status/fdinfo field below the pinned proc root. For NSpid,
+ * first is the proc mount's namespace and last the task's active one. */
+static bool user_observer_field(struct user_observer* observer, const char* path, const char* field,
+                                unsigned long* first, unsigned long* last, unsigned* count)
+{
+    int fd = user_observer_raw(SYS_openat, observer->root, (long)path, O_RDONLY | O_CLOEXEC, 0, 0, 0);
+    if (fd < 0) return false;
+    size_t length = strlen(field), used = 0;
+    bool found = false;
+    long bytes;
+    while (!found && (bytes = user_observer_raw(SYS_read, fd, (long)observer->input,
+                                                sizeof(observer->input), 0, 0, 0)) > 0) {
+        for (long i = 0; i < bytes && !found; ++i) {
+            char byte = observer->input[i];
+            if (byte != '\n') {
+                if (used + 1 < sizeof(observer->line)) observer->line[used++] = byte;
+                continue;
+            }
+            observer->line[used] = 0;
+            used = 0;
+            if (memcmp(observer->line, field, length)) continue;
+            found = true;
+            *count = 0;
+            for (const char* at = observer->line + length;;) {
+                while (*at == ' ' || *at == '\t') ++at;
+                if (*at < '0' || *at > '9') break;
+                unsigned long value = user_observer_number(&at, 10);
+                if (!(*count)++) *first = value;
+                *last = value;
+            }
+        }
+    }
+    user_observer_raw(SYS_close, fd, 0, 0, 0, 0, 0);
+    return found && *count;
+}
+
+/* Proc-namespace PID to the active namespace, the one gettid() reports. */
+static unsigned long user_observer_active_pid(struct user_observer* observer, unsigned long pid)
+{
+    if (!observer->nested) return pid;
+    char path[48];
+    user_observer_decimal(path, pid);
+    memcpy(path + strlen(path), "/status", 8);
+    unsigned long first, last;
+    unsigned count;
+    return user_observer_field(observer, path, "NSpid:", &first, &last, &count) ? last : 0;
+}
+
+/* Active-namespace caller TID to proc numbering: scan the owner's tasks. */
+static unsigned long user_observer_proc_tid(struct user_observer* observer, unsigned long tid)
+{
+    if (!observer->nested) return tid;
+    if (!observer->owner_proc) return 0;
+    char path[64];
+    user_observer_decimal(path, observer->owner_proc);
+    size_t base = strlen(path);
+    memcpy(path + base, "/task", 6);
+    int dir = user_observer_raw(SYS_openat, observer->root, (long)path,
+                                O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0, 0, 0);
+    if (dir < 0) return 0;
+    char entries[2048];
+    unsigned long found = 0;
+    long bytes;
+    while (!found && (bytes = user_observer_raw(SYS_getdents64, dir, (long)entries,
+                                                sizeof(entries), 0, 0, 0)) > 0) {
+        for (long at = 0; at < bytes && !found;) {
+            /* linux_dirent64: d_reclen at 16, d_name at 19. */
+            const char* name = entries + at + 19;
+            unsigned short length;
+            memcpy(&length, entries + at + 16, sizeof(length));
+            if (!length) break;
+            at += length;
+            if (*name < '1' || *name > '9') continue;
+            const char* digits = name;
+            unsigned long candidate = user_observer_number(&digits, 10);
+            path[base] = '/';
+            memcpy(path + base + 1, "task/", 5);
+            user_observer_decimal(path + base + 6, candidate);
+            memcpy(path + strlen(path), "/status", 8);
+            unsigned long first, last;
+            unsigned count;
+            if (user_observer_field(observer, path, "NSpid:", &first, &last, &count) && last == tid)
+                found = candidate;
+        }
+    }
+    user_observer_raw(SYS_close, dir, 0, 0, 0, 0, 0);
+    return found;
+}
+
 static bool user_observer_internal_pid(struct user_observer* observer, unsigned pid)
 {
     if (pid == (unsigned)observer->pid) return true;
@@ -119,9 +212,11 @@ static bool user_observer_internal_pid(struct user_observer* observer, unsigned 
     return false;
 }
 
-static bool user_observer_candidate(struct user_observer* observer, unsigned pid)
+/* Returns the candidate's active-namespace PID, or zero. */
+static unsigned user_observer_candidate(struct user_observer* observer, unsigned pid)
 {
-    if (user_observer_internal_pid(observer, pid)) return false;
+    unsigned active = user_observer_active_pid(observer, pid);
+    if (!active || user_observer_internal_pid(observer, active)) return 0;
     char path[48];
     user_observer_decimal(path, pid);
     size_t length = strlen(path);
@@ -130,7 +225,7 @@ static bool user_observer_candidate(struct user_observer* observer, unsigned pid
     if (maps < 0) return false;
     bool found = user_observer_lines(observer, maps, false);
     user_observer_raw(SYS_close, maps, 0, 0, 0, 0, 0);
-    return found;
+    return found ? active : 0;
 }
 
 static long user_observer_find(struct user_observer* observer)
@@ -152,13 +247,14 @@ static long user_observer_find(struct user_observer* observer)
                 pid = pid * 10 + digit;
             } else {
                 if (digit != ' ') return -EIO;
-                if (pid && user_observer_candidate(observer, pid)) return pid;
+                unsigned active = pid ? user_observer_candidate(observer, pid) : 0;
+                if (active) return active;
                 pid = 0;
             }
         }
     }
     if (ret < 0) return ret;
-    return pid && user_observer_candidate(observer, pid) ? pid : 0;
+    return pid ? user_observer_candidate(observer, pid) : 0;
 }
 
 static void user_observer_cookie_close(struct user_observer* observer)
@@ -187,11 +283,13 @@ static long user_observer_cookie_open(struct user_observer* observer)
     if (ret < 0) return ret;
     ret = user_observer_raw(SYS_mprotect, (long)observer->marker, observer->marker_size, PROT_READ, 0, 0, 0);
     if (ret < 0) return ret;
+    unsigned long caller = user_observer_proc_tid(observer, observer->caller);
+    if (!caller) return -ESRCH;
     char path[64];
-    user_observer_decimal(path, observer->caller);
+    user_observer_decimal(path, caller);
     size_t length = strlen(path);
     memcpy(path + length, "/task/", 6);
-    user_observer_decimal(path + length + 6, observer->caller);
+    user_observer_decimal(path + length + 6, caller);
     length = strlen(path);
     memcpy(path + length, "/children", 10);
     observer->children = user_observer_raw(SYS_openat, observer->root, (long)path,
@@ -210,6 +308,19 @@ static __attribute__((no_stack_protector)) int user_observer_main(void* opaque)
     if (ret >= 0) ret = observer->maps = user_observer_raw(SYS_openat, observer->root, (long)"self/maps", O_RDONLY | O_CLOEXEC, 0, 0, 0);
     if (ret >= 0) ret = observer->smaps = user_observer_raw(SYS_openat, observer->root, (long)"self/smaps", O_RDONLY | O_CLOEXEC, 0, 0, 0);
     if (ret >= 0) ret = observer->owner_fd = user_observer_raw(SYS_pidfd_open, observer->owner, 0, 0, 0, 0, 0);
+    if (ret >= 0) {
+        /* A single NSpid level proves proc numbers match gettid(). Without
+         * NSpid support, keep the identity mapping. */
+        unsigned long first, last;
+        unsigned count;
+        observer->nested = user_observer_field(observer, "self/status", "NSpid:", &first, &last, &count)
+            && count > 1;
+        char path[48];
+        memcpy(path, "self/fdinfo/", 12);
+        user_observer_decimal(path + 12, observer->owner_fd);
+        if (observer->nested && user_observer_field(observer, path, "Pid:", &first, &last, &count))
+            observer->owner_proc = first;
+    }
     observer->result = ret < 0 ? ret : 0;
     atomic_store_uint32(&observer->state, 2);
     user_observer_raw(SYS_futex, (long)&observer->state, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0);
