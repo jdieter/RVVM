@@ -200,6 +200,9 @@ override USER_STATIC := 1
 override bin_ldflags_rvvm_user := -static-pie
 else
 override bin_ldflags_rvvm_user := -pie
+$(call log_warn,Cannot link static-pie (install glibc-static?): rvvm_user will be dynamic. It can \
+run guests directly but fails as a binfmt interpreter inside chroots such as mock. It also lacks \
+private-mm VFORK.)
 endif
 ifneq (,$(USER_STATIC))
 ifneq (,$(call check_compile,int main(void){_Static_assert(__GLIBC__ == 2 && __GLIBC_MINOR__ >= 34 && __GLIBC_MINOR__ <= 43$(COMMA) "glibc");return 0;},-include features.h,static-glibc-fork-34-43))
