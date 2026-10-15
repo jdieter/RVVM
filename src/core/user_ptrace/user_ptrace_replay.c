@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -16,12 +17,91 @@ struct replay {
     bool sent;
     struct user_ptrace_replay_entry entry;
 };
-static spinlock_t replay_lock = SPINLOCK_INIT;
-static struct replay* replays;
-static struct replay** replay_tail = &replays;
-static uint64_t next_token = 1;
+struct replay_records {
+    spinlock_t lock;
+    struct replay *nodes, **last;
+    uint64_t token;
+    void* (*allocate)(void*, size_t, void*);
+    void* opaque;
+};
+static struct replay_records initial_records = {
+    .lock = SPINLOCK_INIT, .last = &initial_records.nodes, .token = 1,
+};
+static _Thread_local struct replay_records* selected_records;
+static struct replay_records* records(void)
+{
+    return selected_records ? selected_records : &initial_records;
+}
+#define replay_lock (records()->lock)
+#define replays (records()->nodes)
+#define replay_tail (records()->last)
+#define next_token (records()->token)
+
+void* user_ptrace_replay_records_new(void* (*allocate)(void*, size_t, void*), void* opaque)
+{
+    struct replay_records* next = calloc(1, sizeof(*next));
+    if (next) {
+        spin_init(&next->lock);
+        next->last = &next->nodes;
+        next->token = 1;
+        next->allocate = allocate;
+        next->opaque = opaque;
+    }
+    return next;
+}
+
+void user_ptrace_replay_records_free(void* pointer)
+{
+    struct replay_records* owned = pointer;
+    if (!owned) return;
+    if (!owned->allocate) while (owned->nodes) {
+        struct replay* node = owned->nodes;
+        owned->nodes = node->next;
+        free(node);
+    }
+    free(owned);
+}
+
+void* user_ptrace_replay_temporary(size_t size)
+{
+    return records()->allocate ? records()->allocate(records()->opaque, size, NULL) : malloc(size);
+}
+
+void user_ptrace_replay_temporary_free(void* pointer)
+{
+    if (records()->allocate) records()->allocate(records()->opaque, 0, pointer);
+    else free(pointer);
+}
 static __thread struct user_ptrace_replay_entry* mailbox;
 static __thread size_t mailbox_count;
+static __thread void* (*mailbox_allocator)(void*, size_t, void*);
+static __thread void* mailbox_allocator_opaque;
+
+void user_ptrace_replay_context_save(struct user_ptrace_replay_context* context)
+{
+    *context = (struct user_ptrace_replay_context){
+        mailbox, mailbox_count, mailbox_allocator, mailbox_allocator_opaque, selected_records,
+    };
+}
+
+void user_ptrace_replay_context_load(const struct user_ptrace_replay_context* context)
+{
+    mailbox = context->mailbox;
+    mailbox_count = context->count;
+    mailbox_allocator = context->allocate;
+    mailbox_allocator_opaque = context->opaque;
+    selected_records = context->records;
+}
+
+void user_ptrace_replay_context_release(struct user_ptrace_replay_context* context)
+{
+    if (context->mailbox) {
+        if (context->allocate) context->allocate(context->opaque, 0, context->mailbox);
+        else munmap(context->mailbox, context->count * sizeof(*context->mailbox));
+    }
+    context->mailbox = NULL;
+    context->count = 0;
+}
 
 static int send_replay(struct replay* node, pid_t tgid)
 {
@@ -36,8 +116,9 @@ static int send_replay(struct replay* node, pid_t tgid)
 
 static int store_replay(pid_t pid, pid_t tgid, const siginfo_t* info, bool send)
 {
-    struct replay* node = calloc(1, sizeof(*node));
+    struct replay* node = user_ptrace_replay_temporary(sizeof(*node));
     if (!node) return -ENOMEM;
+    memset(node, 0, sizeof(*node));
     node->pid = pid;
     node->entry.info = *info;
     node->entry.sender = getpid();
@@ -50,7 +131,7 @@ static int store_replay(pid_t pid, pid_t tgid, const siginfo_t* info, bool send)
         replay_tail = &node->next;
     }
     spin_unlock(&replay_lock);
-    if (ret) free(node);
+    if (ret) user_ptrace_replay_temporary_free(node);
     return ret;
 }
 
@@ -134,7 +215,7 @@ bool user_ptrace_replay_take(pid_t pid, const siginfo_t* tagged, siginfo_t* orig
             *original = node->entry.info;
             *link = node->next;
             if (!*link) replay_tail = link;
-            free(node);
+            user_ptrace_replay_temporary_free(node);
             found = true;
             break;
         }
@@ -151,13 +232,18 @@ struct user_ptrace_replay_entry* user_ptrace_replay_allocate(size_t count)
     if (count > SIZE_MAX / sizeof(*mailbox) - active) { errno = ENOMEM; return NULL; }
     size_t length = active + count;
     if (!length) return NULL;
-    struct user_ptrace_replay_entry* next = mmap(NULL, length * sizeof(*next),
-        PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (next == MAP_FAILED) return NULL;
+    struct user_ptrace_replay_entry* next = mailbox_allocator
+        ? mailbox_allocator(mailbox_allocator_opaque, length * sizeof(*next), NULL)
+        : mmap(NULL, length * sizeof(*next), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (!next || next == MAP_FAILED) { errno = ENOMEM; return NULL; }
+    /* mmap is zero-filled; a trusted-runtime allocator need not be. */
+    if (mailbox_allocator) memset(next, 0, length * sizeof(*next));
     size_t index = 0;
     for (size_t i = 0; i < mailbox_count; i++)
         if (mailbox[i].token) next[index++] = mailbox[i];
-    if (mailbox) munmap(mailbox, mailbox_count * sizeof(*mailbox));
+    struct user_ptrace_replay_context old;
+    user_ptrace_replay_context_save(&old);
+    user_ptrace_replay_context_release(&old);
     mailbox = next;
     mailbox_count = length;
     return next + active;
@@ -188,7 +274,7 @@ void user_ptrace_replay_remove(pid_t pid)
         if (!pid || node->pid == pid) {
             *link = node->next;
             if (!*link) replay_tail = link;
-            free(node);
+            user_ptrace_replay_temporary_free(node);
         }
         else link = &node->next;
     }
@@ -197,7 +283,9 @@ void user_ptrace_replay_remove(pid_t pid)
 
 void user_ptrace_replay_thread_destroy(void)
 {
-    if (mailbox) munmap(mailbox, mailbox_count * sizeof(*mailbox));
+    struct user_ptrace_replay_context old;
+    user_ptrace_replay_context_save(&old);
+    user_ptrace_replay_context_release(&old);
     mailbox = NULL;
     mailbox_count = 0;
 }

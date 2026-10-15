@@ -38,6 +38,26 @@ void user_fd_guard_select(user_fd_guard_t* guard);
 void user_fd_guard_default(user_fd_guard_t* guard);
 /* Finish pending table recovery after acquiring the outermost guard. */
 void user_fd_guard_set_resume(void (*resume)(void));
+#ifdef USER_NATIVE_VFORK_POC
+struct user_fd_registration {
+    user_fd_mutex_t* lock;
+    struct robust_list_head* head;
+    struct robust_list* node;
+    struct robust_list* next;
+};
+typedef struct {
+    user_fd_guard_t* selected;
+    unsigned depth;
+    uint32_t tid, marker;
+    void (*resume)(void);
+    struct user_fd_registration registrations[8];
+    unsigned registration_count;
+} user_fd_context_t;
+/* Shared-mm children borrow native TLS. Save/restore all guard state without
+ * touching the lender's robust-list nodes or process-global default guard. */
+void user_fd_context_save(user_fd_context_t* context);
+void user_fd_context_load(const user_fd_context_t* context);
+#endif
 /* Protect the entire lifetime of private temporary descriptors. */
 void user_fd_lock(void);
 void user_fd_unlock(void);

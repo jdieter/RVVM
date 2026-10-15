@@ -26,6 +26,12 @@ struct user_ptrace_stop {
     struct user_ptrace_event event;
     uint64_t bridge_hint, hart_hint;
 };
+void* user_ptrace_events_context_new(void);
+void* user_ptrace_events_context_current(void);
+void user_ptrace_events_context_select(void*);
+void user_ptrace_events_context_free(void*);
+/* The owner retires retained allocations after the shared-mm process dies. */
+void user_ptrace_events_context_allocator(void*, void* (*)(void*, size_t, void*), void*);
 
 /* All returned records are copies. No call invokes ptrace or resumes a child. */
 bool user_ptrace_events_push(const struct user_ptrace_event*);

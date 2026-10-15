@@ -44,8 +44,6 @@ static struct user_fork_slot* user_fork_cache_prepare(user_fd_table_t* source, b
         *slot->guard = (user_fd_guard_t){.refs = slot->guard_refs};
         *slot->table_refs = *slot->guard_refs = 1;
         slot->table->exe_fd = atomic_load_uint32_relax(&source->exe_fd);
-        slot->table->vm_fd = atomic_load_uint32_relax(&source->vm_fd);
-        slot->table->vm_service = source->vm_service;
         memcpy(slot->table->descriptor, source->descriptor, sizeof(source->descriptor));
         return slot;
     }

@@ -1520,11 +1520,14 @@ void rvvm_user_jit_reclaim(rvvm_hart_t* hart)
 #endif
 }
 
-PUBLIC rvvm_hart_t* rvvm_create_user_thread(rvvm_machine_t* machine)
+static rvvm_hart_t* user_thread_create(rvvm_machine_t* machine, bool interpreter)
 {
     if (likely(machine)) {
         rvvm_hart_t* thread = riscv_hart_init(machine);
         if (!thread) return NULL;
+#ifdef USER_NATIVE_VFORK_POC
+        thread->user_native_interpreter = interpreter;
+#endif
 
         // Allow time CSR access from U-mode
         thread->csr.counteren[RISCV_PRIV_MACHINE]    = CSR_COUNTEREN_MASK;
@@ -1547,7 +1550,7 @@ PUBLIC rvvm_hart_t* rvvm_create_user_thread(rvvm_machine_t* machine)
 
         bool published = false;
         scoped_spin_lock (&global_lock) {
-            bool prepare = true;
+            bool prepare = !interpreter;
 #if defined(RVVM_USER_TEST) && defined(__linux__) && defined(USE_JIT)
             struct rlimit limit;
             if (!getrlimit(RLIMIT_AS, &limit) && limit.rlim_cur != RLIM_INFINITY) {
@@ -1560,7 +1563,7 @@ PUBLIC rvvm_hart_t* rvvm_create_user_thread(rvvm_machine_t* machine)
                     uint64_t used = rvjit_ctx_memory_size(&vector_at(machine->harts, i)->jit);
                     budget = used < budget ? budget - used : 0;
                 }
-                prepare = cache <= budget;
+                prepare = prepare && cache <= budget;
             }
 #endif
             if (prepare) {
@@ -1598,6 +1601,18 @@ PUBLIC rvvm_hart_t* rvvm_create_user_thread(rvvm_machine_t* machine)
     }
     return NULL;
 }
+
+PUBLIC rvvm_hart_t* rvvm_create_user_thread(rvvm_machine_t* machine)
+{
+    return user_thread_create(machine, false);
+}
+
+#ifdef USER_NATIVE_VFORK_POC
+rvvm_hart_t* rvvm_create_user_thread_interpreter(rvvm_machine_t* machine)
+{
+    return user_thread_create(machine, true);
+}
+#endif
 
 PUBLIC void rvvm_free_user_thread(rvvm_hart_t* thread)
 {

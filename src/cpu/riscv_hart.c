@@ -100,7 +100,12 @@ rvvm_addr_t riscv_hart_run_userland(rvvm_hart_t* vm)
     if (flush) {
         riscv_jit_flush_cache(vm);
         riscv_tlb_flush(vm);
-        if (flush & 6) rvvm_user_jit_reclaim(vm);
+        if (flush & 6) {
+#ifdef USER_NATIVE_VFORK_POC
+            if (!vm->user_native_interpreter)
+#endif
+                rvvm_user_jit_reclaim(vm);
+        }
     }
 #endif
     if (atomic_load_uint32(&vm->user_signal_pending)) {

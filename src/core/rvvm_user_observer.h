@@ -1,0 +1,334 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+#ifndef RVVM_USER_OBSERVER_H
+#define RVVM_USER_OBSERVER_H
+
+/* Only the trusted worker calls this protocol. The observer owns its files
+ * and limits, and never executes a guest operation or borrows libc TLS. */
+struct user_observer {
+    user_fd_mutex_t lock;
+    uint32_t state, alive;
+    pid_t owner, pid, caller;
+    long result;
+    int operation;
+    struct user_native_vfork* request;
+    void* stack;
+    void* marker;
+    size_t marker_size;
+    int root, maps, smaps, owner_fd, children, cookie;
+    struct stat identity;
+    char input[4096], line[256];
+};
+static struct user_observer* user_observer;
+static struct user_native_vfork* user_native_requests;
+
+static long user_observer_raw(long nr, long a, long b, long c, long d, long e, long f)
+{
+    return user_native_internal(nr, a, b, c, d, e, f);
+}
+
+static unsigned long user_observer_number(const char** text, unsigned base)
+{
+    unsigned long number = 0;
+    for (;;) {
+        unsigned digit = (unsigned char)**text;
+        digit = digit >= '0' && digit <= '9' ? digit - '0'
+              : digit >= 'a' && digit <= 'f' ? digit - 'a' + 10 : 255;
+        if (digit >= base) break;
+        number = number * base + digit;
+        ++*text;
+    }
+    return number;
+}
+
+static void user_observer_decimal(char* output, unsigned long value)
+{
+    char reverse[24];
+    size_t count = 0;
+    do { reverse[count++] = '0' + value % 10; value /= 10; } while (value);
+    while (count) *output++ = reverse[--count];
+    *output = 0;
+}
+
+static bool user_observer_map_identity(const char* line, struct user_observer* observer)
+{
+    /* start-end perms offset major:minor inode */
+    const char* at = line;
+    user_observer_number(&at, 16);
+    if (*at++ != '-') return false;
+    user_observer_number(&at, 16);
+    while (*at == ' ') ++at;
+    for (unsigned i = 0; i < 4 && *at; ++i) ++at;
+    while (*at == ' ') ++at;
+    user_observer_number(&at, 16);
+    while (*at == ' ') ++at;
+    unsigned major_id = user_observer_number(&at, 16);
+    if (*at++ != ':') return false;
+    unsigned minor_id = user_observer_number(&at, 16);
+    while (*at == ' ') ++at;
+    unsigned long inode = user_observer_number(&at, 10);
+    return inode == observer->identity.st_ino
+        && major_id == major(observer->identity.st_dev)
+        && minor_id == minor(observer->identity.st_dev);
+}
+
+static bool user_observer_lines(struct user_observer* observer, int fd, bool cow)
+{
+    if (user_observer_raw(SYS_lseek, fd, 0, SEEK_SET, 0, 0, 0) < 0) return false;
+    size_t used = 0;
+    bool selected = false;
+    long count;
+    while ((count = user_observer_raw(SYS_read, fd, (long)observer->input,
+                                      sizeof(observer->input), 0, 0, 0)) > 0) {
+        for (long i = 0; i < count; ++i) {
+            char byte = observer->input[i];
+            if (byte != '\n') {
+                if (used + 1 < sizeof(observer->line)) observer->line[used++] = byte;
+                continue;
+            }
+            observer->line[used] = 0;
+            if (user_observer_map_identity(observer->line, observer)) {
+                if (!cow) return true;
+                selected = true;
+            } else if (cow && selected) {
+                const char* at = observer->line;
+                user_observer_number(&at, 16);
+                if (*at == '-') selected = false;
+                if ((!memcmp(observer->line, "Shared_Dirty:", 13)
+                     || !memcmp(observer->line, "Shared_Clean:", 13))) {
+                    at = observer->line + 13;
+                    while (*at == ' ') ++at;
+                    if (user_observer_number(&at, 10)) return true;
+                }
+            }
+            used = 0;
+        }
+    }
+    return false;
+}
+
+static bool user_observer_internal_pid(struct user_observer* observer, unsigned pid)
+{
+    if (pid == (unsigned)observer->pid) return true;
+    /* The trusted worker holds mmap_lock: membership and helper creation
+     * cannot change until this snapshot witness has been accepted. */
+    for (struct user_native_vfork* item = user_native_requests; item; item = item->observer_next) {
+        if (item == observer->request) continue;
+        if (pid == atomic_load_uint32(item->clone_marker)
+            || pid == atomic_load_uint32(&item->helper_pid)) return true;
+    }
+    return false;
+}
+
+static bool user_observer_candidate(struct user_observer* observer, unsigned pid)
+{
+    if (user_observer_internal_pid(observer, pid)) return false;
+    char path[48];
+    user_observer_decimal(path, pid);
+    size_t length = strlen(path);
+    memcpy(path + length, "/maps", 6);
+    int maps = user_observer_raw(SYS_openat, observer->root, (long)path, O_RDONLY | O_CLOEXEC, 0, 0, 0);
+    if (maps < 0) return false;
+    bool found = user_observer_lines(observer, maps, false);
+    user_observer_raw(SYS_close, maps, 0, 0, 0, 0, 0);
+    return found;
+}
+
+static long user_observer_find(struct user_observer* observer)
+{
+    if (observer->request->private_thread)
+        return user_observer_lines(observer, observer->smaps, true) ? 1 : 0;
+    long ret = user_observer_raw(SYS_lseek, observer->children, 0, SEEK_SET, 0, 0, 0);
+    if (ret < 0) return ret;
+    /* Maps parsing reuses input; stream the child list through its own
+     * buffer so large families don't impose a PID-count ceiling. */
+    char children[4096];
+    unsigned pid = 0;
+    while ((ret = user_observer_raw(SYS_read, observer->children, (long)children, sizeof(children), 0, 0, 0)) > 0) {
+        for (long i = 0; i < ret; ++i) {
+            unsigned digit = (unsigned char)children[i];
+            if (digit >= '0' && digit <= '9') {
+                digit -= '0';
+                if (pid > (UINT32_MAX - digit) / 10) return -EIO;
+                pid = pid * 10 + digit;
+            } else {
+                if (digit != ' ') return -EIO;
+                if (pid && user_observer_candidate(observer, pid)) return pid;
+                pid = 0;
+            }
+        }
+    }
+    if (ret < 0) return ret;
+    return pid && user_observer_candidate(observer, pid) ? pid : 0;
+}
+
+static void user_observer_cookie_close(struct user_observer* observer)
+{
+    if (observer->children >= 0) user_observer_raw(SYS_close, observer->children, 0, 0, 0, 0, 0);
+    if (observer->marker) user_observer_raw(SYS_munmap, (long)observer->marker, observer->marker_size, 0, 0, 0, 0);
+    if (observer->cookie >= 0) user_observer_raw(SYS_close, observer->cookie, 0, 0, 0, 0, 0);
+    observer->children = observer->cookie = -1;
+    observer->marker = NULL;
+}
+
+static long user_observer_cookie_open(struct user_observer* observer)
+{
+    observer->cookie = user_observer_raw(SYS_memfd_create, (long)"rvvm-snapshot", MFD_CLOEXEC, 0, 0, 0, 0);
+    if (observer->cookie < 0) return observer->cookie;
+    long ret = user_observer_raw(SYS_ftruncate, observer->cookie, observer->marker_size, 0, 0, 0, 0);
+    if (ret < 0) return ret;
+    ret = user_observer_raw(SYS_fstat, observer->cookie, (long)&observer->identity, 0, 0, 0, 0);
+    if (ret < 0) return ret;
+    ret = user_observer_raw(SYS_mmap, 0, observer->marker_size, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE, observer->cookie, 0);
+    if (ret < 0 && ret >= -4095) return ret;
+    observer->marker = (void*)ret;
+    *(volatile unsigned char*)observer->marker = 1;
+    ret = user_observer_raw(SYS_madvise, ret, observer->marker_size, MADV_UNMERGEABLE, 0, 0, 0);
+    if (ret < 0) return ret;
+    ret = user_observer_raw(SYS_mprotect, (long)observer->marker, observer->marker_size, PROT_READ, 0, 0, 0);
+    if (ret < 0) return ret;
+    char path[64];
+    user_observer_decimal(path, observer->caller);
+    size_t length = strlen(path);
+    memcpy(path + length, "/task/", 6);
+    user_observer_decimal(path + length + 6, observer->caller);
+    length = strlen(path);
+    memcpy(path + length, "/children", 10);
+    observer->children = user_observer_raw(SYS_openat, observer->root, (long)path,
+                                          O_RDONLY | O_CLOEXEC, 0, 0, 0);
+    return observer->children < 0 ? observer->children : 0;
+}
+
+static __attribute__((no_stack_protector)) int user_observer_main(void* opaque)
+{
+    struct user_observer* observer = opaque;
+    uint64_t mask = UINT64_MAX;
+    user_observer_raw(SYS_rt_sigprocmask, SIG_SETMASK, (long)&mask, 0, 8, 0, 0);
+    long ret = user_observer_raw(SYS_setsid, 0, 0, 0, 0, 0, 0);
+    if (ret >= 0) ret = user_observer_raw(SYS_close_range, 0, UINT32_MAX, 0, 0, 0, 0);
+    if (ret >= 0) ret = observer->root = user_observer_raw(SYS_openat, AT_FDCWD, (long)"/proc", O_PATH | O_DIRECTORY | O_CLOEXEC, 0, 0, 0);
+    if (ret >= 0) ret = observer->maps = user_observer_raw(SYS_openat, observer->root, (long)"self/maps", O_RDONLY | O_CLOEXEC, 0, 0, 0);
+    if (ret >= 0) ret = observer->smaps = user_observer_raw(SYS_openat, observer->root, (long)"self/smaps", O_RDONLY | O_CLOEXEC, 0, 0, 0);
+    if (ret >= 0) ret = observer->owner_fd = user_observer_raw(SYS_pidfd_open, observer->owner, 0, 0, 0, 0, 0);
+    observer->result = ret < 0 ? ret : 0;
+    atomic_store_uint32(&observer->state, 2);
+    user_observer_raw(SYS_futex, (long)&observer->state, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0);
+    if (ret < 0) return 1;
+    for (;;) {
+        uint32_t state = atomic_load_uint32(&observer->state);
+        if (state == 3) break;
+        if (state != 1) {
+            struct pollfd owner = {.fd = observer->owner_fd, .events = POLLIN};
+            struct timespec timeout = {.tv_sec = 1};
+            if (user_observer_raw(SYS_ppoll, (long)&owner, 1, (long)&(struct timespec){0}, 0, 8, 0) > 0) break;
+            user_observer_raw(SYS_futex, (long)&observer->state, FUTEX_WAIT_PRIVATE, state, (long)&timeout, 0, 0);
+            continue;
+        }
+        if (observer->operation == 1) observer->result = user_observer_cookie_open(observer);
+        else if (observer->operation == 2) observer->result = user_observer_find(observer);
+        else { user_observer_cookie_close(observer); observer->result = 0; }
+        atomic_store_uint32(&observer->state, 2);
+        user_observer_raw(SYS_futex, (long)&observer->state, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0);
+    }
+    user_observer_cookie_close(observer);
+    return 0;
+}
+
+static void user_observer_join(struct user_observer* observer)
+{
+    atomic_store_uint32(&observer->state, 3);
+    rvvm_futex_wake(&observer->state, 1);
+    while (atomic_load_uint32(&observer->alive))
+        rvvm_futex_wait(&observer->alive, atomic_load_uint32(&observer->alive), 10000000);
+    int status;
+    syscall(SYS_wait4, observer->pid, &status, __WALL, NULL);
+    munmap(observer->stack, 1024 * 1024);
+    free(observer);
+}
+
+static user_fd_mutex_t user_observer_init_lock;
+static void user_observer_fork_child(void)
+{
+    /* No original actor survives in this mm; its inherited stack and client
+     * locks are private copies, even if a parent worker held them at fork. */
+    if (user_observer) {
+        munmap(user_observer->stack, 1024 * 1024);
+        free(user_observer);
+    }
+    user_observer = NULL;
+    user_native_requests = NULL;
+    user_observer_init_lock = (user_fd_mutex_t){0};
+}
+
+static struct user_observer* user_observer_get(void)
+{
+    user_fd_mutex_lock(&user_observer_init_lock);
+    pid_t owner = getpid();
+    if (user_observer && user_observer->owner != owner) {
+        /* These are private copies after ordinary fork. The original actor
+         * still owns its parent's mm and must not receive child requests. */
+        munmap(user_observer->stack, 1024 * 1024);
+        free(user_observer);
+        user_observer = NULL;
+        user_native_requests = NULL;
+    }
+    if (!user_observer) {
+        struct user_observer* observer = calloc(1, sizeof(*observer));
+        if (!observer) { user_fd_mutex_unlock(&user_observer_init_lock); return NULL; }
+        observer->root = observer->maps = observer->smaps = observer->owner_fd = -1;
+        observer->children = observer->cookie = -1;
+        observer->owner = owner;
+        observer->marker_size = user_vma_page();
+        observer->stack = mmap(NULL, 1024 * 1024, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (observer->stack == MAP_FAILED) {
+            free(observer); user_fd_mutex_unlock(&user_observer_init_lock); return NULL;
+        }
+        uintptr_t* packet = (void*)((char*)observer->stack + 1024 * 1024 - 2 * sizeof(uintptr_t));
+        packet[0] = (uintptr_t)user_observer_main;
+        packet[1] = (uintptr_t)observer;
+        observer->alive = UINT32_MAX;
+        struct {
+            uint64_t flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls;
+        } args = {
+            .flags = CLONE_VM | CLONE_PARENT_SETTID | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID,
+            .parent_tid = (uintptr_t)&observer->pid,
+            .child_tid = (uintptr_t)&observer->alive,
+            .stack = (uintptr_t)observer->stack,
+            .stack_size = 1024 * 1024 - 2 * sizeof(uintptr_t),
+        };
+        long ret = user_native_clone3(&args, sizeof(args));
+        if (ret < 0) {
+            munmap(observer->stack, 1024 * 1024); free(observer);
+            user_fd_mutex_unlock(&user_observer_init_lock); errno = -ret; return NULL;
+        }
+        while (atomic_load_uint32(&observer->state) != 2 && atomic_load_uint32(&observer->alive))
+            rvvm_futex_wait(&observer->state, 0, 10000000);
+        ret = observer->result;
+        if (ret < 0 || !atomic_load_uint32(&observer->alive)) {
+            user_observer_join(observer);
+            user_fd_mutex_unlock(&user_observer_init_lock); errno = ret < 0 ? -ret : EIO; return NULL;
+        }
+        atomic_store_uint32(&observer->state, 0);
+        user_observer = observer;
+    }
+    struct user_observer* result = user_observer;
+    user_fd_mutex_unlock(&user_observer_init_lock);
+    return result;
+}
+
+static long user_observer_call(struct user_observer* observer, int operation)
+{
+    observer->operation = operation;
+    atomic_store_uint32(&observer->state, 1);
+    rvvm_futex_wake(&observer->state, 1);
+    while (atomic_load_uint32(&observer->state) != 2) {
+        if (!atomic_load_uint32(&observer->alive)) return -EIO;
+        rvvm_futex_wait(&observer->state, 1, 10000000);
+    }
+    long result = observer->result;
+    atomic_store_uint32(&observer->state, 0);
+    return result;
+}
+
+#endif

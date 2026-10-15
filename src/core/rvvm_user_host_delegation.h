@@ -124,10 +124,10 @@ static no_inline long user_host_mount_setattr(int fd, const char* path, unsigned
      * A complete snapshot also preserves future extension-tail validation. */
     if (!(flags & ~(AT_EMPTY_PATH | AT_RECURSIVE | AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT))
         && size >= 32 && size <= (size_t)sysconf(_SC_PAGESIZE)) {
-        copy = malloc(size);
+        copy = user_runtime_allocate(size);
         if (!copy) { user_fd_unlock(); return -ENOMEM; }
         if (user_memory_copy(copy, attr, size)) {
-            free(copy); copy = NULL; attr = (const void*)1;
+            user_runtime_release(copy); copy = NULL; attr = (const void*)1;
         }
     }
     if (copy) {
@@ -141,7 +141,7 @@ static no_inline long user_host_mount_setattr(int fd, const char* path, unsigned
     } else {
         ret = errno_ret(USER_SYSCALL(SYS_mount_setattr, user_host_fd(fd), path, flags, attr, size, 0));
     }
-    free(copy);
+    user_runtime_release(copy);
     user_fd_unlock();
     return ret;
 }

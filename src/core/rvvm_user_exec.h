@@ -2,6 +2,22 @@
 #ifndef RVVM_USER_EXEC_H
 #define RVVM_USER_EXEC_H
 
+static long user_exec_interpreter(const char* path, char** argv, char** envp)
+{
+    char snapshot[UAPI_PATH_MAX], wrapped[UAPI_PATH_MAX];
+    long ret = user_path_copy(snapshot, path, sizeof(snapshot));
+    if (ret < 0) return ret;
+    if (USER_SYSCALL(SYS_faccessat, AT_FDCWD, wrap_path(wrapped, snapshot), F_OK, 0, 0, 0)) return -ENOENT;
+    char* next[256] = {"/proc/self/exe", "-user", (char*)path};
+    char* first;
+    if (user_memory_copy(&first, argv, sizeof(first))) return -EFAULT;
+    for (size_t i = 1; first && i < 253; ++i) {
+        if (user_memory_copy(&next[i + 2], argv + i, sizeof(*argv))) return -EFAULT;
+        if (!next[i + 2]) break;
+    }
+    return errno_ret(USER_SYSCALL(SYS_execve, "/proc/self/exe", next, envp, 0, 0, 0));
+}
+
 static long user_exec_environment(char** envp, char* marker, char*** result)
 {
     size_t count = 0, limit = (size_t)sysconf(_SC_ARG_MAX) / sizeof(char*);

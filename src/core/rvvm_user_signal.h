@@ -115,6 +115,10 @@ static THREAD_LOCAL struct {
     bool syscall_unstarted;
     bool synchronous;
 } user_sig;
+#ifdef USER_NATIVE_VFORK_POC
+static THREAD_LOCAL bool user_native_child_active;
+#include "rvvm_user_native_jump.h"
+#endif
 static void* user_sigtramp;
 static void user_fault_handler(int, siginfo_t*, void*);
 #ifdef USER_FAULT_META
@@ -181,11 +185,7 @@ static long user_safe_syscall(long nr, long a, long b, long c, long d, long e, l
         else if (nr == SYS_pselect6) { select_mask.set = &host_mask; f = (long)&select_mask; }
         else e = (long)&host_mask;
     }
-    long ret;
-    do {
-        user_vm_private_wake = false;
-        ret = user_safe_raw(&user_sig.pending, nr, a, b, c, d, e, f);
-    } while (ret == -EINTR && user_vm_private_wake && !user_sig.pending);
+    long ret = user_safe_raw(&user_sig.pending, nr, a, b, c, d, e, f);
     if (ret == -512) {
         // No host syscall ran: resume its guest instruction after the handler,
         // regardless of SA_RESTART. Never expose this private result to Linux.

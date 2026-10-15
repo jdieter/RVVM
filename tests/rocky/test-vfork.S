@@ -24,7 +24,8 @@ _start:
     ld t1, 0(t0)
     li t2, 77
     sb t2, 0(t1)
-    /* A live kernel PI lock cannot survive temporary futex-key migration. */
+    /* Eager migration cannot preserve PI keys; native shared-mm vfork can.
+     * A successful child must leave the parent's kernel ownership intact. */
     la a0, pi_lock
     li a1, 134 /* FUTEX_LOCK_PI_PRIVATE */
     li a2, 0
@@ -41,8 +42,21 @@ _start:
     li a4, 0
     li a7, 220
     ecall
-    li t0, -38 /* Explicitly unsupported with a live PI lock. */
-    bne a0, t0, fail
+    beqz a0, pi_child_exit
+    li t0, -38 /* Compatibility backend's explicit migration limitation. */
+    beq a0, t0, pi_done
+    bltz a0, fail
+    mv s0, a0
+    la a1, status
+    li a2, 0
+    li a3, 0
+    li a7, 260
+    ecall
+    bne a0, s0, fail
+    la t0, status
+    lw t0, 0(t0)
+    bnez t0, fail
+pi_done:
     la a0, pi_lock
     li a1, 135 /* FUTEX_UNLOCK_PI_PRIVATE */
     li a2, 0
@@ -147,6 +161,9 @@ _start:
     la t0, status
     lw t1, 0(t0)
     bnez t1, fail
+    li a0, 0
+    j exit
+pi_child_exit:
     li a0, 0
     j exit
 child:

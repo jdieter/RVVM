@@ -11,6 +11,20 @@ struct user_ptrace_replay_entry {
     siginfo_t info;
     pid_t sender;
 };
+struct user_ptrace_replay_context {
+    struct user_ptrace_replay_entry* mailbox;
+    size_t count;
+    void* (*allocate)(void*, size_t, void*);
+    void* opaque;
+    void* records;
+};
+void user_ptrace_replay_context_save(struct user_ptrace_replay_context*);
+void user_ptrace_replay_context_load(const struct user_ptrace_replay_context*);
+void user_ptrace_replay_context_release(struct user_ptrace_replay_context*);
+void* user_ptrace_replay_records_new(void* (*)(void*, size_t, void*), void*);
+void user_ptrace_replay_records_free(void*);
+void* user_ptrace_replay_temporary(size_t);
+void user_ptrace_replay_temporary_free(void*);
 int user_ptrace_replay_queue(pid_t, pid_t, const siginfo_t*);
 int user_ptrace_replay_store_unsent(pid_t, const siginfo_t*);
 size_t user_ptrace_replay_count(pid_t);

@@ -15,8 +15,11 @@
 #include "util/atomics.h"
 #include "util/spinlock.h"
 #include "util/user_fd_guard.h"
+#include "util/user_proc_read.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <stddef.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -65,12 +68,48 @@ static __thread uint32_t* executable_fd;
 static spinlock_t bridge_pool_lock = SPINLOCK_INIT;
 static struct bridge* bridge_pool;
 static unsigned bridge_pool_count;
+static void* bridge_marker;
+
+void user_ptrace_context_save(struct user_ptrace_context* context)
+{
+    context->bridge = self;
+    context->executable_fd = executable_fd;
+    context->stepped = stepped;
+    context->events = user_ptrace_events_context_current();
+    user_ptrace_replay_context_save(&context->replay);
+}
+
+void user_ptrace_context_load(const struct user_ptrace_context* context)
+{
+    self = context->bridge;
+    executable_fd = context->executable_fd;
+    stepped = context->stepped;
+    user_ptrace_events_context_select(context->events);
+    user_ptrace_replay_context_load(&context->replay);
+}
 static bool debug_enabled(void)
 {
     const char* value = getenv("RVVM_PTRACE_DEBUG");
     return value && *value && strcmp(value, "0");
 }
-#define TRACE(...) do { if (debug_enabled()) { fprintf(stderr, "rvvm-ptrace[%ld]: ", syscall(SYS_gettid)); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
+static void trace_message(const char* format, ...)
+{
+    if (!debug_enabled()) return;
+    /* A shared-mm child can die here; don't leave a parent's FILE lock held. */
+    char line[512];
+    int prefix = snprintf(line, sizeof(line), "rvvm-ptrace[%ld]: ", syscall(SYS_gettid));
+    if (prefix < 0 || (size_t)prefix >= sizeof(line) - 1) return;
+    va_list arguments;
+    va_start(arguments, format);
+    int suffix = vsnprintf(line + prefix, sizeof(line) - prefix, format, arguments);
+    va_end(arguments);
+    if (suffix < 0) return;
+    size_t length = prefix + (size_t)suffix;
+    if (length >= sizeof(line) - 1) length = sizeof(line) - 2;
+    line[length++] = '\n';
+    syscall(SYS_write, STDERR_FILENO, line, length);
+}
+#define TRACE(...) trace_message(__VA_ARGS__)
 
 static long host_ptrace(unsigned long request, pid_t pid, uintptr_t addr, uintptr_t data)
 {
@@ -126,8 +165,18 @@ static int remote(pid_t pid, uintptr_t addr, void* buffer, size_t size, bool wri
 
 static uintptr_t bridge_mapping_address(const char* line)
 {
-    unsigned long start;
-    if (!strstr(line, "/memfd:rvvm-ptrace-") || sscanf(line, "%lx-", &start) != 1) return 0;
+    if (!strstr(line, "/memfd:rvvm-ptrace-")) return 0;
+    uintptr_t start = 0;
+    const char* digit = line;
+    for (;;) {
+        unsigned value = *digit >= '0' && *digit <= '9' ? *digit - '0'
+            : *digit >= 'a' && *digit <= 'f' ? *digit - 'a' + 10 : 16;
+        if (value == 16) break;
+        if (start > (UINTPTR_MAX - value) / 16) return 0;
+        start = start * 16 + value;
+        ++digit;
+    }
+    if (digit == line || *digit != '-') return 0;
     /* A zero-length file labels a guard page; the state itself is anonymous.
      * Continue recognizing the older file-backed bridge layout as well. */
     if (strstr(line, "/memfd:rvvm-ptrace-marker")) start += (unsigned long)sysconf(_SC_PAGESIZE);
@@ -148,10 +197,10 @@ static uintptr_t locate_inner(pid_t pid, struct bridge* state, bool proc)
     char path[64], line[1024];
     snprintf(path, sizeof(path), "/proc/%u/maps", pid);
     user_fd_lock();
-    FILE* maps = fopen(path, "re");
-    if (!maps) { user_fd_unlock(); return 0; }
+    struct user_proc_reader maps;
+    if (!user_proc_open(&maps, path)) { user_fd_unlock(); return 0; }
     uintptr_t addr = 0;
-    while (fgets(line, sizeof(line), maps)) {
+    while (user_proc_line(&maps, line, sizeof(line))) {
         uintptr_t start = bridge_mapping_address(line);
         if (start
             && !(proc ? remote_read(pid, start, state, sizeof(*state))
@@ -161,7 +210,7 @@ static uintptr_t locate_inner(pid_t pid, struct bridge* state, bool proc)
             break;
         }
     }
-    fclose(maps);
+    user_proc_close(&maps);
     user_fd_unlock();
     if (!addr) {
         struct user_ptrace_stop stop;
@@ -188,10 +237,11 @@ bool user_ptrace_guest_task(pid_t pid, pid_t tid, bool* recognized)
     *recognized = false;
     char path[64], line[1024];
     snprintf(path, sizeof(path), "/proc/%u/maps", pid);
-    FILE* maps = fopen(path, "re");
-    if (!maps) return true;
+    struct user_proc_reader maps;
+    user_fd_lock();
+    if (!user_proc_open(&maps, path)) { user_fd_unlock(); return true; }
     bool found = false;
-    while (fgets(line, sizeof(line), maps)) {
+    while (user_proc_line(&maps, line, sizeof(line))) {
         uintptr_t address = bridge_mapping_address(line);
         if (!address) continue;
         struct bridge state;
@@ -205,21 +255,22 @@ bool user_ptrace_guest_task(pid_t pid, pid_t tid, bool* recognized)
         *recognized = true;
         if (state.tid == (uint32_t)tid) { found = true; break; }
     }
-    fclose(maps);
+    user_proc_close(&maps);
+    user_fd_unlock();
     return found;
 }
 
 static bool traced(void)
 {
-    char path[64], line[256];
-    snprintf(path, sizeof(path), "/proc/self/task/%ld/status", syscall(SYS_gettid));
+    struct user_proc_reader status;
+    char line[256];
     user_fd_lock();
-    FILE* status = fopen(path, "re");
-    if (!status) { user_fd_unlock(); return false; }
-    unsigned tracer = 0;
-    while (fgets(line, sizeof(line), status))
-        if (sscanf(line, "TracerPid: %u", &tracer) == 1) break;
-    fclose(status);
+    if (!user_proc_open(&status, "/proc/thread-self/status")) { user_fd_unlock(); return false; }
+    int32_t tracer = 0;
+    while (user_proc_line(&status, line, sizeof(line))) {
+        if (user_proc_integer(line, "TracerPid:", &tracer)) break;
+    }
+    user_proc_close(&status);
     user_fd_unlock();
     return tracer != 0;
 }
@@ -334,24 +385,32 @@ static struct bridge* allocate_bridge(void)
         memset(cached, 0, sizeof(*cached));
         return cached;
     }
-    /* Growing a private memfd can kill exec/pthread creation with SIGXFSZ
-     * under a small guest RLIMIT_FSIZE. Keep the state anonymous and label
-     * its preceding guard page with an empty memfd. Unlike anonymous VMA
-     * naming, this also works on kernels without CONFIG_ANON_VMA_NAME. */
+    /* Keep bridge state private and its empty file marker inaccessible.
+     * Clone the shared marker VMA, rather than opening another descriptor:
+     * guest NOFILE/FSIZE limits must not prevent tracing state allocation. */
     size_t page = (size_t)sysconf(_SC_PAGESIZE);
     size_t length = page + sizeof(struct bridge);
     user_fd_lock();
-    int fd = syscall(SYS_memfd_create, "rvvm-ptrace-marker", 1);
-    if (fd < 0) { user_fd_unlock(); return NULL; }
+    spin_lock(&bridge_pool_lock);
+    if (!bridge_marker) {
+        int fd = syscall(SYS_memfd_create, "rvvm-ptrace-marker", 1);
+        if (fd >= 0) {
+            void* marker = mmap(NULL, page, PROT_NONE, MAP_SHARED, fd, 0);
+            if (marker != MAP_FAILED) bridge_marker = marker;
+            close(fd);
+        }
+    }
+    void* marker = bridge_marker;
+    spin_unlock(&bridge_pool_lock);
+    user_fd_unlock();
+    if (!marker) return NULL;
     void* region = mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     struct bridge* result = NULL;
     if (region != MAP_FAILED) {
-        if (mmap(region, page, PROT_NONE, MAP_PRIVATE | MAP_FIXED, fd, 0) != MAP_FAILED)
+        if (mremap(marker, 0, page, MREMAP_MAYMOVE | MREMAP_FIXED, region) != MAP_FAILED)
             result = (void*)((char*)region + page);
         else munmap(region, length);
     }
-    close(fd);
-    user_fd_unlock();
     return result;
 }
 
@@ -399,6 +458,10 @@ void* user_ptrace_prepare(rvvm_hart_t* cpu, const uint64_t* auxv, size_t size, u
 
 void user_ptrace_cancel(void* state)
 {
+    if (self && self->clone_bridge == (uintptr_t)state) {
+        self->clone_bridge = 0;
+        self->clone_hart = 0;
+    }
     recycle_bridge(state);
 }
 
@@ -438,6 +501,19 @@ void user_ptrace_fork(rvvm_hart_t* cpu)
     self->hart = (uintptr_t)cpu;
     self->command = self->stopped = self->dirty = 0;
     self->syscall.phase = 0;
+}
+
+void user_ptrace_process_init(rvvm_hart_t* cpu, uint64_t* mask,
+                             volatile sig_atomic_t* pending, void* prepared)
+{
+    /* Shared-mm callers already selected this prepared bridge. A recovered
+     * COW child can safely retire its copied parent bridge first. */
+    struct bridge* state = prepared;
+    if (!state) return;
+    if (self && self != state) recycle_bridge(self);
+    state->tgid = syscall(SYS_getpid);
+    state->clone_hart = state->clone_bridge = 0;
+    user_ptrace_init(cpu, NULL, 0, mask, pending, state);
 }
 
 void user_ptrace_destroy(void)
@@ -895,10 +971,10 @@ static int dirty_process(pid_t pid)
     char path[64], line[1024];
     snprintf(path, sizeof(path), "/proc/%u/maps", pid);
     user_fd_lock();
-    FILE* maps = fopen(path, "re");
-    if (!maps) { user_fd_unlock(); return -errno; }
+    struct user_proc_reader maps;
+    if (!user_proc_open(&maps, path)) { user_fd_unlock(); return -errno; }
     int ret = 0;
-    while (fgets(line, sizeof(line), maps)) {
+    while (user_proc_line(&maps, line, sizeof(line))) {
         uintptr_t start = bridge_mapping_address(line);
         if (!start) continue;
         uint64_t magic;
@@ -908,7 +984,7 @@ static int dirty_process(pid_t pid)
         ret = remote(pid, start + offsetof(struct bridge, dirty), &dirty, sizeof(dirty), true);
         if (ret) break;
     }
-    fclose(maps);
+    user_proc_close(&maps);
     user_fd_unlock();
     return ret;
 }
@@ -964,11 +1040,11 @@ static int detach_mailbox(pid_t pid, uintptr_t address, struct bridge* state)
         if (user_ptrace_replay_count(pid) != count) continue;
         if (count > SIZE_MAX / sizeof(struct user_ptrace_replay_entry)) return -ENOMEM;
         size_t bytes = count * sizeof(struct user_ptrace_replay_entry);
-        struct user_ptrace_replay_entry* entries = malloc(bytes);
+        struct user_ptrace_replay_entry* entries = user_ptrace_replay_temporary(bytes);
         if (!entries) return -ENOMEM;
         int exported = user_ptrace_replay_export(pid, entries, count);
         ret = exported < 0 ? exported : remote(pid, state->replay_area, entries, bytes, true);
-        free(entries);
+        user_ptrace_replay_temporary_free(entries);
         return ret ? ret : user_ptrace_replay_resend(pid, state->tgid);
     }
 }

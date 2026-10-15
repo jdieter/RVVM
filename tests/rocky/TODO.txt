@@ -281,6 +281,15 @@ brk collisions, shared-memory RPC and host page-size constraints. Delegate
 accounting and kernel errors where possible. Audit mprotect, madvise, mremap
 and mincore where their behavior depends on the original mapping flags.
 
+Preserve partial effects when mprotect fails. Linux can remove execute
+permission from the first VMA, encounter a later hole and return ENOMEM.
+The current executable registry changes only after a successful return, so
+it incorrectly allows execution from that first VMA. Both the installed
+baseline and the native-vfork candidate fail test-mprotect-partial-exec.c;
+native ARM and x86 pass. Don't infer guest execute intent from host READ
+permission: rvvm_sys_prot deliberately translates EXEC into READ. Mapping
+transaction recovery needs the completed effects, not just the final errno.
+
 Regression coverage: mapping type and alias visibility; locked-memory limits;
 fault-driven stack growth; populate behavior; huge pages; unknown flag bits;
 fixed-address replacement/collisions; shared-memory child changes; unmap and

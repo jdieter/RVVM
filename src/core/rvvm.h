@@ -308,6 +308,9 @@ struct align_cacheline rvvm_hart_t {
     uint64_t user_fault_pc;
     volatile uint32_t user_fault_interpreted;
     uint32_t user_cache_flush;
+#ifdef USER_NATIVE_VFORK_POC
+    bool user_native_interpreter;
+#endif
 #endif
 
     // AIA register files for M/S modes
@@ -370,5 +373,8 @@ void rvvm_user_fork_unlock(void);
 void rvvm_user_fork_child(rvvm_hart_t* thread);
 void rvvm_user_jit_pressure(rvvm_hart_t* thread);
 void rvvm_user_jit_reclaim(rvvm_hart_t* thread);
+#ifdef USER_NATIVE_VFORK_POC
+rvvm_hart_t* rvvm_create_user_thread_interpreter(rvvm_machine_t* machine);
+#endif
 
 #endif

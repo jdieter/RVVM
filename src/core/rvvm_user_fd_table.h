@@ -22,8 +22,6 @@ struct user_fd_relocation {
 
 typedef struct {
     uint32_t exe_fd;
-    uint32_t vm_fd;
-    bool vm_service;
     /* The pointer is inherited at the same address, but its allocation is
      * private: references count native threads in this process. Other
      * processes own their mappings independently, including after SIGKILL. */
@@ -49,7 +47,13 @@ typedef struct user_fd_owner {
 } user_fd_owner_t;
 static user_fd_mutex_t user_fd_owners_lock;
 static user_fd_owner_t* user_fd_owners;
-static __thread user_fd_owner_t user_fd_owner;
+static __thread user_fd_owner_t user_fd_thread_owner;
+#ifdef USER_NATIVE_VFORK_POC
+static __thread user_fd_owner_t* user_fd_owner_override;
+#define user_fd_owner (*(user_fd_owner_override ? user_fd_owner_override : &user_fd_thread_owner))
+#else
+#define user_fd_owner user_fd_thread_owner
+#endif
 static void user_exe_relocation_held(void);
 
 static user_fd_table_t* user_fd_table_alloc(user_fd_guard_t* guard)
@@ -66,7 +70,7 @@ static user_fd_table_t* user_fd_table_alloc(user_fd_guard_t* guard)
     table->refs = calloc(1, sizeof(*table->refs));
     if (!table->refs) { munmap(table, bytes); return NULL; }
     *table->refs = 1;
-    table->exe_fd = table->vm_fd = UINT32_MAX;
+    table->exe_fd = UINT32_MAX;
     table->exec_handoff = -1;
     table->guard_adjacent = !guard;
     table->guard = guard ? user_fd_guard_retain(guard)
@@ -249,8 +253,6 @@ static user_fd_table_t* user_fd_table_copy_guard(user_fd_table_t* old, bool priv
     user_fd_table_t* next = user_fd_table_alloc(private_guard ? NULL : old->guard);
     if (!next) return NULL;
     next->exe_fd = atomic_load_uint32_relax(&old->exe_fd);
-    next->vm_fd = atomic_load_uint32_relax(&old->vm_fd);
-    next->vm_service = old->vm_service;
     memcpy(next->descriptor, old->descriptor, sizeof(next->descriptor));
     return next;
 }
@@ -293,15 +295,11 @@ static long user_fd_close_range(unsigned first, unsigned last, unsigned flags)
     long ret = 0;
     if (flags & 2) ret = user_fd_table_unshare(CLONE_FILES, true);
     if (!ret) {
-        unsigned pins[2] = {atomic_load_uint32_relax(&user_fd_table()->exe_fd),
-                            atomic_load_uint32_relax(&user_fd_table()->vm_fd)};
-        if (pins[1] < pins[0]) { unsigned swap = pins[0]; pins[0] = pins[1]; pins[1] = swap; }
+        unsigned pin = atomic_load_uint32_relax(&user_fd_table()->exe_fd);
         flags &= ~2U;
         // The pin is always CLOEXEC, including when the guest asks to mark a
         // range. Do not let guest close_range invalidate proc/exe emulation.
-        for (unsigned i = 0; !ret && i < 2; ++i) {
-            unsigned pin = pins[i];
-            if (pin < first || pin > last || pin == UINT32_MAX) continue;
+        if (pin >= first && pin <= last && pin != UINT32_MAX) {
             if (first < pin) ret = errno_ret(syscall(SYS_close_range, first, pin - 1, flags));
             first = pin + 1;
         }

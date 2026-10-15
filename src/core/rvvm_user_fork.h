@@ -16,6 +16,7 @@ static __thread int* user_fork_pidfd;
 static __thread int* user_fork_native_tid;
 static __thread struct robust_list_head* user_fork_native_robust;
 static __thread bool user_fork_native_saved;
+static __thread bool user_fork_recover_cow;
 pid_t __real__Fork(void);
 extern void __getrandom_fork_subprocess(void) __attribute__((weak));
 
@@ -48,6 +49,18 @@ static void user_host_fork_init(void)
  * Dynamic libc binds this call internally, so this backend is static-only. */
 pid_t __wrap__Fork(void)
 {
+    /* The native VFORK child already has its own kernel mm. Run libc's
+     * child-side fork recovery without creating another process. */
+    if (user_fork_recover_cow) {
+        user_fork_recover_cow = false;
+        *user_fork_native_tid = syscall(SYS_gettid);
+        struct robust_list_head* robust = user_fork_native_robust;
+        ((void**)robust)[-1] = &robust->list;
+        robust->list.next = &robust->list;
+        syscall(SYS_set_robust_list, robust, sizeof(*robust));
+        if (__getrandom_fork_subprocess) __getrandom_fork_subprocess();
+        return 0;
+    }
     unsigned signal = user_fork_signal;
     unsigned extra = user_fork_flags;
     user_fork_signal = SIGCHLD;

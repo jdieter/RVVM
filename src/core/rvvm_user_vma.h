@@ -16,6 +16,27 @@
 #include <unistd.h>
 #include "user_fd_guard.h"
 
+#ifdef USER_NATIVE_VFORK_POC
+#include <sys/syscall.h>
+static THREAD_LOCAL long (*user_vma_executor)(long, long, long, long, long, long, long);
+static long user_vma_execute(long nr, long a, long b, long c, long d, long e, long f)
+{
+    if (!user_vma_executor) return syscall(nr, a, b, c, d, e, f);
+    long ret = user_vma_executor(nr, a, b, c, d, e, f);
+    if ((unsigned long)ret >= (unsigned long)-4095) { errno = -ret; return -1; }
+    return ret;
+}
+#define user_vma_kernel_map(a,b,c,d,e,f) ((void*)user_vma_execute(SYS_mmap,(long)(a),b,c,d,e,f))
+#define user_vma_kernel_unmap(a,b) ((int)user_vma_execute(SYS_munmap,(long)(a),b,0,0,0,0))
+#define user_vma_kernel_remap(a,b,c,d,e) ((void*)user_vma_execute(SYS_mremap,(long)(a),b,c,d,(long)(e),0))
+#define user_vma_kernel_valid(fd) user_vma_execute(SYS_fcntl,fd,F_GETFD,0,0,0,0)
+#else
+#define user_vma_kernel_map mmap
+#define user_vma_kernel_unmap munmap
+#define user_vma_kernel_remap mremap
+#define user_vma_kernel_valid(fd) fcntl(fd,F_GETFD)
+#endif
+
 struct user_vma_layout {
     uintptr_t limit, top, low;
     size_t brk_window;
@@ -179,7 +200,7 @@ static int user_vma_unmap(void* addr, size_t size)
     size_t page = user_vma_page();
     if (!size || start % page || size > SIZE_MAX - page + 1
         || start > SIZE_MAX - ((size + page - 1) & ~(page - 1)))
-        return munmap(addr, size);
+        return user_vma_kernel_unmap(addr, size);
     if (size <= SIZE_MAX - page + 1) {
         uintptr_t end = start + ((size + page - 1) & ~(page - 1));
         for (size_t i = 0; i < user_vma_owned_count; ++i) {
@@ -187,7 +208,7 @@ static int user_vma_unmap(void* addr, size_t size)
                 && !user_vma_reserve(1)) return -1;
         }
     }
-    int ret = munmap(addr, size);
+    int ret = user_vma_kernel_unmap(addr, size);
     if (!ret) {
         user_vma_forget((uintptr_t)addr, size);
         size_t page = user_vma_page();
@@ -305,12 +326,12 @@ static void* user_vma_map_raw(void* addr, size_t size, int prot, int flags, int 
     size_t span = (size + page - 1) & ~(page - 1);
     if (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) {
         if (!user_vma_range((uintptr_t)addr, span)) { errno = ENOMEM; return MAP_FAILED; }
-        return mmap(addr, size, prot, flags, fd, offset);
+        return user_vma_kernel_map(addr, size, prot, flags, fd, offset);
     }
     if (addr && user_vma_range((uintptr_t)addr, span)) {
-        void* ret = mmap(addr, size, prot, flags, fd, offset);
+        void* ret = user_vma_kernel_map(addr, size, prot, flags, fd, offset);
         if (ret == MAP_FAILED || user_vma_range((uintptr_t)ret, span)) return ret;
-        munmap(ret, span);
+        user_vma_kernel_unmap(ret, span);
     }
     uintptr_t top = __atomic_load_n(&user_vma_cursor, __ATOMIC_RELAXED);
     if (!top) {
@@ -332,7 +353,7 @@ static void* user_vma_map_raw(void* addr, size_t size, int prot, int flags, int 
         do {
             next = (top >= floor + span ? top - span : user_vma_layout.top - span) & ~(page - 1);
         } while (!__atomic_compare_exchange_n(&user_vma_cursor, &top, next, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
-        void* ret = mmap((void*)next, size, prot, flags | MAP_FIXED_NOREPLACE, fd, offset);
+        void* ret = user_vma_kernel_map((void*)next, size, prot, flags | MAP_FIXED_NOREPLACE, fd, offset);
         if (ret != MAP_FAILED || errno != EEXIST) return ret;
     }
     for (unsigned retry = 0; retry < 128; ++retry) {
@@ -340,7 +361,7 @@ static void* user_vma_map_raw(void* addr, size_t size, int prot, int flags, int 
                                      UINT64_C(0x10000), user_vma_layout.top);
         if (!next) { errno = ENOMEM; return MAP_FAILED; }
         next = (next + page - 1) & ~(page - 1);
-        void* ret = mmap((void*)next, size, prot, flags | MAP_FIXED_NOREPLACE, fd, offset);
+        void* ret = user_vma_kernel_map((void*)next, size, prot, flags | MAP_FIXED_NOREPLACE, fd, offset);
         if (ret != MAP_FAILED || errno != EEXIST) return ret;
     }
     errno = ENOMEM;
@@ -354,7 +375,7 @@ static void* user_vma_map(void* addr, size_t size, int prot, int flags, int fd, 
     if (!size || !page || page >= user_vma_layout.limit || size > user_vma_layout.limit - page
         || offset % user_vma_page()
         || ((flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) && (uintptr_t)addr % page)
-        || (!(flags & MAP_ANONYMOUS) && fcntl(fd, F_GETFD) < 0))
+        || (!(flags & MAP_ANONYMOUS) && user_vma_kernel_valid(fd) < 0))
         return user_vma_map_raw(addr, size, prot, flags, fd, offset);
     if (!user_vma_reserve(1)) return MAP_FAILED;
     void* ret = user_vma_map_raw(addr, size, prot, flags, fd, offset);
@@ -387,9 +408,9 @@ static void* user_vma_remap_raw(void* addr, size_t oldsize, size_t newsize, int 
         return MAP_FAILED;
     }
     if ((flags & MREMAP_FIXED) || !(flags & MREMAP_MAYMOVE))
-        return mremap(addr, oldsize, newsize, flags, newaddr);
+        return user_vma_kernel_remap(addr, oldsize, newsize, flags, newaddr);
     if (!(flags & MREMAP_DONTUNMAP) && oldsize && user_vma_range((uintptr_t)addr, newsize)) {
-        void* ret = mremap(addr, oldsize, newsize, flags & ~MREMAP_MAYMOVE);
+        void* ret = user_vma_kernel_remap(addr, oldsize, newsize, flags & ~MREMAP_MAYMOVE, NULL);
         if (ret != MAP_FAILED || errno != ENOMEM) return ret;
     }
     /* DONTUNMAP uses newaddr as a hint even without FIXED. Reserve it with
@@ -397,10 +418,10 @@ static void* user_vma_remap_raw(void* addr, size_t oldsize, size_t newsize, int 
     void* hint = (flags & MREMAP_DONTUNMAP) ? newaddr : NULL;
     void* dest = user_vma_map_raw(hint, newsize, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (dest == MAP_FAILED) return dest;
-    void* ret = mremap(addr, oldsize, newsize, flags | MREMAP_FIXED, dest);
+    void* ret = user_vma_kernel_remap(addr, oldsize, newsize, flags | MREMAP_FIXED, dest);
     if (ret == MAP_FAILED) {
         int error = errno;
-        munmap(dest, newsize);
+        user_vma_kernel_unmap(dest, newsize);
         errno = error;
     }
     return ret;

@@ -8,13 +8,19 @@
 #include "rvvm_user_fs.h"
 #define user_exe_fd_value (user_fd_table()->exe_fd)
 #define user_exe_fd ((int)atomic_load_uint32_relax(&user_exe_fd_value))
-#define user_vm_fd ((int)atomic_load_uint32_relax(&user_fd_table()->vm_fd))
-static bool user_private_fd(int fd) { return fd >= 0 && (fd == user_exe_fd || fd == user_vm_fd); }
+static bool user_private_fd(int fd) { return fd >= 0 && fd == user_exe_fd; }
 #define user_exe_descriptor (user_fd_table()->descriptor)
 static struct stat user_host_exe;
 static struct stat user_host_exe_link;
 static THREAD_LOCAL struct stat user_fork_exe_link;
 static THREAD_LOCAL bool user_fork_exe_link_ready;
+static void user_exe_process_link_init(bool shared)
+{
+    if (lstat("/proc/self/exe", &user_fork_exe_link))
+        memset(&user_fork_exe_link, 0, sizeof(user_fork_exe_link));
+    user_fork_exe_link_ready = true;
+    if (!shared) user_host_exe_link = user_fork_exe_link;
+}
 #define user_exe_lock (user_fd_table()->lock)
 #define user_exe_waits (user_fd_table()->waits)
 #define user_exe_relocation (user_fd_table()->relocation)
@@ -61,6 +67,17 @@ static unsigned user_exe_fd_args(unsigned nr)
     if (nr == 36 || nr == 71 || nr == 77) mask |= 2;
     if (nr == 21 || nr == 37 || nr == 76 || nr == 276 || nr == 285) mask |= 4;
     return mask;
+}
+
+static void user_exe_filter_args(long nr, long a[6])
+{
+    unsigned mask = user_exe_fd_args(nr);
+    if (nr == 57) mask |= 1;
+    for (unsigned i = 0; i < 3; ++i)
+        if ((mask & (1U << i)) && user_private_fd((int)a[i])) a[i] = -1;
+    if (nr == 95 && a[0] == 3 && user_private_fd((int)a[1])) a[1] = -1;
+    if (nr == 222 && !(a[3] & 0x20) /* RISC-V MAP_ANONYMOUS */
+        && user_private_fd((int)a[4])) a[4] = -1;
 }
 
 static bool user_exe_init(const char* path)
@@ -137,10 +154,9 @@ static long user_exe_getdents(int fd, void* guest, size_t size)
     size = (unsigned int)size; // getdents64's count is 32-bit even on RV64.
     user_fd_table_t* table = user_exe_fd_directory(fd);
     if (!table) return errno_ret(syscall(SYS_getdents64, fd, guest, size));
-    char buffer[4096], hidden[16], control[16];
+    char buffer[4096], hidden[16];
     user_fd_mutex_lock(&table->lock);
     snprintf(hidden, sizeof(hidden), "%d", (int)atomic_load_uint32_relax(&table->exe_fd));
-    snprintf(control, sizeof(control), "%d", (int)atomic_load_uint32_relax(&table->vm_fd));
     long result;
     do {
         result = errno_ret(syscall(SYS_getdents64, fd, buffer, size < sizeof(buffer) ? size : sizeof(buffer)));
@@ -149,8 +165,7 @@ static long user_exe_getdents(int fd, void* guest, size_t size)
         for (size_t pos = 0; pos < (size_t)result;) {
             struct uapi_linux_dirent64* entry = (void*)(buffer + pos);
             size_t length = entry->d_reclen;
-            bool dot = entry->d_name[0] == '.';
-            if ((dot || !table->vm_service) && strcmp(entry->d_name, hidden) && strcmp(entry->d_name, control)) {
+            if (strcmp(entry->d_name, hidden)) {
                 memmove(buffer + kept, entry, length);
                 kept += length;
             }
@@ -172,7 +187,7 @@ static bool user_exe_cached_link(int dirfd, const char* path)
     // The common proc link (including directory aliases) has a stable identity.
     // Keep kernel path resolution: a normal symlink named "exe" is not special.
     struct stat st;
-    const struct stat* identity = &user_host_exe_link;
+    const struct stat* identity = user_fork_exe_link_ready ? &user_fork_exe_link : &user_host_exe_link;
     if (!identity->st_ino) {
         if (!user_fork_exe_link_ready) {
             if (lstat("/proc/self/exe", &user_fork_exe_link))

@@ -4,6 +4,7 @@
 #include "user_ptrace_events.h"
 #include "util/spinlock.h"
 #include "util/user_fd_guard.h"
+#include "util/user_proc_read.h"
 #include <fcntl.h>
 #include <limits.h>
 #include <linux/futex.h>
@@ -21,12 +22,83 @@ struct stop_node {
     struct stop_node* next;
     struct user_ptrace_stop value;
 };
-static spinlock_t events_lock = SPINLOCK_INIT;
-static spinlock_t normalization_lock = SPINLOCK_INIT;
-static struct event_node *events, **tail = &events;
-static struct stop_node* stops;
-static uint32_t queued_count;
-static uint32_t tracked_count, generation, sleepers;
+struct events_context {
+    spinlock_t lock, normalization;
+    struct event_node *nodes, **last;
+    struct stop_node* stoplist;
+    uint32_t queued, tracked, changed, sleeping;
+    void* (*allocate)(void*, size_t, void*);
+    void* opaque;
+};
+static struct events_context initial_context = {
+    .lock = SPINLOCK_INIT, .normalization = SPINLOCK_INIT,
+    .last = &initial_context.nodes,
+};
+static _Thread_local struct events_context* selected_context;
+static struct events_context* context(void)
+{
+    return selected_context ? selected_context : &initial_context;
+}
+#define events_lock (context()->lock)
+#define normalization_lock (context()->normalization)
+#define events (context()->nodes)
+#define tail (context()->last)
+#define stops (context()->stoplist)
+#define queued_count (context()->queued)
+#define tracked_count (context()->tracked)
+#define generation (context()->changed)
+#define sleepers (context()->sleeping)
+
+void* user_ptrace_events_context_new(void)
+{
+    struct events_context* next = calloc(1, sizeof(*next));
+    if (next) {
+        spin_init(&next->lock);
+        spin_init(&next->normalization);
+        next->last = &next->nodes;
+    }
+    return next;
+}
+
+void* user_ptrace_events_context_current(void) { return selected_context; }
+void user_ptrace_events_context_select(void* selected) { selected_context = selected; }
+
+void user_ptrace_events_context_allocator(void* selected,
+                                         void* (*allocate)(void*, size_t, void*), void* opaque)
+{
+    struct events_context* owned = selected;
+    owned->allocate = allocate;
+    owned->opaque = opaque;
+}
+
+static void* event_allocate(size_t size)
+{
+    return context()->allocate ? context()->allocate(context()->opaque, size, NULL) : malloc(size);
+}
+
+static void event_release(void* pointer)
+{
+    if (context()->allocate) context()->allocate(context()->opaque, 0, pointer);
+    else free(pointer);
+}
+
+void user_ptrace_events_context_free(void* opaque)
+{
+    struct events_context* owned = opaque;
+    if (!owned) return;
+    if (owned->allocate) { free(owned); return; }
+    while (owned->nodes) {
+        struct event_node* node = owned->nodes;
+        owned->nodes = node->next;
+        free(node);
+    }
+    while (owned->stoplist) {
+        struct stop_node* node = owned->stoplist;
+        owned->stoplist = node->next;
+        free(node);
+    }
+    free(owned);
+}
 
 bool user_ptrace_events_tracing(void)
 {
@@ -78,16 +150,16 @@ void user_ptrace_events_identify(struct user_ptrace_event* event)
         char path[64], line[256];
         snprintf(path, sizeof(path), "/proc/%d/status", event->pid);
         user_fd_lock();
-        FILE* status = fopen(path, "re");
-        if (status) {
-            while (fgets(line, sizeof(line), status)) {
-                int tid;
-                if (sscanf(line, "TracerPid: %d", &tid) == 1) {
+        struct user_proc_reader status;
+        if (user_proc_open(&status, path)) {
+            while (user_proc_line(&status, line, sizeof(line))) {
+                int32_t tid;
+                if (user_proc_integer(line, "TracerPid:", &tid)) {
                     event->owner_tid = tid;
                     break;
                 }
             }
-            fclose(status);
+            user_proc_close(&status);
         }
         user_fd_unlock();
     }
@@ -117,7 +189,7 @@ bool user_ptrace_events_pending(void)
 
 bool user_ptrace_events_push(const struct user_ptrace_event* value)
 {
-    struct event_node* node = malloc(sizeof(*node));
+    struct event_node* node = event_allocate(sizeof(*node));
     if (!node) return false;
     *node = (struct event_node){.value = *value};
     spin_lock(&events_lock);
@@ -160,7 +232,7 @@ bool user_ptrace_events_pop_deferred(pid_t pid, struct user_ptrace_event* result
             *result = node->value;
             *link = node->next;
             if (!*link) tail = link;
-            free(node);
+            event_release(node);
             atomic_sub_uint32(&queued_count, 1);
             spin_unlock(&events_lock);
             return true;
@@ -193,7 +265,7 @@ static bool take(pid_t pid, pid_t pgid, const struct stat* pidfd, int options, b
             if (!waitid || !(options & WNOWAIT)) {
                 *link = node->next;
                 if (!*link) tail = link;
-                free(node);
+                event_release(node);
                 atomic_sub_uint32(&queued_count, 1);
             }
             spin_unlock(&events_lock);
@@ -234,14 +306,14 @@ bool user_ptrace_events_waitid(idtype_t type, id_t id, pid_t caller_pgid, int op
         if (fd < 0) { user_fd_unlock(); return false; }
         char path[64], line[256];
         snprintf(path, sizeof(path), "/proc/thread-self/fdinfo/%d", fd);
-        FILE* info = fopen(path, "re");
+        struct user_proc_reader info;
         bool valid = false;
-        if (info) {
-            while (fgets(line, sizeof(line), info)) {
-                int pid;
-                if (sscanf(line, "Pid: %d", &pid) == 1) { valid = true; break; }
+        if (user_proc_open(&info, path)) {
+            while (user_proc_line(&info, line, sizeof(line))) {
+                int32_t pid;
+                if (user_proc_integer(line, "Pid:", &pid)) { valid = true; break; }
             }
-            fclose(info);
+            user_proc_close(&info);
         }
         struct stat st;
         valid = valid && !fstat(fd, &st);
@@ -278,7 +350,7 @@ bool user_ptrace_events_set(const struct user_ptrace_stop* value)
             return true;
         }
     }
-    struct stop_node* node = malloc(sizeof(*node));
+    struct stop_node* node = event_allocate(sizeof(*node));
     if (node) {
         *node = (struct stop_node){.next = stops, .value = *value};
         stops = node;
@@ -309,7 +381,7 @@ bool user_ptrace_events_inherit(pid_t parent, pid_t child)
             return true;
         }
     }
-    struct stop_node* node = malloc(sizeof(*node));
+    struct stop_node* node = event_allocate(sizeof(*node));
     if (node) {
         *node = (struct stop_node){.next = stops, .value = inherited};
         stops = node;
@@ -327,7 +399,7 @@ void user_ptrace_events_remove(pid_t pid)
         struct stop_node* node = *stop;
         if (node->value.pid == pid) {
             *stop = node->next;
-            free(node);
+            event_release(node);
             atomic_sub_uint32(&tracked_count, 1);
             break;
         }
@@ -338,7 +410,7 @@ void user_ptrace_events_remove(pid_t pid)
         struct event_node* node = *event;
         if (node->value.pid == pid) {
             *event = node->next;
-            free(node);
+            event_release(node);
             atomic_sub_uint32(&queued_count, 1);
         } else event = &node->next;
     }

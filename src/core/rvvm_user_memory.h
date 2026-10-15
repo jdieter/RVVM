@@ -5,9 +5,171 @@
 /* Data protection stays with the host kernel. Execution needs its own map:
  * reading an instruction is not an executable access from the host's view. */
 #include "rvvm_user_exec_ranges.h"
+#ifdef USER_NATIVE_VFORK_POC
+struct user_exec_snapshot {
+    struct user_exec_snapshot* next;
+    size_t count, capacity;
+    struct user_exec_range ranges[];
+};
+static struct user_exec_snapshot* user_exec_snapshot;
+static struct user_exec_snapshot* user_exec_retired;
+static struct user_exec_snapshot* user_exec_reserved;
+struct user_exec_reader {
+    struct user_exec_reader* next;
+    struct user_exec_snapshot* snapshot;
+};
+static struct user_exec_reader* user_exec_readers;
+static size_t user_exec_native_readers;
+static THREAD_LOCAL struct user_exec_reader* user_native_exec_reader;
+static THREAD_LOCAL bool user_exec_deferred;
+
+static bool user_exec_reserve(size_t additional)
+{
+    if (!user_exec_native_readers) return true;
+    size_t count = vector_size(user_exec_ranges);
+    if (additional > (SIZE_MAX - sizeof(struct user_exec_snapshot)) / sizeof(struct user_exec_range) - count)
+        return false;
+    size_t capacity = count + additional;
+    if (user_exec_reserved && user_exec_reserved->capacity >= capacity) return true;
+    struct user_exec_snapshot* next = malloc(sizeof(*next) + capacity * sizeof(*next->ranges));
+    if (!next) return false;
+    next->capacity = capacity;
+    free(user_exec_reserved);
+    user_exec_reserved = next;
+    return true;
+}
+
+/* mmap_lock protects writers and lifetime enrollment. A killable reader
+ * publishes one hazard pointer instead of owning a lock. SIGKILL may retain
+ * that one snapshot until its parent removes the reader, never an unbounded
+ * history of executable mapping changes. */
+static void user_exec_collect(void)
+{
+    struct user_exec_snapshot** slot = &user_exec_retired;
+    while (*slot) {
+        struct user_exec_snapshot* candidate = *slot;
+        bool referenced = false;
+        for (struct user_exec_reader* r = user_exec_readers; r; r = r->next)
+            referenced |= atomic_load_pointer_ex(&r->snapshot, ATOMIC_SEQ_CST) == candidate;
+        if (referenced) slot = &candidate->next;
+        else { *slot = candidate->next; free(candidate); }
+    }
+}
+
+static bool user_exec_publish(void)
+{
+    size_t count = vector_size(user_exec_ranges);
+    struct user_exec_snapshot* old = atomic_load_pointer(&user_exec_snapshot);
+    if (old && old->count == count
+        && !memcmp(old->ranges, vector_buffer(user_exec_ranges), count * sizeof(*old->ranges))) return true;
+    struct user_exec_snapshot* next = user_exec_reserved;
+    if (next && next->capacity >= count) user_exec_reserved = NULL;
+    else {
+        next = malloc(sizeof(*next) + count * sizeof(*next->ranges));
+        if (next) next->capacity = count;
+    }
+    if (!next) return false;
+    next->count = count;
+    next->next = NULL;
+    memcpy(next->ranges, vector_buffer(user_exec_ranges), count * sizeof(*next->ranges));
+    atomic_store_pointer_ex(&user_exec_snapshot, next, ATOMIC_SEQ_CST);
+    if (old) {
+        old->next = user_exec_retired;
+        user_exec_retired = old;
+    }
+    user_exec_collect();
+    return true;
+}
+
+static bool user_exec_native_enter(struct user_exec_reader* reader)
+{
+    spin_lock(&mmap_lock);
+    bool ready = user_exec_publish();
+    if (ready) {
+        ++user_exec_native_readers;
+        reader->next = user_exec_readers;
+        user_exec_readers = reader;
+    }
+    spin_unlock(&mmap_lock);
+    return ready;
+}
+
+static void user_exec_native_leave(struct user_exec_reader* reader)
+{
+    spin_lock(&mmap_lock);
+    struct user_exec_reader** slot = &user_exec_readers;
+    while (*slot != reader) slot = &(*slot)->next;
+    *slot = reader->next;
+    atomic_store_pointer_ex(&reader->snapshot, NULL, ATOMIC_SEQ_CST);
+    user_exec_collect();
+    if (!--user_exec_native_readers) {
+        struct user_exec_snapshot* current = atomic_load_pointer(&user_exec_snapshot);
+        atomic_store_pointer(&user_exec_snapshot, NULL);
+        current->next = user_exec_retired;
+        while (current) {
+            struct user_exec_snapshot* next = current->next;
+            free(current);
+            current = next;
+        }
+        user_exec_retired = NULL;
+        free(user_exec_reserved);
+        user_exec_reserved = NULL;
+    }
+    spin_unlock(&mmap_lock);
+}
+
+/* Call in a new private mm, with mmap_lock inherited from its coherent
+ * snapshot and libc child recovery complete. Parent readers don't survive
+ * fork; retaining their hazards would pin every later mapping snapshot. */
+static void user_exec_fork_child(void)
+{
+    free(user_exec_snapshot);
+    while (user_exec_retired) {
+        struct user_exec_snapshot* next = user_exec_retired->next;
+        free(user_exec_retired);
+        user_exec_retired = next;
+    }
+    free(user_exec_reserved);
+    user_exec_snapshot = user_exec_reserved = NULL;
+    user_exec_readers = NULL;
+    user_exec_native_readers = 0;
+    user_native_exec_reader = NULL;
+    user_exec_deferred = false;
+}
+#endif
 
 static bool user_exec_check(rvvm_addr_t addr)
 {
+#ifdef USER_NATIVE_VFORK_POC
+    if (user_native_exec_reader) {
+        for (;;) {
+            /* Observe a quiescent writer, without acquiring its lock. The
+             * final pointer/lock check retries if permissions changed. */
+            if (atomic_load_uint32(&mmap_lock.flag)) continue;
+            const struct user_exec_snapshot* snapshot = atomic_load_pointer_ex(&user_exec_snapshot, ATOMIC_SEQ_CST);
+            atomic_store_pointer_ex(&user_native_exec_reader->snapshot, (void*)snapshot, ATOMIC_SEQ_CST);
+            if (snapshot != atomic_load_pointer_ex(&user_exec_snapshot, ATOMIC_SEQ_CST)
+                || atomic_load_uint32(&mmap_lock.flag)) {
+                atomic_store_pointer_ex(&user_native_exec_reader->snapshot, NULL, ATOMIC_SEQ_CST);
+                continue;
+            }
+            size_t lo = 0, hi = snapshot->count;
+            bool allowed = false;
+            while (lo < hi) {
+                size_t mid = lo + (hi - lo) / 2;
+                struct user_exec_range range = snapshot->ranges[mid];
+                if (addr < range.start) hi = mid;
+                else if (addr >= range.end) lo = mid + 1;
+                else { allowed = true; break; }
+            }
+            atomic_fence_ex(ATOMIC_ACQUIRE);
+            bool consistent = !atomic_load_uint32(&mmap_lock.flag)
+                && snapshot == atomic_load_pointer_ex(&user_exec_snapshot, ATOMIC_SEQ_CST);
+            atomic_store_pointer_ex(&user_native_exec_reader->snapshot, NULL, ATOMIC_SEQ_CST);
+            if (consistent) return allowed;
+        }
+    }
+#endif
     spin_lock(&mmap_lock);
     bool allowed = user_exec_ranges_contains(addr);
     spin_unlock(&mmap_lock);
@@ -16,7 +178,15 @@ static bool user_exec_check(rvvm_addr_t addr)
 
 static void user_exec_update(uintptr_t start, size_t size, bool executable)
 {
-    if (user_exec_ranges_update(start, size, executable)) {
+    bool invalidated = user_exec_ranges_update(start, size, executable);
+#ifdef USER_NATIVE_VFORK_POC
+    if (user_exec_native_readers && !user_exec_deferred && !user_exec_publish()) {
+        /* The kernel mutation already committed. Continuing with stale
+         * execute permission would be incorrect, as would replaying it. */
+        syscall(SYS_exit_group, 127);
+    }
+#endif
+    if (invalidated) {
         uintptr_t first = start & ~(uintptr_t)4095;
         uintptr_t end = (start + size + 4095) & ~(uintptr_t)4095;
         rvvm_flush_icache(userland, first, end - first);
@@ -82,6 +252,10 @@ static void user_exec_move_prepare(struct user_exec_move* move, uintptr_t addr, 
 static void user_exec_move_apply(struct user_exec_move* move, uintptr_t addr, size_t oldsize,
                                   size_t newsize, int flags, uintptr_t ret)
 {
+#ifdef USER_NATIVE_VFORK_POC
+    bool deferred = user_exec_deferred;
+    user_exec_deferred = true;
+#endif
     size_t span = oldsize ? oldsize : newsize;
         if (!(flags & MREMAP_DONTUNMAP)) user_exec_update(addr, oldsize, false);
         else rvvm_flush_icache(userland, addr, oldsize);
@@ -92,16 +266,32 @@ static void user_exec_move_apply(struct user_exec_move* move, uintptr_t addr, si
                 user_exec_update(ret + r.start, EVAL_MIN(r.end, newsize) - r.start, true);
         }
         if (newsize > span && move->executable_tail) user_exec_update(ret + span, newsize - span, true);
+#ifdef USER_NATIVE_VFORK_POC
+    user_exec_deferred = deferred;
+    if (!deferred && user_exec_native_readers && !user_exec_publish()) syscall(SYS_exit_group, 127);
+#endif
 }
 
 static rvvm_addr_t user_mremap(uintptr_t addr, size_t oldsize, size_t newsize, int flags, uintptr_t newaddr)
 {
     user_fd_lock();
     spin_lock(&mmap_lock);
+#ifdef USER_NATIVE_VFORK_POC
+    if (!user_exec_reserve(vector_size(user_exec_ranges) + 4)) {
+        spin_unlock(&mmap_lock);
+        user_fd_unlock();
+        return -ENOMEM;
+    }
+    user_exec_deferred = true;
+#endif
     struct user_exec_move move = ZERO_INIT;
     user_exec_move_prepare(&move, addr, oldsize, newsize);
     rvvm_addr_t ret = errno_ret((uintptr_t)user_vma_remap((void*)addr, oldsize, newsize, flags, (void*)newaddr));
     if (ret < (rvvm_addr_t)-4095) user_exec_move_apply(&move, addr, oldsize, newsize, flags, ret);
+#ifdef USER_NATIVE_VFORK_POC
+    user_exec_deferred = false;
+    if (user_exec_native_readers && !user_exec_publish()) syscall(SYS_exit_group, 127);
+#endif
     vector_free(move.ranges);
     spin_unlock(&mmap_lock);
     user_fd_unlock();

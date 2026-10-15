@@ -2,9 +2,24 @@
 #ifndef RVVM_USER_PTRACE_H
 #define RVVM_USER_PTRACE_H
 #include "core/rvvm.h"
+#include "user_ptrace_replay.h"
 #include <signal.h>
 #include <sys/types.h>
 #define USER_PTRACE_WAIT_AGAIN (-4096L)
+
+/* A kernel VFORK child borrows the suspended caller's TLS, but owns its
+ * tracee bridge and signal replay buffers. Tracer event queues stay with
+ * their native process; these handles don't transfer wait ownership. */
+struct user_ptrace_context {
+    void* bridge;
+    uint32_t* executable_fd;
+    bool stepped;
+    void* events;
+    struct user_ptrace_replay_context replay;
+};
+void user_ptrace_context_save(struct user_ptrace_context*);
+void user_ptrace_context_load(const struct user_ptrace_context*);
+void user_ptrace_process_init(rvvm_hart_t*, uint64_t*, volatile sig_atomic_t*, void*);
 
 void user_ptrace_init(rvvm_hart_t*, const uint64_t*, size_t, uint64_t*, volatile sig_atomic_t*, void*);
 void* user_ptrace_prepare(rvvm_hart_t*, const uint64_t*, size_t, uint64_t);

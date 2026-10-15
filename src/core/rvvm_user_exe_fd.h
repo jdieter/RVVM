@@ -118,21 +118,6 @@ static long user_exe_dup3(int oldfd, int newfd, unsigned flags)
     user_fd_mutex_lock(&user_exe_lock);
     long ret;
     if (user_private_fd(oldfd)) ret = -EBADF;
-    else if (newfd == user_vm_fd) {
-        struct rlimit limit;
-        if (fcntl(oldfd, F_GETFD) < 0 || getrlimit(RLIMIT_NOFILE, &limit)
-            || (unsigned)newfd >= limit.rlim_cur) {
-            ret = -EBADF;
-            goto out;
-        }
-        int moved = fcntl(user_vm_fd, F_DUPFD_CLOEXEC, 0);
-        if (moved < 0) ret = -errno;
-        else {
-            ret = errno_ret(syscall(SYS_dup3, oldfd, newfd, flags));
-            if (ret < 0) close(moved);
-            else atomic_store_uint32_relax(&user_fd_table()->vm_fd, moved);
-        }
-    }
     else if (newfd != user_exe_fd) ret = errno_ret(syscall(SYS_dup3, oldfd, newfd, flags));
     else {
         struct rlimit limit;

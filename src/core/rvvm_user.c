@@ -487,6 +487,11 @@ static const char* prefix_path = NULL;
 #endif
 
 static bool fake_root = true;
+struct user_fake_credentials { int uid, gid; };
+static struct user_fake_credentials user_fake_default;
+static THREAD_LOCAL struct user_fake_credentials* user_fake_current;
+#define fake_uid ((user_fake_current ? user_fake_current : &user_fake_default)->uid)
+#define fake_gid ((user_fake_current ? user_fake_current : &user_fake_default)->gid)
 static const char* user_binfmt_executable;
 
 static bool path_bypass(const char* path)
@@ -525,8 +530,11 @@ static const char* wrap_path(char* buffer, const char* path)
 #include "rvvm_user_path.h"
 #include "user_ptrace/user_ptrace.h"
 #include "user_ptrace/user_ptrace_events.h"
-#include "rvvm_user_vm_pause.h"
-#include "rvvm_user_service.h"
+static uint32_t user_reaper_tid;
+static user_fd_mutex_t user_reaper_lock;
+#ifdef USER_NATIVE_VFORK_POC
+static void user_observer_fork_child(void);
+#endif
 #include "rvvm_user_signal.h"
 #include "rvvm_user_jit_memory.h"
 #include "rvvm_user_posix.h"
@@ -538,6 +546,7 @@ static const char* wrap_path(char* buffer, const char* path)
 #include "rvvm_user_fs_watch.h"
 #include "rvvm_user_system_control.h"
 #include "rvvm_user_exe.h"
+#include "rvvm_user_allocate.h"
 #include "rvvm_user_host_delegation.h"
 #include "rvvm_user_exec.h"
 #include "user_ptrace/user_ptrace_proc.h"
@@ -559,6 +568,19 @@ static long user_ptrace_wait_pause(uint32_t generation)
     return !ret || ret == -EAGAIN || ret == -ETIMEDOUT ? USER_PTRACE_WAIT_AGAIN : ret;
 }
 
+#ifdef __linux__
+static long rvvm_sys_openat(int dirfd, const char* path, uint32_t flags, unsigned mode)
+{
+    char snapshot[UAPI_PATH_MAX], wrapped[UAPI_PATH_MAX];
+    user_host_path(snapshot, wrapped, &path);
+    unsigned host_flags = uapi_open_flags_to_host(flags);
+    long special;
+    if (user_exe_fast_open(path, host_flags, &special)) return special;
+    long fd = (long)errno_ret(USER_SYSCALL(SYS_openat, dirfd, path, host_flags, mode, 0, 0));
+    return user_cpu_opened(fd, host_flags, dirfd, path);
+}
+#endif
+
 #if defined(__linux__) && defined(SYS_openat2)
 static rvvm_addr_t rvvm_sys_openat2(int dirfd, const char* path, void* guest_how, size_t size)
 {
@@ -568,7 +590,7 @@ static rvvm_addr_t rvvm_sys_openat2(int dirfd, const char* path, void* guest_how
     if (size < sizeof(struct open_how)) return -UAPI_EINVAL;
     if (size > (size_t)sysconf(_SC_PAGESIZE)) return -UAPI_E2BIG;
 
-    struct open_how* how = malloc(size);
+    struct open_how* how = user_runtime_allocate(size);
     if (!how) return -UAPI_ENOMEM;
     struct iovec local = { .iov_base = how, .iov_len = size };
     struct iovec remote = { .iov_base = guest_how, .iov_len = size };
@@ -589,7 +611,7 @@ static rvvm_addr_t rvvm_sys_openat2(int dirfd, const char* path, void* guest_how
             ret = user_cpu_opened((int64_t)ret, how->flags, dirfd, wrapped);
         }
     }
-    free(how);
+    user_runtime_release(how);
     return ret;
 }
 #endif
@@ -614,7 +636,6 @@ static void user_fault_hex(char** p, uint64_t val)
 
 static void user_fault_handler(int sig, siginfo_t* info, void* ucontext)
 {
-    if (user_vm_pause_signal(info)) return;
     if (user_ptrace_signal(user_sig.cpu, sig, info)) return;
     bool replayed = user_ptrace_restore_signal(info);
     if ((replayed && info->si_code > 0) || user_ptrace_injected(sig, info)) {
@@ -685,6 +706,11 @@ static void user_fault_handler(int sig, siginfo_t* info, void* ucontext)
         user_sig.synchronous = true;
         user_fault_save_fenv(uc);
         user_fault_armed = 0;
+#ifdef USER_NATIVE_VFORK_POC
+        if (user_native_child_active) {
+            user_native_jump_restore(user_native_fault_target);
+        }
+#endif
         siglongjmp(user_fault_resume, 1);
     }
 #endif
@@ -758,20 +784,6 @@ static void* rvvm_user_thread_wrap(void* arg);
 
 static spinlock_t brk_lock = {0};
 static spinlock_t mmap_lock = {0};
-static user_fd_mutex_t user_vm_transition_lock;
-static THREAD_LOCAL unsigned user_vm_transition_depth;
-static THREAD_LOCAL bool user_vm_service, user_vm_child, user_vm_fork_peer;
-
-static void user_vm_enter(void)
-{
-    if (!user_vm_service && !user_vm_transition_depth++) user_fd_mutex_lock(&user_vm_transition_lock);
-}
-
-static void user_vm_leave(void)
-{
-    if (!user_vm_service && !--user_vm_transition_depth) user_fd_mutex_unlock(&user_vm_transition_lock);
-}
-
 static rvvm_user_thread_t* user_reap_threads;
 static bool user_reaper_running;
 /* Publish the last guest exit status together with the live count. The
@@ -795,38 +807,24 @@ static void user_reap_finished(void)
     }
 }
 
-/* The reaper lock keeps exited threads registered until native join proves
- * that their last kernel writes have finished. Helpers never execute guest
- * code and all their guest-memory writes are excluded by this same lock. */
-static int user_vm_pause_collect(pid_t self)
-{
-    /* Remove finished native tasks before looking up TIDs: the kernel may
-     * already have reused a dead guest's number for an internal helper. */
-    user_reap_finished();
-    if (user_vm_pause_add(user_vm_initial_tid, self)) return -1;
-    for (rvvm_user_thread_t* thread = user_reap_threads; thread; thread = thread->reap_next)
-        if (user_vm_pause_add(atomic_load_uint32(&thread->tid), self)) return -1;
-    return 0;
-}
-
 static void* user_thread_reaper(void* unused)
 {
     UNUSED(unused);
-    atomic_store_uint32(&user_vm_reaper_tid, gettid());
-    rvvm_futex_wake(&user_vm_reaper_tid, 1);
+    atomic_store_uint32(&user_reaper_tid, gettid());
+    rvvm_futex_wake(&user_reaper_tid, 1);
     for (;;) {
-        user_fd_mutex_lock(&user_vm_reaper_lock);
+        user_fd_mutex_lock(&user_reaper_lock);
         user_reap_finished();
         bool pending = user_reap_threads != NULL;
         uint64_t lifetime = atomic_load_uint64(&user_thread_lifetime);
         if (!pending) {
             user_reaper_running = false;
-            atomic_store_uint32(&user_vm_reaper_tid, 0);
-            user_fd_mutex_unlock(&user_vm_reaper_lock);
+            atomic_store_uint32(&user_reaper_tid, 0);
+            user_fd_mutex_unlock(&user_reaper_lock);
             if (!(uint32_t)lifetime) syscall(SYS_exit, lifetime >> 32);
             return NULL;
         }
-        user_fd_mutex_unlock(&user_vm_reaper_lock);
+        user_fd_mutex_unlock(&user_reaper_lock);
         sleep_ms(1);
     }
 }
@@ -892,9 +890,14 @@ static void* rvvm_sys_brk(void* addr)
 #define UAPI_CLONE_OPTIONAL_FLAGS (UAPI_CLONE_SETTLS | UAPI_CLONE_PARENT_SETTID \
     | UAPI_CLONE_CHILD_CLEARTID | UAPI_CLONE_CHILD_SETTID)
 
-static rvvm_hart_t* user_clone_cpu(rvvm_hart_t* parent)
+static rvvm_hart_t* user_clone_cpu_mode(rvvm_hart_t* parent, bool interpreter)
 {
+#ifdef USER_NATIVE_VFORK_POC
+    rvvm_hart_t* cpu = interpreter ? rvvm_create_user_thread_interpreter(userland) : rvvm_create_user_thread(userland);
+#else
+    UNUSED(interpreter);
     rvvm_hart_t* cpu = rvvm_create_user_thread(userland);
+#endif
     if (!cpu) return NULL;
     for (size_t i = 1; i < 32; ++i)
         rvvm_write_cpu_reg(cpu, RVVM_REGID_X0 + i, rvvm_read_cpu_reg(parent, RVVM_REGID_X0 + i));
@@ -907,6 +910,11 @@ static rvvm_hart_t* user_clone_cpu(rvvm_hart_t* parent)
     rvvm_write_cpu_reg(cpu, RVVM_REGID_PC, rvvm_read_cpu_reg(parent, RVVM_REGID_PC) + 4);
     rvvm_write_cpu_reg(cpu, RVVM_REGID_X0 + 10, 0);
     return cpu;
+}
+
+static rvvm_hart_t* user_clone_cpu(rvvm_hart_t* parent)
+{
+    return user_clone_cpu_mode(parent, false);
 }
 
 // long sys_clone(unsigned long flags, void *stack, int *parent_tid, unsigned long tls, int *child_tid);
@@ -930,25 +938,25 @@ static int rvvm_sys_clone_impl(rvvm_user_thread_t* current, uint32_t flags, size
         uint64_t held = UINT64_MAX, saved_mask;
         syscall(SYS_rt_sigprocmask, SIG_SETMASK, &held, &saved_mask, 8);
         if (separate) user_fd_lock();
-        user_fd_mutex_lock(&user_vm_reaper_lock);
+        user_fd_mutex_lock(&user_reaper_lock);
         if (!user_reaper_running) {
             rvvm_thread_t* reaper = rvvm_thread_create(user_thread_reaper, NULL);
             if (!reaper) {
-                user_fd_mutex_unlock(&user_vm_reaper_lock);
+                user_fd_mutex_unlock(&user_reaper_lock);
                 if (separate) user_fd_unlock();
                 syscall(SYS_rt_sigprocmask, SIG_SETMASK, &saved_mask, NULL, 8);
                 return -EAGAIN;
             }
             user_reaper_running = true;
             thread_detach(reaper);
-            while (!atomic_load_uint32(&user_vm_reaper_tid))
-                rvvm_futex_wait(&user_vm_reaper_tid, 0, RVVM_FUTEX_INFINITE);
+            while (!atomic_load_uint32(&user_reaper_tid))
+                rvvm_futex_wait(&user_reaper_tid, 0, RVVM_FUTEX_INFINITE);
         }
 
         rvvm_user_thread_t* thread = calloc(1, sizeof(*thread));
         if (!thread || !(thread->cpu = user_clone_cpu(cpu))) {
             free(thread);
-            user_fd_mutex_unlock(&user_vm_reaper_lock);
+            user_fd_mutex_unlock(&user_reaper_lock);
             if (separate) user_fd_unlock();
             syscall(SYS_rt_sigprocmask, SIG_SETMASK, &saved_mask, NULL, 8);
             return -EAGAIN;
@@ -975,7 +983,7 @@ static int rvvm_sys_clone_impl(rvvm_user_thread_t* current, uint32_t flags, size
             user_signal_process_release(thread->signals);
             rvvm_free_user_thread(thread->cpu);
             free(thread);
-            user_fd_mutex_unlock(&user_vm_reaper_lock);
+            user_fd_mutex_unlock(&user_reaper_lock);
             if (separate) user_fd_unlock();
             syscall(SYS_rt_sigprocmask, SIG_SETMASK, &saved_mask, NULL, 8);
             return -EAGAIN;
@@ -987,7 +995,7 @@ static int rvvm_sys_clone_impl(rvvm_user_thread_t* current, uint32_t flags, size
         rvvm_thread_t* host_thread = rvvm_thread_create_ex(rvvm_user_thread_wrap, thread, 256 * 1024);
         syscall(SYS_rt_sigprocmask, SIG_SETMASK, &saved_mask, NULL, 8);
         if (!host_thread) {
-            user_fd_mutex_unlock(&user_vm_reaper_lock);
+            user_fd_mutex_unlock(&user_reaper_lock);
             if (separate) user_fd_unlock();
             atomic_sub_uint64(&user_thread_lifetime, 1);
             user_signal_process_release(thread->signals);
@@ -1007,7 +1015,7 @@ static int rvvm_sys_clone_impl(rvvm_user_thread_t* current, uint32_t flags, size
         thread->host_thread = host_thread;
         thread->reap_next = user_reap_threads;
         user_reap_threads = thread;
-        user_fd_mutex_unlock(&user_vm_reaper_lock);
+        user_fd_mutex_unlock(&user_reaper_lock);
 
         uint32_t tid = atomic_load_uint32(&thread->tid);
         while (!tid) {
@@ -1043,7 +1051,7 @@ static int rvvm_sys_clone_impl(rvvm_user_thread_t* current, uint32_t flags, size
          * new mm inherits it, including helpers created by vfork below. */
         atomic_store_uint32(&source_table->guard->escaped, 1);
         struct user_fork_slot* fork_slot = user_fork_cache_prepare(source_table,
-            !shared_files && !user_vm_service && !user_vm_fork_peer);
+            !shared_files);
         user_fd_table_t* child_table = shared_files ? source_table
             : fork_slot ? fork_slot->table : user_fd_table_copy_guard(source_table, true);
         if (!child_table) {
@@ -1067,7 +1075,7 @@ static int rvvm_sys_clone_impl(rvvm_user_thread_t* current, uint32_t flags, size
         spin_lock(&brk_lock);
         spin_lock(&mmap_lock);
         user_fd_mutex_lock(&user_exe_lock);
-        user_fd_mutex_lock(&user_vm_reaper_lock);
+        user_fd_mutex_lock(&user_reaper_lock);
         rvvm_user_fork_lock();
         user_ptrace_clone(cpu);
         user_fork_namespaces = flags & namespaces;
@@ -1077,16 +1085,12 @@ static int rvvm_sys_clone_impl(rvvm_user_thread_t* current, uint32_t flags, size
         user_fork_cache_finish(fork_slot, pid);
         unsigned child_fd_depth = 0;
         if (!pid) {
-            user_services = NULL;
             /* Other native threads, their join handles and wake queues do
              * not survive host fork. The survivor is now a process thread. */
             user_reap_threads = NULL;
             user_reaper_running = false;
             user_thread_lifetime = 1;
-            user_vm_reaper_tid = 0;
-            user_vm_initial_tid = gettid();
-            user_vm_pi_users = 0;
-            user_vm_pi_owned = 0;
+            user_reaper_tid = 0;
             child_fd_depth = user_fd_fork_select(child_table->guard);
             user_fd_guard_default(child_table->guard);
             user_fd_current = child_table;
@@ -1098,9 +1102,14 @@ static int rvvm_sys_clone_impl(rvvm_user_thread_t* current, uint32_t flags, size
             if (initial_table != source_table) user_fd_table_fork_discard(initial_table);
             rvvm_user_fork_child(cpu);
             user_ptrace_fork(cpu);
+#ifdef USER_NATIVE_VFORK_POC
+            user_exec_fork_child();
+            user_observer_fork_child();
+#endif
+            user_exe_process_link_init(false);
         }
         rvvm_user_fork_unlock();
-        user_fd_mutex_unlock(&user_vm_reaper_lock);
+        user_fd_mutex_unlock(&user_reaper_lock);
         if (pid) user_fd_mutex_unlock(&user_exe_lock);
         if (!pid) {
             user_fd_table_fork_child();
@@ -1122,22 +1131,6 @@ static int rvvm_sys_clone_impl(rvvm_user_thread_t* current, uint32_t flags, size
                 if ((flags & UAPI_CLONE_PIDFD) && received != 1) _exit(127);
             }
             user_fd_unlock();
-            /* A new ordinary-fork child must not keep its parent's vfork
-             * completion channel alive after that parent execs or exits. */
-            if (!shared_files && user_vm_fd >= 0 && !user_vm_fork_peer) {
-                close(user_vm_fd);
-                atomic_store_uint32_relax(&user_fd_table()->vm_fd, UINT32_MAX);
-            }
-            current->tid = gettid();
-            atomic_store_uint32_relax(&user_signal_process_current()->refs, 1);
-            user_host_exe_link.st_ino = 0; // The child has a different proc inode.
-            user_fork_exe_link_ready = false;
-            current->refs = 1;
-            current->process_thread = true;
-            current->parent_settid = NULL;
-            current->child_settid = NULL;
-            current->child_cleartid = (flags & UAPI_CLONE_CHILD_CLEARTID) ? child_tid : NULL;
-            syscall(SYS_set_tid_address, current->child_cleartid);
             if (flags & UAPI_CLONE_CHILD_SETTID)
                 (void)uapi_extra_copy(&current->tid, child_tid, sizeof(current->tid), true);
             if (flags & UAPI_CLONE_SETTLS) rvvm_write_cpu_reg(cpu, RVVM_REGID_X0 + 4, tls);
@@ -1150,9 +1143,8 @@ static int rvvm_sys_clone_impl(rvvm_user_thread_t* current, uint32_t flags, size
             atomic_store_uint32(&cpu->user_signal_pending, 0);
             /* A fork service starts guest dispatch only after publication
              * and wrapper initialization; keep its native signals blocked. */
-            if (!user_vm_service) user_apply_mask();
+            user_apply_mask();
         } else {
-            if (pid > 0) user_service_guest(pid);
             if (!shared_files && !fork_slot) user_fd_table_release(child_table);
             int publish_error = 0;
             if (pid > 0 && (flags & UAPI_CLONE_PIDFD)) {
@@ -1190,502 +1182,25 @@ static int rvvm_sys_clone_impl(rvvm_user_thread_t* current, uint32_t flags, size
 static int rvvm_sys_clone(rvvm_user_thread_t* current, uint32_t flags, size_t stack,
                           uint32_t* parent_tid, size_t tls, uint32_t* child_tid)
 {
-    if (user_vm_child) return -ENOSYS;
     if (flags & UAPI_CLONE_VFORK) return rvvm_sys_vfork(current, flags, stack, parent_tid, tls, child_tid);
-    user_vm_enter();
-    int ret = rvvm_sys_clone_impl(current, flags, stack, parent_tid, tls, child_tid);
-    user_vm_leave();
-    return ret;
+    return rvvm_sys_clone_impl(current, flags, stack, parent_tid, tls, child_tid);
 }
 
-#include "rvvm_user_vm.h"
-static void user_vm_serve(struct user_vm*, int);
-
-struct user_vfork {
-    rvvm_user_thread_t child;
-    __typeof__(user_sig) signal;
-    user_fd_table_t* source_table;
-    uint32_t flags;
-    size_t stack, tls;
-    uint32_t *parent_tid, *child_tid;
-    int result;
-    int publish_error;
-    uint32_t stage;
-    pid_t group;
-    struct rlimit nofile;
-    uint32_t service_ready;
-    struct user_service* service;
-    user_fd_table_t snapshot;
-    pid_t aborted_child;
-    bool transition_released;
-    uint32_t files_ready;
-    int control[2], old_vm_fd;
-    struct user_vm* vm;
-};
-
-/* Only the service raises its limit. Channel installation briefly shares
- * the primary's files while guest kernel writers are parked; moving these
- * new socket descriptors cannot release any guest POSIX file locks. */
-static void user_vfork_channels(struct user_vfork* request)
-{
-    int error = 0;
-    if (user_vm_pause_begin()) error = errno;
-    else {
-        if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, request->control)) error = errno;
-        if (!error && getpid() != request->group) {
-            int minimum = request->nofile.rlim_max > 2 ? request->nofile.rlim_max - 2 : 0;
-            for (unsigned i = 0; i < 2 && !error; ++i) {
-                int moved = fcntl(request->control[i], F_DUPFD_CLOEXEC, minimum);
-                if (moved < 0 && errno == EMFILE)
-                    moved = fcntl(request->control[i], F_DUPFD_CLOEXEC, request->nofile.rlim_cur);
-                /* Relocation is optional: inherited high guest descriptors
-                 * may fill that range while lower slots remain available. */
-                if (moved >= 0) { close(request->control[i]); request->control[i] = moved; }
-            }
-        }
-        if (!error && syscall(SYS_unshare, CLONE_FILES)) error = errno;
-        if (error) {
-            for (unsigned i = 0; i < 2; ++i) {
-                if (request->control[i] >= 0) close(request->control[i]);
-                request->control[i] = -1;
-            }
-        }
-        user_vm_pause_end();
-    }
-    request->result = -error;
-    atomic_store_uint32(&request->stage, 5);
-    rvvm_futex_wake(&request->stage, 1);
-}
-
-static void* user_vfork_worker(void* opaque)
-{
-    user_host_fork_init();
-    struct user_vfork* request = opaque;
-    if (user_vm_service_group) {
-        /* The watcher copied metadata under the same guard as clone's
-         * kernel FD-table copy. Subsequent parent IO cannot change it. */
-        user_fd_table_t* private = user_fd_table_copy(&request->snapshot);
-        if (private) {
-            user_fd_guard_release(private->guard);
-            private->guard = user_fd_guard_create();
-        }
-        if (!private || !private->guard) {
-            if (private) user_fd_table_release(private);
-            request->result = -ENOMEM;
-            atomic_store_uint32(&request->stage, 3);
-            rvvm_futex_wake(&request->stage, 1);
-            return NULL;
-        }
-        user_fd_table_release(request->source_table);
-        request->source_table = private;
-    }
-    user_vm_service = true;
-    user_sig = request->signal;
-    user_sig.cpu = NULL;
-    user_signal_process = request->child.signals;
-    user_fd_table_t* source = request->source_table;
-    user_fd_table_enter(source);
-    uint64_t mask = UINT64_MAX;
-    syscall(SYS_rt_sigprocmask, SIG_SETMASK, &mask, NULL, 8);
-    user_fd_lock();
-    struct user_vm* vm = NULL;
-    int control[2] = {request->control[0], -1};
-    user_fd_table_t* table = mmap(NULL, sizeof(*table), PROT_READ | PROT_WRITE,
-                                MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    if (table == MAP_FAILED) { request->result = -ENOMEM; goto out; }
-    table->refs = calloc(1, sizeof(*table->refs));
-    if (!table->refs) { munmap(table, sizeof(*table)); request->result = -ENOMEM; goto out; }
-    *table->refs = 1;
-    table->exec_handoff = -1;
-    table->lock.shared = true;
-    table->exe_fd = source->exe_fd;
-    table->vm_fd = UINT32_MAX;
-    table->vm_service = true;
-    table->guard = user_fd_guard_create();
-    if (!table->guard) { request->result = -ENOMEM; user_fd_table_release(table); goto out; }
-    memcpy(table->descriptor, source->descriptor, sizeof(table->descriptor));
-    if (syscall(SYS_unshare, CLONE_FILES)) { request->result = -errno; user_fd_table_release(table); goto out; }
-    /* The service's private descriptors must not block unrelated guest IO. */
-    user_fd_unlock();
-    user_fd_table_enter(table);
-    if ((int)source->vm_fd >= 0) close((int)source->vm_fd);
-    user_fd_table_release(source);
-    request->source_table = NULL;
-    user_fd_lock();
-    spin_lock(&brk_lock);
-    spin_lock(&mmap_lock);
-    if (request->flags & UAPI_CLONE_VM) vm = user_vm_prepare();
-    if (vm && (request->flags & UAPI_CLONE_CHILD_CLEARTID)) vm->child_cleartid = (uintptr_t)request->child_tid;
-    if ((request->flags & UAPI_CLONE_VM) && !vm) request->result = -errno;
-    else if (vm) {
-        if (user_vm_pause_begin()) request->result = -errno;
-        else {
-            /* Moving an anonymous mapping changes non-private PI futex keys.
-             * Never migrate a live kernel PI owner or waiter. */
-            if (atomic_load_uint32(&user_vm_pi_users)) request->result = -ENOSYS;
-            else {
-                atomic_store_uint32(&user_vm_shared_active, 1);
-                request->result = user_vm_share(vm) ? -errno : 0;
-                if (request->result) atomic_store_uint32(&user_vm_shared_active, 0);
-            }
-            user_vm_pause_end();
-        }
-    }
-    spin_unlock(&mmap_lock);
-    spin_unlock(&brk_lock);
-    if (request->result) goto out;
-
-    /* Fork in the primary, so the kernel supplies its credentials, session,
-     * limits, parent relationship and SIGCHLD behavior without emulation. */
-    request->vm = vm;
-    atomic_store_uint32(&request->stage, 4);
-    rvvm_futex_wake(&request->stage, 1);
-    while (atomic_load_uint32(&request->stage) == 4)
-        rvvm_futex_wait(&request->stage, 4, RVVM_FUTEX_INFINITE);
-    int pid = request->result;
-    if (pid > 0) {
-        if (request->publish_error) {
-            close(control[0]);
-            control[0] = -1;
-            request->aborted_child = pid;
-            request->result = request->publish_error;
-        } else {
-            if (!vm && !request->service) {
-                user_fd_mutex_unlock(&user_vm_transition_lock);
-                request->transition_released = true;
-            }
-            if (!vm && request->service) {
-                /* Lend TLS exclusively while the watcher releases transition:
-                 * its mutex unlock saves/restores the same native errno. */
-                atomic_store_uint32(&request->files_ready, 3);
-                while (atomic_load_uint32(&request->service_ready) != 3) {}
-            }
-            (void)!send(control[0], "", 1, MSG_NOSIGNAL);
-            /* CLOEXEC closes the peer only after successful exec. A failed exec
-             * keeps guest bytes shared until the child writes its error and exits.
-             * Kernel close on process death also covers SIGKILL and host faults. */
-            user_vm_serve(vm, control[0]);
-        }
-    }
-    if (vm) {
-        /* EOF follows kernel exec/exit cleanup. The private host mm has only
-         * one guest thread, so Linux may skip its clear_child_tid store;
-         * publish it into the shared guest view before restoring COW. */
-        uint32_t zero = 0;
-        if (pid > 0 && vm->child_cleartid
-            && !uapi_extra_copy(&zero, (void*)vm->child_cleartid, sizeof(zero), true))
-            syscall(SYS_futex, (void*)vm->child_cleartid, FUTEX_WAKE, 1, NULL, NULL, 0);
-        spin_lock(&brk_lock);
-        spin_lock(&mmap_lock);
-        if (user_vm_pause_begin() || user_vm_restore(vm)) rvvm_fatal("Cannot restore vfork guest mappings");
-        atomic_store_uint32(&user_vm_shared_active, 0);
-        user_vm_pause_end();
-        spin_unlock(&mmap_lock);
-        spin_unlock(&brk_lock);
-    }
-out:
-    if (control[0] >= 0) close(control[0]);
-    if (control[1] >= 0) close(control[1]);
-    if (vm) user_vm_destroy(vm);
-    user_fd_unlock();
-    rvvm_free_user_thread(request->child.cpu);
-    user_fd_table_leave();
-    if (request->source_table) request->source_table = NULL;
-    user_signal_process_release(request->child.signals);
-    atomic_store_uint32(&request->stage, 3);
-    rvvm_futex_wake(&request->stage, 1);
-    return NULL;
-}
-
-#ifdef RVVM_STATIC_GLIBC_FORK
-static int user_vfork_service(void* opaque)
-{
-    struct user_vfork* request = opaque;
-    /* Do not touch the lent native TLS until the watcher has dropped its
-     * descriptor bookkeeping. This publication window is allocation-free. */
-    while (!atomic_load_uint32(&request->service_ready)) {}
-    /* The waiting native thread lends this service its TLS exclusively.
-     * A guest child never shares this native heap: the existing fork path
-     * still creates its COW process, with the original guest as parent. */
-    *user_fork_native_tid = syscall(SYS_gettid);
-    syscall(SYS_set_robust_list, user_fork_native_robust, sizeof(*user_fork_native_robust));
-    syscall(SYS_prctl, PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
-    if (getppid() != request->group) _exit(127);
-    if (setsid() < 0) _exit(127);
-    user_vm_service_group = request->group;
-    if (getrlimit(RLIMIT_NOFILE, &request->nofile)) _exit(127);
-    struct rlimit internal = request->nofile;
-    internal.rlim_cur = internal.rlim_max;
-    if (setrlimit(RLIMIT_NOFILE, &internal)) _exit(127);
-    user_vfork_channels(request);
-    while (atomic_load_uint32(&request->service_ready) != 2) {}
-    if (request->result) {
-        atomic_store_uint32(&request->stage, 3);
-        rvvm_futex_wake(&request->stage, 1);
-        return 0;
-    }
-    close(request->control[1]);
-    user_vfork_worker(request);
-    return 0;
-}
-
-static void* user_vfork_watch(void* opaque)
-{
-    user_host_fork_init();
-    struct user_vfork* request = opaque;
-    if (!user_fork_native_tid || !user_fork_native_robust) {
-        request->result = -ENOSYS;
-        atomic_store_uint32(&request->stage, 3);
-        rvvm_futex_wake(&request->stage, 1);
-        return NULL;
-    }
-    const size_t size = 256 * 1024;
-    request->service = calloc(1, sizeof(*request->service));
-    if (!request->service) {
-        request->result = -ENOMEM;
-        atomic_store_uint32(&request->stage, 3);
-        rvvm_futex_wake(&request->stage, 1);
-        return NULL;
-    }
-    void* stack = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    pid_t self = syscall(SYS_gettid);
-    /* The watcher owns the transition through preparation and restoration.
-     * Lending TLS to the service must not open a gap for another vfork to
-     * replace this request's peer in the primary descriptor metadata. */
-    user_fd_mutex_lock(&user_vm_transition_lock);
-    atomic_add_uint32(request->source_table->refs, 1);
-    user_fd_table_enter(request->source_table);
-    user_fd_lock();
-    request->snapshot = *request->source_table;
-    pid_t service = stack == MAP_FAILED ? -1
-        : clone(user_vfork_service, (char*)stack + size, CLONE_VM | CLONE_FS | CLONE_FILES, request);
-    int error = errno;
-    if (service < 0) {
-        user_fd_unlock();
-        user_fd_table_leave();
-        user_fd_mutex_unlock(&user_vm_transition_lock);
-        free(request->service);
-        request->service = NULL;
-        if (stack != MAP_FAILED) munmap(stack, size);
-        request->result = -error;
-        atomic_store_uint32(&request->stage, 3);
-        rvvm_futex_wake(&request->stage, 1);
-        return NULL;
-    }
-    user_service_publish(request->service, service);
-    atomic_store_uint32(&request->service_ready, 1);
-    while (atomic_load_uint32(&request->files_ready) != 2) {
-        int status;
-        /* Successful WNOHANG polling leaves borrowed TLS untouched. Startup
-         * death must fail closed rather than leave the primary waiting forever. */
-        if (syscall(SYS_wait4, service, &status, __WALL | WNOHANG | WUNTRACED, NULL))
-            syscall(SYS_exit_group, 127);
-    }
-    user_fd_unlock();
-    user_fd_table_leave();
-    atomic_store_uint32(&request->service_ready, 2);
-    if (!(request->flags & UAPI_CLONE_VM)) {
-        /* A private-mm child may wait for another parent thread to map memory.
-         * Once publication restored the parent peer, it needs no VM lock. */
-        while (atomic_load_uint32(&request->files_ready) != 3
-               && atomic_load_uint32(&request->stage) != 3) {
-            int status;
-            pid_t waited = syscall(SYS_wait4, service, &status, __WALL | WNOHANG | WUNTRACED, NULL);
-            if (waited && atomic_load_uint32(&request->stage) == 3
-                && ((waited == service && WIFEXITED(status) && !WEXITSTATUS(status))
-                    || (waited < 0 && errno == ECHILD))) {
-                if (waited == service) user_service_wait(service, status, true);
-                break;
-            }
-            if (waited) syscall(SYS_exit_group, 127);
-        }
-        if (atomic_load_uint32(&request->files_ready) == 3) {
-            user_fd_mutex_unlock(&user_vm_transition_lock);
-            request->transition_released = true;
-            atomic_store_uint32(&request->service_ready, 3);
-        }
-    }
-    int status;
-    pid_t waited;
-    do { waited = syscall(SYS_wait4, service, &status, __WALL | WUNTRACED, NULL); }
-    while (waited < 0 && errno == EINTR);
-    /* A trusted service can be in a native allocator critical section.
-     * Never continue the primary after unexpected service death or stop. */
-    if (waited < 0 && errno == ECHILD && atomic_load_uint32(&request->service->reaped)) {
-        status = request->service->status;
-        waited = service;
-    }
-    if ((waited != service && !(waited < 0 && errno == ECHILD))
-        || (waited == service && (!WIFEXITED(status) || WEXITSTATUS(status)))
-        || atomic_load_uint32(&request->stage) != 3) syscall(SYS_exit_group, 127);
-    *user_fork_native_tid = self;
-    atomic_store_uint32(&request->service->pid, 0);
-    if (!request->transition_released) user_fd_mutex_unlock(&user_vm_transition_lock);
-    munmap(stack, size);
-    return NULL;
-}
-#else
-static void* user_vfork_watch(void* opaque)
-{
-    struct user_vfork* request = opaque;
-    user_fd_mutex_lock(&user_vm_transition_lock);
-    atomic_add_uint32(request->source_table->refs, 1);
-    user_fd_table_enter(request->source_table);
-    user_fd_lock();
-    request->snapshot = *request->source_table;
-    user_vm_service_group = request->group;
-    user_vfork_channels(request);
-    while (atomic_load_uint32(&request->files_ready) != 2) {}
-    user_fd_unlock();
-    user_fd_table_leave();
-    if (!request->result) {
-        close(request->control[1]);
-        user_vfork_worker(request);
-    } else {
-        atomic_store_uint32(&request->stage, 3);
-        rvvm_futex_wake(&request->stage, 1);
-    }
-    if (!request->transition_released) user_fd_mutex_unlock(&user_vm_transition_lock);
-    return NULL;
-}
+#include "user_ptrace/user_ptrace_restart.h"
+#ifdef USER_NATIVE_VFORK_POC
+static bool user_kernel_dispatch(rvvm_hart_t*, long, long[6], long*);
+#include "rvvm_user_native_vfork.h"
 #endif
 
 static int rvvm_sys_vfork(rvvm_user_thread_t* current, uint32_t flags, size_t stack,
                           uint32_t* parent_tid, size_t tls, uint32_t* child_tid)
 {
-    flags &= ~UAPI_CLONE_IGNORED_FLAGS;
-    const uint32_t supported = 0xff | UAPI_CLONE_OPTIONAL_FLAGS | UAPI_CLONE_VM | UAPI_CLONE_VFORK | UAPI_CLONE_PIDFD;
-    if ((flags & ~supported) || (flags & 0xff) != SIGCHLD) return -EINVAL;
-    if ((flags & UAPI_CLONE_PIDFD) && (flags & UAPI_CLONE_PARENT_SETTID)) return -EINVAL;
-    struct user_vfork* request = calloc(1, sizeof(*request));
-    if (!request) return -ENOMEM;
-    request->child.cpu = user_clone_cpu(current->cpu);
-    if (!request->child.cpu) { free(request); return -EAGAIN; }
-    request->child.refs = 1;
-    request->child.signals = user_signal_process_retain();
-    request->signal = user_sig;
-    request->source_table = user_fd_table_retain();
-    atomic_store_uint32(&request->source_table->guard->escaped, 1);
-    request->flags = flags;
-    request->stack = stack;
-    request->tls = tls;
-    request->parent_tid = parent_tid;
-    request->child_tid = child_tid;
-    request->group = getpid();
-    request->control[0] = request->control[1] = -1;
-    request->old_vm_fd = user_vm_fd;
-    if (getrlimit(RLIMIT_NOFILE, &request->nofile)) {
-        int error = errno;
-        rvvm_free_user_thread(request->child.cpu);
-        user_signal_process_release(request->child.signals);
-        user_fd_table_release(request->source_table);
-        free(request);
-        return -error;
-    }
-    /* A helper must not receive guest signals before its TLS is initialized. */
-    uint64_t held = UINT64_MAX, saved_mask;
-    syscall(SYS_rt_sigprocmask, SIG_SETMASK, &held, &saved_mask, 8);
-    rvvm_thread_t* worker = rvvm_thread_create(user_vfork_watch, request);
-    syscall(SYS_rt_sigprocmask, SIG_SETMASK, &saved_mask, NULL, 8);
-    if (!worker) {
-        rvvm_free_user_thread(request->child.cpu);
-        user_signal_process_release(request->child.signals);
-        user_fd_table_release(request->source_table);
-        free(request);
-        return -EAGAIN;
-    }
-    uint32_t stage;
-    while (!(stage = atomic_load_uint32(&request->stage)))
-        rvvm_futex_wait(&request->stage, 0, RVVM_FUTEX_INFINITE);
-    if (stage == 5) {
-        if (!request->result) {
-            /* The service has detached its files; only this endpoint is
-             * needed in the primary until its native fork copies it. */
-            close(request->control[0]);
-            atomic_store_uint32_relax(&user_fd_table()->vm_fd, request->control[1]);
-        }
-        atomic_store_uint32(&request->files_ready, 2);
-        while ((stage = atomic_load_uint32(&request->stage)) == 5)
-            rvvm_futex_wait(&request->stage, 5, RVVM_FUTEX_INFINITE);
-    }
-    if (stage == 4) {
-        user_vm_fork_peer = true;
-        user_vm_service = true; // Keep child native signals held until wrapper setup.
-#ifdef RVVM_STATIC_GLIBC_FORK
-        user_fork_want_pidfd = (flags & UAPI_CLONE_PIDFD) != 0;
-        user_fork_pidfd = (int*)parent_tid;
+#ifdef USER_NATIVE_VFORK_POC
+    return user_native_vfork(current, flags, stack, parent_tid, tls, child_tid);
+#else
+    UNUSED(current); UNUSED(flags); UNUSED(stack); UNUSED(parent_tid); UNUSED(tls); UNUSED(child_tid);
+    return -ENOSYS;
 #endif
-        int pid = rvvm_sys_clone_impl(&request->child,
-            flags & ~(UAPI_CLONE_VM | UAPI_CLONE_VFORK | UAPI_CLONE_PIDFD | UAPI_CLONE_PARENT_SETTID),
-            stack, parent_tid, tls, child_tid);
-#ifdef RVVM_STATIC_GLIBC_FORK
-        user_fork_want_pidfd = false;
-        user_fork_pidfd = NULL;
-#endif
-        user_vm_fork_peer = false;
-        if (!pid) {
-            user_fd_table_t* table = user_fd_table();
-            char ready;
-            ssize_t received;
-            do { received = recv(request->control[1], &ready, 1, 0); } while (received < 0 && errno == EINTR);
-            if (received != 1) _exit(127);
-            /* Backing/proc descriptors exist only in the resource service.
-             * Drop this fork's aliases without closing unrelated guest fds. */
-            if (request->vm) user_vm_destroy_view(request->vm, false);
-            user_vm_service = false;
-            user_vm_child = (flags & UAPI_CLONE_VM) != 0;
-            user_vm_service_group = 0;
-            user_vm_transition_lock = (user_fd_mutex_t){0};
-            user_vm_transition_depth = 0;
-            user_vm_pause.active = 0;
-            request->child.fd_table = table;
-            request->child.signal_mask = request->signal.mask;
-            request->child.inherit_signal_stack = true;
-            request->child.signal_stack = request->signal.stack;
-            user_sig = request->signal;
-            user_sig.cpu = NULL;
-            current_user_hart = request->child.cpu;
-            rvvm_user_thread_wrap(&request->child);
-            _exit(127);
-        }
-        user_vm_service = false;
-        request->result = pid;
-        user_fd_lock();
-        close(request->control[1]);
-        request->control[1] = -1;
-        atomic_store_uint32_relax(&user_fd_table()->vm_fd, request->old_vm_fd);
-        user_fd_unlock();
-#ifndef RVVM_STATIC_GLIBC_FORK
-        if (flags & UAPI_CLONE_PIDFD) {
-            user_fd_lock();
-            int pidfd = syscall(SYS_pidfd_open, request->result, 0);
-            request->publish_error = pidfd < 0 ? -errno : uapi_extra_copy(&pidfd, parent_tid, sizeof(pidfd), true);
-            if (request->publish_error && pidfd >= 0) close(pidfd);
-            user_fd_unlock();
-        } else
-#endif
-        if (pid > 0 && (flags & UAPI_CLONE_PARENT_SETTID))
-            (void)uapi_extra_copy(&request->result, parent_tid, sizeof(request->result), true);
-        atomic_store_uint32(&request->stage, 2);
-        rvvm_futex_wake(&request->stage, 1);
-    }
-    thread_join(worker);
-    if (request->control[1] >= 0) {
-        user_fd_lock();
-        close(request->control[1]);
-        atomic_store_uint32_relax(&user_fd_table()->vm_fd, request->old_vm_fd);
-        user_fd_unlock();
-    }
-    if (request->aborted_child)
-        while (waitpid(request->aborted_child, NULL, 0) < 0 && errno == EINTR) {}
-    int result = request->result;
-    if (request->source_table) {
-        rvvm_free_user_thread(request->child.cpu);
-        user_signal_process_release(request->child.signals);
-        user_fd_table_release(request->source_table);
-    }
-    free(request);
-    return result;
 }
 
 #define UAPI_FUTEX_CMD_MASK    0x3F
@@ -1698,31 +1213,11 @@ static int rvvm_sys_futex(uint32_t* addr, int futex_op, uint32_t val, size_t val
 {
 #if defined(__linux__)
     int command = futex_op & FUTEX_CMD_MASK;
-    /* The worker has a different host mm. PRIVATE futex operations there
-     * cannot use the suspended parent's kernel keys. Reject them explicitly
-     * rather than returning a false wake or waiting on an unreachable key. */
-    if (user_vm_child && (futex_op & FUTEX_PRIVATE_FLAG)) return -ENOSYS;
-    bool pi_acquire = command == FUTEX_LOCK_PI || command == FUTEX_TRYLOCK_PI
-                   || command == FUTEX_WAIT_REQUEUE_PI || command == FUTEX_LOCK_PI2;
-    if (pi_acquire) {
-        atomic_add_uint32(&user_vm_pi_users, 1);
-        if (atomic_load_uint32(&user_vm_shared_active)) {
-            atomic_sub_uint32(&user_vm_pi_users, 1);
-            return -ENOSYS;
-        }
-    }
     long result;
     if (command == FUTEX_WAIT || command == FUTEX_WAIT_BITSET || command == FUTEX_LOCK_PI
         || command == FUTEX_WAIT_REQUEUE_PI || command == FUTEX_LOCK_PI2)
         result = errno_ret(USER_SYSCALL(SYS_futex, addr, futex_op, val, val2, uaddr2, val3));
     else result = errno_ret(syscall(SYS_futex, addr, futex_op, val, val2, uaddr2, val3));
-    if (pi_acquire) {
-        if (result < 0) atomic_sub_uint32(&user_vm_pi_users, 1);
-        else ++user_vm_pi_owned;
-    } else if (command == FUTEX_UNLOCK_PI && !result && user_vm_pi_owned) {
-        --user_vm_pi_owned;
-        atomic_sub_uint32(&user_vm_pi_users, 1);
-    }
     return result;
 #else
     UNUSED(val2); UNUSED(uaddr2); UNUSED(val3);
@@ -1803,8 +1298,14 @@ static inline int rvvm_sys_prot(int prot)
     int ret = PROT_NONE;
     if (prot & UAPI_PROT_READ)  ret |= PROT_READ;
     if (prot & UAPI_PROT_WRITE) ret |= PROT_WRITE;
-    // No real PROT_EXEC, since rvvm-user reads code when translating
-    if (prot & UAPI_PROT_EXEC)  ret |= PROT_READ;
+    /* The decoder needs readable code; retain X so kernel maps can recover
+     * guest execution permissions after an interrupted mapping transaction. */
+    if (prot & UAPI_PROT_EXEC) {
+        ret |= PROT_READ;
+#ifdef USER_NATIVE_VFORK_POC
+        ret |= PROT_EXEC;
+#endif
+    }
     ret |= prot & (PROT_GROWSDOWN | PROT_GROWSUP);
     return ret;
 }
@@ -1819,6 +1320,13 @@ static rvvm_addr_t rvvm_sys_mmap(void* addr, size_t size, int prot, int flags, i
 
     user_fd_lock();
     spin_lock(&mmap_lock);
+#ifdef USER_NATIVE_VFORK_POC
+    if (!user_exec_reserve(2)) {
+        spin_unlock(&mmap_lock);
+        user_fd_unlock();
+        return -ENOMEM;
+    }
+#endif
     if (flags & UAPI_MAP_SHARED) mmap_flags |= MAP_SHARED;
     if (flags & UAPI_MAP_PRIVATE) mmap_flags |= MAP_PRIVATE;
     if (flags & UAPI_MAP_ANON) mmap_flags |= MAP_ANON;
@@ -1860,6 +1368,9 @@ static rvvm_addr_t rvvm_sys_mmap(void* addr, size_t size, int prot, int flags, i
 static int rvvm_sys_munmap(void* addr, size_t size)
 {
     spin_lock(&mmap_lock);
+#ifdef USER_NATIVE_VFORK_POC
+    if (!user_exec_reserve(2)) { spin_unlock(&mmap_lock); return -ENOMEM; }
+#endif
 #ifdef __linux__
     rvvm_addr_t ret = errno_ret(user_vma_unmap(addr, size));
 #else
@@ -1872,7 +1383,6 @@ static int rvvm_sys_munmap(void* addr, size_t size)
     return ret;
 }
 
-#include "rvvm_user_vm_rpc.h"
 
 extern uint64_t __thread_selfid(void);
 
@@ -1884,9 +1394,6 @@ static int rvvm_sys_gettid(void)
     return gettid();
 #endif
 }
-
-static int fake_uid = 0;
-static int fake_gid = 0;
 
 static int rvvm_sys_getuid(void)
 {
@@ -1948,9 +1455,13 @@ static rvvm_addr_t rvvm_sys_getcwd(char* buffer, size_t size)
     }
 #endif
     char tmp[UAPI_PATH_MAX] = {0};
+#ifdef __linux__
+    if (syscall(SYS_getcwd, tmp, sizeof(tmp)) < 0) return last_errno();
+#else
     if (!getcwd(tmp, sizeof(tmp))) {
         return last_errno();
     }
+#endif
     const char* path = tmp;
     size_t prefix_len = prefix_path ? strlen(prefix_path) : 0;
     if (prefix_len && !strncmp(path, prefix_path, prefix_len)
@@ -2017,7 +1528,9 @@ static rvvm_addr_t rvvm_sys_readlinkat(int dirfd, const char* pathname, char* bu
 //#define rvvm_info(...) rvvm_warn(__VA_ARGS__);
 #define rvvm_info(...)
 
-#include "user_ptrace/user_ptrace_restart.h"
+#ifdef __linux__
+#include "rvvm_user_kernel_dispatch.h"
+#endif
 
 static void* rvvm_user_thread_wrap(void* arg)
 {
@@ -2042,14 +1555,11 @@ static void* rvvm_user_thread_wrap(void* arg)
     user_private_signals_restore();
     user_signal_init(cpu, thread->signal_mask);
     if (thread->inherit_signal_stack) user_sig.stack = thread->signal_stack;
-    user_vm_pause_checkpoint();
 
     char path_buf[UAPI_PATH_MAX] = {0};
-    char path_buf1[UAPI_PATH_MAX] = {0};
 
     // Set up thread tid, child_tid
     uint32_t tid = rvvm_sys_gettid();
-    if (thread->process_thread) user_vm_initial_tid = tid;
     if (!thread->setup_error && thread->child_settid) {
         (void)uapi_extra_copy(&tid, thread->child_settid, sizeof(tid), true);
     }
@@ -2109,118 +1619,20 @@ static void* rvvm_user_thread_wrap(void* arg)
             rvvm_addr_t a5 = rvvm_read_cpu_reg(cpu, RVVM_REGID_X0 + 15);
             rvvm_addr_t a7 = rvvm_read_cpu_reg(cpu, RVVM_REGID_X0 + 17);
             user_exe_relocation_resume();
-            // Use an invalid host fd for the private executable pin, while
-            // preserving kernel rules for ignored dirfds and argument errors.
-            // The common case adds only comparisons, not a descriptor lookup.
-            if (user_private_fd((int)a0) || user_private_fd((int)a1) || user_private_fd((int)a2)) {
-                unsigned fds = user_exe_fd_args(a7);
-                if ((fds & 1) && user_private_fd((int)a0)) a0 = -1;
-                if ((fds & 2) && user_private_fd((int)a1)) a1 = -1;
-                if ((fds & 4) && user_private_fd((int)a2)) a2 = -1;
-                if (a7 == 95 && a0 == 3 && user_private_fd((int)a1)) a1 = -1;
-            }
-            bool vm_mutation = a7 == 196 || a7 == 197 || a7 == 214 || a7 == 215
-                            || a7 == 216 || a7 == 222 || a7 == 226 || a7 == 233;
-            if (a7 == 222 && !(a3 & UAPI_MAP_ANON) && user_private_fd((int)a4)) a4 = -1;
-            if (a7 == 96 && user_vm_child) {
-                thread->child_cleartid = to_ptr(a0);
-                int result = user_vm_rpc(a7, a0, 0, 0, 0, 0, 0);
-                a0 = result < 0 ? result : syscall(SYS_set_tid_address, a0);
-            } else if (vm_mutation && user_vm_child) a0 = user_vm_rpc(a7, a0, a1, a2, a3, a4, a5);
-            else {
-            if (vm_mutation) user_vm_enter();
+            long kernel_args[] = {a0, a1, a2, a3, a4, a5};
+            user_exe_filter_args(a7, kernel_args);
+            a0 = kernel_args[0]; a1 = kernel_args[1]; a2 = kernel_args[2];
+            a3 = kernel_args[3]; a4 = kernel_args[4]; a5 = kernel_args[5];
+            bool memory_mutation = a7 == 196 || a7 == 197 || a7 == 214 || a7 == 215
+                                || a7 == 216 || a7 == 222 || a7 == 226 || a7 == 233;
+#ifdef __linux__
+            long kernel_result;
+            if (user_kernel_dispatch(cpu, a7, kernel_args, &kernel_result)) a0 = kernel_result;
+            else
+#endif
             switch (a7) {
-                case 58: // vhangup
-                    a0 = errno_ret(USER_SYSCALL(SYS_vhangup, 0, 0, 0, 0, 0, 0));
-                    break;
-                case 89: // acct
-                    a0 = user_host_path_call(SYS_acct, a0, 0, 0, 0, 0);
-                    break;
-                case 106: // delete_module: names refer to modules in the running host kernel
-                    a0 = errno_ret(USER_SYSCALL(SYS_delete_module, a0, a1, 0, 0, 0, 0));
-                    break;
-                case 142: // reboot: the host kernel enforces capabilities and PID namespaces
-                    a0 = errno_ret(USER_SYSCALL(SYS_reboot, a0, a1, a2, a3, 0, 0));
-                    break;
-                case 170: // settimeofday: Linux LP64 timeval/timezone ABI
-                    a0 = errno_ret(USER_SYSCALL(SYS_settimeofday, a0, a1, 0, 0, 0, 0));
-                    break;
-                case 224: // swapon
-                    a0 = user_host_path_call(SYS_swapon, a0, a1, 0, 0, 0);
-                    break;
-                case 225: // swapoff
-                    a0 = user_host_path_call(SYS_swapoff, a0, 0, 0, 0, 0);
-                    break;
-                case 41: // pivot_root
-                    a0 = user_host_path_call(SYS_pivot_root, a0, a1, 0, 0, 0);
-                    break;
-                case 268: // setns: change the calling kernel thread's namespaces
-                    a0 = user_host_fd_call(SYS_setns, a0, a1, 0);
-                    break;
-                case 272: // kcmp
-                    // Host object identities and remote private pins differ from the guest.
-                    a0 = -UAPI_ENOSYS;
-                    break;
-                case 428: // open_tree
-                    a0 = user_host_path_call(SYS_open_tree, a0, a1, a2, 0, 0);
-                    break;
-                case 429: // move_mount
-                    a0 = user_host_path_call(SYS_move_mount, a0, a1, a2, a3, a4);
-                    break;
-                case 430: // fsopen
-                    a0 = errno_ret(USER_SYSCALL(SYS_fsopen, a0, a1, 0, 0, 0, 0));
-                    break;
-                case 431: // fsconfig
-                    a0 = user_host_fsconfig(a0, a1, to_str(a2), to_ptr(a3), a4);
-                    break;
-                case 432: // fsmount
-                    a0 = user_host_fd_call(SYS_fsmount, a0, a1, a2);
-                    break;
-                case 433: // fspick
-                    a0 = user_host_path_call(SYS_fspick, a0, a1, a2, 0, 0);
-                    break;
-                case 438: // pidfd_getfd
-                    // Remote descriptor inspection cannot yet hide private pins reliably.
-                    a0 = -UAPI_ENOSYS;
-                    break;
-                case 442: // mount_setattr: kernel validates the extensible mount_attr structure
-                    a0 = user_host_mount_setattr(a0, to_str(a1), a2, to_ptr(a3), a4);
-                    break;
-                case 460: // lsm_set_self_attr: host LSM validates the fixed-width context records
-                    a0 = errno_ret(USER_SYSCALL(SYS_lsm_set_self_attr, a0, a1, a2, a3, 0, 0));
-                    break;
-                case 217: // add_key: the kernel owns payloads, keyrings and credentials
-                    a0 = errno_ret(USER_SYSCALL(SYS_add_key, a0, a1, a2, a3, a4, 0));
-                    break;
-                case 218: // request_key: retain host upcalls and interruptible waits
-                    a0 = errno_ret(USER_SYSCALL(SYS_request_key, a0, a1, a2, a3, 0, 0));
-                    break;
-                case 219: // keyctl: command-specific descriptor protection
-                    a0 = user_host_keyctl(a0, a1, a2, a3, a4);
-                    break;
-                case 60: // quotactl: preserve path-prefix handling and the kernel ABI
-                    a0 = user_host_quotactl(a0, to_str(a1), a2, a3);
-                    break;
-                case 443: // quotactl_fd
-                    a0 = user_host_quotactl_fd(a0, a1, a2, a3);
-                    break;
-                case 457: // statmount: fixed-width request and output structures
-                    a0 = errno_ret(USER_SYSCALL(SYS_statmount, a0, a1, a2, a3, 0, 0));
-                    break;
-                case 458: // listmount: kernel mount IDs belong to the real namespace
-                    a0 = errno_ret(USER_SYSCALL(SYS_listmount, a0, a1, a2, a3, 0, 0));
-                    break;
-                case 459: // lsm_get_self_attr: kernel credentials and security contexts
-                    a0 = errno_ret(USER_SYSCALL(SYS_lsm_get_self_attr, a0, a1, a2, a3, 0, 0));
-                    break;
-                case 461: // lsm_list_modules: kernel supplies active LSM IDs
-                    a0 = errno_ret(USER_SYSCALL(SYS_lsm_list_modules, a0, a1, a2, 0, 0, 0));
-                    break;
                 case 128: // restart_syscall: preserve a traced timed wait's original deadline
                     a0 = user_ptrace_restart_syscall();
-                    break;
-                case 132:
-                    a0 = user_sigaltstack(cpu, to_ptr(a0), to_ptr(a1));
                     break;
                 // Userspace emulation cannot load a guest kernel or guest modules into the host.
                 case 104: // kexec_load
@@ -2246,227 +1658,11 @@ static void* rvvm_user_thread_wrap(void* arg)
                 case 97: // unshare
                     a0 = user_fd_unshare(a0);
                     break;
-                case 107: // timer_create: use kernel timer IDs, not libc timer_t
-                    BUILD_ASSERT(sizeof(struct sigevent) == 64);
-                    BUILD_ASSERT(offsetof(struct sigevent, sigev_value) == 0);
-                    BUILD_ASSERT(offsetof(struct sigevent, sigev_signo) == 8);
-                    BUILD_ASSERT(offsetof(struct sigevent, sigev_notify) == 12);
-                    BUILD_ASSERT(offsetof(struct sigevent, _sigev_un._tid) == 16);
-                    a0 = errno_ret(syscall(SYS_timer_create, (int)a0, to_ptr(a1), to_ptr(a2)));
-                    break;
-                case 108: // timer_gettime
-                    a0 = errno_ret(syscall(SYS_timer_gettime, (int)a0, to_ptr(a1)));
-                    break;
-                case 109: // timer_getoverrun
-                    a0 = errno_ret(syscall(SYS_timer_getoverrun, (int)a0));
-                    break;
-                case 110: // timer_settime: RV64 uses two LP64 timespec structures
-                    a0 = errno_ret(syscall(SYS_timer_settime, (int)a0, (int)a1, to_ptr(a2), to_ptr(a3)));
-                    break;
-                case 111: // timer_delete
-                    a0 = errno_ret(syscall(SYS_timer_delete, (int)a0));
-                    break;
-                case 169: // gettimeofday: timeval and timezone have the LP64 Linux ABI
-                    BUILD_ASSERT(sizeof(struct timeval) == 16);
-                    BUILD_ASSERT(sizeof(struct timezone) == 8);
-                    a0 = errno_ret(syscall(SYS_gettimeofday, to_ptr(a0), to_ptr(a1)));
-                    break;
-                case 117:
-                    a0 = user_ptrace_request(a0, a1, a2, a3);
-                    break;
-                case 92: // personality: let Linux validate execution domains and flags
-                    a0 = errno_ret(syscall(SYS_personality, (unsigned int)a0));
-                    break;
-                case 171: // adjtimex: RV64 and LP64 hosts share the Linux timex ABI
-                    BUILD_ASSERT(sizeof(struct timex) == 208);
-                    a0 = errno_ret(syscall(SYS_adjtimex, to_ptr(a0)));
-                    break;
-                case 266: // clock_adjtime
-                    a0 = errno_ret(syscall(SYS_clock_adjtime, (int)a0, to_ptr(a1)));
-                    break;
-                case 184: // mq_notify: LP64 sigevent layout is checked above
-                    a0 = errno_ret(syscall(SYS_mq_notify, (int)a0, to_ptr(a1)));
-                    break;
-                case 285: // copy_file_range: both offsets point to signed 64-bit values
-                    a0 = errno_ret(syscall(SYS_copy_file_range, (int)a0, to_ptr(a1),
-                                          (int)a2, to_ptr(a3), a4, (unsigned)a5));
-                    break;
-                case 227: // msync
-                    a0 = errno_ret(msync(to_ptr(a0), a1, a2));
-                    break;
-                case 8: // getxattr
-                    a0 = errno_ret(getxattr(wrap_path(path_buf, to_str(a0)), to_str(a1), to_ptr(a2), a3));
-                    break;
-                case 5: // setxattr
-                    a0 = errno_ret(setxattr(wrap_path(path_buf, to_str(a0)), to_str(a1), to_ptr(a2), a3,
-                        uapi_translate_flags(a4, uapi_xattr_flags,
-                                             STATIC_ARRAY_SIZE(uapi_xattr_flags), true)));
-                    break;
-                case 6: // lsetxattr: operate on the link itself, not its target
-                    a0 = errno_ret(lsetxattr(wrap_path(path_buf, to_str(a0)), to_str(a1), to_ptr(a2), a3,
-                        uapi_translate_flags(a4, uapi_xattr_flags,
-                                             STATIC_ARRAY_SIZE(uapi_xattr_flags), true)));
-                    break;
-                case 9: // lgetxattr
-                    a0 = errno_ret(lgetxattr(wrap_path(path_buf, to_str(a0)), to_str(a1), to_ptr(a2), a3));
-                    break;
-                case 11: // listxattr
-                    a0 = errno_ret(listxattr(wrap_path(path_buf, to_str(a0)), to_ptr(a1), a2));
-                    break;
-                case 12: // llistxattr
-                    a0 = errno_ret(llistxattr(wrap_path(path_buf, to_str(a0)), to_ptr(a1), a2));
-                    break;
-                case 13: // flistxattr
-                    a0 = errno_ret(flistxattr(a0, to_ptr(a1), a2));
-                    break;
-                case 14: // removexattr
-                    a0 = errno_ret(removexattr(wrap_path(path_buf, to_str(a0)), to_str(a1)));
-                    break;
-                case 15: // lremovexattr
-                    a0 = errno_ret(lremovexattr(wrap_path(path_buf, to_str(a0)), to_str(a1)));
-                    break;
-                case 16: // fremovexattr
-                    a0 = errno_ret(fremovexattr(a0, to_str(a1)));
-                    break;
-                case 71: // sendfile: RV64 and the hosts use a signed 64-bit offset
-                    a0 = errno_ret(USER_SYSCALL(SYS_sendfile, a0, a1, a2, a3, 0, 0));
-                    break;
-                case 180: // mq_open
-                    a0 = uapi_extra_mq_open(to_str(a0), a1, a2, to_ptr(a3));
-                    break;
-                case 186: case 187: case 188: case 189:
-                    a0 = user_msg_syscall(a7, a0, a1, a2, a3, a4);
-                    break;
-                case 228: case 229: case 284:
-                    a0 = user_lock_memory(a7, a0, a1, a2);
-                    break;
-                case 116: case 162:
-                    a0 = user_system_control(a7, a0, a1, a2);
-                    break;
-                case 263: // fanotify_mark: mask is a single RV64 argument
-                    if ((int)a3 == user_exe_fd) a3 = -1;
-                    a0 = user_fs_fanotify_mark(a0, a1, (uint64_t)a2, (intptr_t)a3, to_str(a4));
-                    break;
-                case 451: // cachestat
-                    a0 = user_fs_cachestat(a0, a1, a2, a3);
-                    break;
-                case 181: case 182: case 183: case 185:
-                case 190: case 192: case 193:
-                    a0 = user_ipc_syscall(a7, a0, a1, a2, a3, a4);
-                    break;
-                case 30: case 31: case 81: case 84: case 213:
-                case 274: case 275:
-                    a0 = user_control_extra(a7, a0, a1, a2, a3);
-                    break;
-                case 75: // vmsplice
-                    a0 = user_io_vmsplice(a0, a1, a2, a3);
-                    break;
-                case 243: // recvmmsg
-                    a0 = user_io_recvmmsg(a0, a1, a2, a3, a4);
-                    break;
-                case 191: // semctl
-                    a0 = uapi_extra_semctl(a0, a1, a2, a3);
-                    break;
-                case 262: // fanotify_init
-                    a0 = uapi_extra_fanotify_init(a0, a1);
-                    break;
-                case 265: // open_by_handle_at
-                    a0 = uapi_extra_open_by_handle_at(a0, to_ptr(a1), a2);
-                    break;
                 case 281: // execveat: the kernel handles ELF/script dispatch through binfmt
                     a0 = user_binfmt_executable || getenv("RVVM_USER_BINFMT")
                        ? user_execveat(a0, to_str(a1), to_ptr(a2), to_ptr(a3),
                            uapi_translate_flags(a4, uapi_path_flags, STATIC_ARRAY_SIZE(uapi_path_flags), true))
                        : -UAPI_ENOSYS;
-                    break;
-                case 441: // epoll_pwait2
-                    a0 = user_epoll_wait(SYS_epoll_pwait2, a0, to_ptr(a1), a2, a3, to_ptr(a4), a5);
-                    break;
-                case 7: // fsetxattr
-                    a0 = errno_ret(fsetxattr(a0, to_str(a1), to_ptr(a2), a3,
-                        uapi_translate_flags(a4, uapi_xattr_flags,
-                                             STATIC_ARRAY_SIZE(uapi_xattr_flags), true)));
-                    break;
-                case 10: // fgetxattr
-                    a0 = errno_ret(fgetxattr(a0, to_str(a1), to_ptr(a2), a3));
-                    break;
-                case 76: // splice: offsets are pointers to signed 64-bit integers
-                    a0 = errno_ret(syscall(SYS_splice, (int)a0, to_ptr(a1),
-                        (int)a2, to_ptr(a3), a4,
-                        uapi_translate_flags(a5, uapi_splice_flags,
-                                             STATIC_ARRAY_SIZE(uapi_splice_flags), true)));
-                    break;
-                case 77: // tee
-                    a0 = errno_ret(USER_SYSCALL(SYS_tee, a0, a1, a2,
-                        uapi_translate_flags(a3, uapi_splice_flags,
-                                             STATIC_ARRAY_SIZE(uapi_splice_flags), true), 0, 0));
-                    break;
-                case 26: // inotify_init1
-                    a0 = errno_ret(syscall(SYS_inotify_init1,
-                        uapi_translate_flags(a0, uapi_fd_create_flags,
-                                             STATIC_ARRAY_SIZE(uapi_fd_create_flags), true)));
-                    break;
-                case 27: // inotify_add_watch: masks are architecture-independent Linux UAPI
-                    a0 = errno_ret(syscall(SYS_inotify_add_watch, a0,
-                        prefix_path && *prefix_path ? wrap_path(path_buf, to_str(a1)) : to_str(a1), a2));
-                    break;
-                case 28: // inotify_rm_watch
-                    a0 = errno_ret(syscall(SYS_inotify_rm_watch, a0, a1));
-                    break;
-                case 85: // timerfd_create
-                    a0 = errno_ret(syscall(SYS_timerfd_create, a0,
-                        uapi_translate_flags(a1, uapi_fd_create_flags,
-                                             STATIC_ARRAY_SIZE(uapi_fd_create_flags), true)));
-                    break;
-                case 86: // timerfd_settime
-                    a0 = errno_ret(syscall(SYS_timerfd_settime, a0, a1, to_ptr(a2), to_ptr(a3)));
-                    break;
-                case 87: // timerfd_gettime
-                    a0 = errno_ret(syscall(SYS_timerfd_gettime, a0, to_ptr(a1)));
-                    break;
-                case 267: // syncfs
-                    a0 = errno_ret(USER_SYSCALL(SYS_syncfs, a0, 0, 0, 0, 0, 0));
-                    break;
-                case 264: // name_to_handle_at: mount ID may be 32 or 64 bits
-                    a0 = errno_ret(syscall(SYS_name_to_handle_at, (int)a0,
-                        wrap_path(path_buf, to_str(a1)), to_ptr(a2), to_ptr(a3), (int)a4));
-                    break;
-#endif
-                case 17: { // getcwd
-                    rvvm_info("sys_getcwd(%lx, %lx)", a0, a1);
-                    a0 = rvvm_sys_getcwd(to_ptr(a0), a1);
-                    break;
-                }
-#ifdef __linux__
-                case 19: // eventfd2
-                    rvvm_info("sys_eventfd2(%lx, %lx)", a0, a1);
-                    a0 = errno_ret(eventfd(a0, a1));
-                    break;
-                case 20: // epoll_create1
-                    rvvm_info("sys_epoll_create1(%lx)", a0);
-                    a0 = errno_ret(epoll_create1(a0));
-                    break;
-                case 21: { // epoll_ctl
-                    // Host (x86-64) epoll_event is packed (12 bytes) while
-                    // RISC-V UAPI one is naturally aligned (16 bytes) - convert
-                    rvvm_info("sys_epoll_ctl(%lx, %lx, %lx, %lx)", a0, a1, a2, a3);
-                    struct epoll_event host_ev;
-                    struct epoll_event* host_ev_ptr = NULL;
-                    if (a3 && a1 != EPOLL_CTL_DEL) {
-                        struct uapi_epoll_event guest_ev;
-                        if (uapi_extra_copy(&guest_ev, to_ptr(a3), sizeof(guest_ev), false)) {
-                            a0 = -UAPI_EFAULT;
-                            break;
-                        }
-                        host_ev.events = guest_ev.event;
-                        host_ev.data.u64 = guest_ev.data.u64;
-                        host_ev_ptr = &host_ev;
-                    }
-                    a0 = errno_ret(epoll_ctl(a0, a1, a2, host_ev_ptr));
-                    break;
-                }
-                case 22: // epoll_pwait
-                    a0 = user_epoll_wait(SYS_epoll_pwait, a0, to_ptr(a1), a2, a3, to_ptr(a4), a5);
                     break;
 #endif
                 case 23: // dup
@@ -2497,114 +1693,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     }
                     break;
                 }
-                case 29: // ioctl
-                    // TODO: I sure hope not many ioctl() interfaces need struct conversion...
-                    rvvm_info("sys_ioctl(%ld, %lx, %lx)", a0, a1, a2);
-                    a0 = errno_ret(ioctl(a0, a1, a2));
-                    break;
-                case 32: // flock
-                    rvvm_info("sys_flock(%ld, %lx)", a0, a1);
-                    a0 = errno_ret(USER_SYSCALL(SYS_flock, a0, a1, 0, 0, 0, 0));
-                    break;
-                case 33: // mknodat
-                    rvvm_info("sys_mknodat(%ld, %s, %lx, %lx)", a0, to_str(a1), a2, a3);
-                    a0 = errno_ret(mknodat(a0, wrap_path(path_buf, to_str(a1)), a2, a3));
-                    break;
-                case 34: // mkdirat
-                    rvvm_info("sys_mkdirat(%ld, %s, %lx)", a0, to_str(a1), a2);
-                    a0 = errno_ret(mkdirat(a0, wrap_path(path_buf, to_str(a1)), a2));
-                    break;
-                case 35: // unlinkat
-                    rvvm_info("sys_unlinkat(%ld, %s, %lx)", a0, to_str(a1), a2);
-                    a0 = errno_ret(unlinkat(a0, wrap_path(path_buf, to_str(a1)), a2));
-                    break;
-                case 36: // symlinkat
-                    rvvm_info("sys_symlinkat(%s, %ld, %s)", to_str(a0), a1, to_str(a2));
-                    a0 = errno_ret(symlinkat(wrap_path(path_buf, to_str(a0)), a1,
-                                             wrap_path(path_buf1, to_str(a2))));
-                    break;
-                case 37: // linkat
-                    rvvm_info("sys_linkat(%ld, %s, %ld, %s, %lx)", a0, to_str(a1), a2, to_str(a3), a4);
-                    a0 = errno_ret(linkat(a0, wrap_path(path_buf, to_str(a1)),
-                                          a2, wrap_path(path_buf1, to_str(a3)), a4));
-                    break;
-                case 43: { // statfs64
-                    struct statfs stfs = {0};
-                    rvvm_info("sys_statfs64(%s, %lx, %lx)", to_str(a0), a1, a2);
-                    a0 = errno_ret(statfs(wrap_path(path_buf, to_str(a0)), &stfs));
-                    if (!a0) {
-                        struct uapi_statfs64 guest;
-                        uapi_statfs64_convert(&guest, &stfs);
-                        a0 = uapi_extra_copy(&guest, to_ptr(a1), sizeof(guest), true);
-                    }
-                    break;
-                }
-                case 44: { // fstatfs64
-                    struct statfs stfs = {0};
-                    rvvm_info("sys_fstatfs64(%ld, %lx, %lx)", a0, a1, a2);
-                    a0 = errno_ret(fstatfs(a0, &stfs));
-                    if (!a0) {
-                        struct uapi_statfs64 guest;
-                        uapi_statfs64_convert(&guest, &stfs);
-                        a0 = uapi_extra_copy(&guest, to_ptr(a1), sizeof(guest), true);
-                    }
-                    break;
-                }
-                case 45: // truncate64
-                    rvvm_info("sys_truncate64(%s, %lx)", to_str(a0), a1);
-                    a0 = errno_ret(truncate(wrap_path(path_buf, to_str(a0)), a1));
-                    break;
-                case 46: // ftruncate64
-                    rvvm_info("sys_ftruncate64(%ld, %lx)", a0, a1);
-                    a0 = errno_ret(ftruncate(a0, a1));
-                    break;
-#ifdef __linux__
-                case 47: // fallocate
-                    rvvm_info("sys_fallocate(%ld, %lx, %lx, %lx)", a0, a1, a2, a3);
-                    a0 = errno_ret(fallocate(a0, a1, a2, a3));
-                    break;
-#endif
-                case 48: // faccessat
-                    rvvm_info("sys_faccessat(%ld, %s, %lx)", a0, to_str(a1), a2);
-                    a0 = errno_ret(faccessat(a0, wrap_path(path_buf, to_str(a1)), a2, 0));
-                    break;
-                case 49: // chdir
-                    rvvm_info("sys_chdir(%s)", to_str(a0));
-                    a0 = errno_ret(chdir(wrap_path(path_buf, to_str(a0))));
-                    break;
-                case 50: // fchdir
-                    rvvm_info("sys_fchdir(%ld)", a0);
-                    a0 = errno_ret(fchdir(a0));
-                    break;
-                case 51: // chroot: real kernel operation in binfmt mode
-                    // The identity prefix remains valid after the kernel changes root.
-                    a0 = prefix_path && *prefix_path && strcmp(prefix_path, "/") ? -UAPI_ENOSYS
-                        : errno_ret(chroot(to_str(a0)));
-                    break;
-                case 52: // fchmod
-                    rvvm_info("sys_fchmodat(%ld, %lx)", a0, a1);
-                    a0 = errno_ret(fchmod(a0, a1));
-                    break;
-                case 53: // fchmodat
-                    rvvm_info("sys_fchmodat(%ld, %s, %lx)", a0, to_str(a1), a2);
-                    a0 = errno_ret(fchmodat(a0, wrap_path(path_buf, to_str(a1)), a2, 0));
-                    break;
-                case 54: // fchownat
-                    if (fake_root) {
-                        a0 = 0;
-                    } else {
-                        rvvm_info("sys_fchownat(%ld, %s, %lx, %lx, %lx)", a0, to_str(a1), a2, a3, a4);
-                        a0 = errno_ret(fchownat(a0, wrap_path(path_buf, to_str(a1)), a2, a3, a4));
-                    }
-                    break;
-                case 55: // fchown
-                    if (fake_root) {
-                        a0 = 0;
-                    } else {
-                        rvvm_info("sys_fchownat(%ld, %lx, %lx)", a0, a1, a2);
-                        a0 = errno_ret(fchown(a0, a1, a2));
-                    }
-                    break;
+#ifndef __linux__
                 case 56: { // openat
                     int dirfd = a0;
                     uint32_t flags = uapi_open_flags_to_host(a2);
@@ -2619,138 +1708,14 @@ static void* rvvm_user_thread_wrap(void* arg)
                     a0 = user_cpu_opened((int64_t)a0, flags, dirfd, path);
                     break;
                 }
+#endif
                 case 57: // close
                     a0 = user_exe_close(a0);
-                    break;
-                case 59: // pipe2
-                    rvvm_info("sys_pipe2(%lx, %lx)", a0, a1);
-#ifdef __linux__
-                    a0 = errno_ret(syscall(SYS_pipe2, to_ptr(a0), uapi_open_flags_to_host(a1)));
-#else
-                    a0 = -UAPI_ENOSYS;
-#endif
                     break;
                 case 61: // getdents64
                     a0 = rvvm_sys_getdents64(a0, to_ptr(a1), a2);
                     break;
-                case 62: // lseek
-                    a0 = errno_ret(lseek(a0, a1, a2));
-                    break;
-                case 63: // read
-                    a0 = errno_ret(USER_SYSCALL(SYS_read, a0, a1, a2, 0, 0, 0));
-                    break;
-                case 64: // write
-                    a0 = errno_ret(USER_SYSCALL(SYS_write, a0, a1, a2, 0, 0, 0));
-                    break;
-                case 65: // readv
-                    // TODO: struct conversion(?)
-                    a0 = errno_ret(USER_SYSCALL(SYS_readv, a0, a1, a2, 0, 0, 0));
-                    break;
-                case 66: // writev
-                    // TODO: struct conversion(?)
-                    a0 = errno_ret(USER_SYSCALL(SYS_writev, a0, a1, a2, 0, 0, 0));
-                    break;
-                case 67: // pread64
-                    a0 = errno_ret(USER_SYSCALL(SYS_pread64, a0, a1, a2, a3, 0, 0));
-                    break;
-                case 68: // pwrite64
-                    a0 = errno_ret(USER_SYSCALL(SYS_pwrite64, a0, a1, a2, a3, 0, 0));
-                    break;
-                case 69: // preadv
-                    a0 = user_posix_vector(SYS_preadv, a0, a1, a2, a3, a4, 0);
-                    break;
-                case 70: // pwritev
-                    a0 = user_posix_vector(SYS_pwritev, a0, a1, a2, a3, a4, 0);
-                    break;
-                case 286: // preadv2
-                    a0 = user_posix_vector(SYS_preadv2, a0, a1, a2, a3, a4, a5);
-                    break;
-                case 287: // pwritev2
-                    a0 = user_posix_vector(SYS_pwritev2, a0, a1, a2, a3, a4, a5);
-                    break;
-                case 72: // pselect6 (RISC-V 64-bit time and fd_set ABI)
-#ifdef __linux__
-                    // The sixth argument points to {sigset pointer, kernel sigset size}.
-                    // Forward it so unmasking signals and waiting remain atomic.
-                    BUILD_ASSERT(sizeof(void*) == 8 && sizeof(unsigned long) == 8);
-                    a0 = errno_ret(USER_SYSCALL(SYS_pselect6, a0, a1, a2, a3, a4, a5));
-#else
-                    a0 = -UAPI_ENOSYS;
-#endif
-                    break;
-                case 73: // ppoll
-#ifdef __linux__
-                    BUILD_ASSERT(sizeof(struct pollfd) == 8);
-                    BUILD_ASSERT(offsetof(struct pollfd, events) == 4);
-                    BUILD_ASSERT(offsetof(struct pollfd, revents) == 6);
-                    a0 = errno_ret(USER_SYSCALL(SYS_ppoll, a0, a1, a2, a3, a4, 0));
-#else
-                    a0 = -UAPI_ENOSYS;
-#endif
-                    break;
-                case 78: // readlinkat
-                    rvvm_info("sys_readlinkat(%ld, %s, %lx, %lx)", a0, to_str(a1), a2, a3);
-                    a0 = rvvm_sys_readlinkat(a0, to_str(a1), to_ptr(a2), a3);
-                    break;
-                case 79: { // newfstatat
-#if defined(__linux__) && defined(__aarch64__) && defined(__AARCH64EL__)
-                    // ARM64 and RV64 share the asm-generic kernel stat ABI.
-                    // Let the kernel copy to guest memory and report EFAULT.
-                    a0 = uapi_stat_syscall(SYS_newfstatat, (int)a0,
-                        (long)wrap_path(path_buf, to_str(a1)), a2, (int)a3);
-#else
-                    struct stat st = {0};
-                    rvvm_info("sys_newfstatat(%ld, %s, %lx, %lx)", a0, to_str(a1), a2, a3);
-                    a0 = errno_ret(fstatat(a0, wrap_path(path_buf, to_str(a1)), &st, a3));
-                    if (!a0) {
-                        struct uapi_stat guest;
-                        uapi_stat_convert(&guest, &st);
-                        a0 = uapi_extra_copy(&guest, to_ptr(a2), sizeof(guest), true);
-                    }
-#endif
-                    break;
-                }
-                case 80: { // newfstat
-#if defined(__linux__) && defined(__aarch64__) && defined(__AARCH64EL__)
-                    a0 = uapi_stat_syscall(SYS_fstat, (int)a0, a1, 0, 0);
-#else
-                    struct stat st = {0};
-                    rvvm_info("sys_newfstat(%ld, %lx)", a0, a1);
-                    a0 = errno_ret(fstat(a0, &st));
-                    if (!a0) {
-                        struct uapi_stat guest;
-                        uapi_stat_convert(&guest, &st);
-                        a0 = uapi_extra_copy(&guest, to_ptr(a1), sizeof(guest), true);
-                    }
-#endif
-                    break;
-                }
-                case 82: // fsync
-                    a0 = errno_ret(fsync(a0));
-                    break;
-                case 83: // fdatasync
-                    a0 = errno_ret(fdatasync(a0));
-                    break;
-                case 88: // utimensat
-#ifdef __linux__
-                    // Raw syscall preserves futimens' NULL pathname and kernel EFAULT handling.
-                    a0 = errno_ret(syscall(SYS_utimensat, (int)a0,
-                        wrap_path(path_buf, to_str(a1)), to_ptr(a2),
-                        uapi_translate_flags(a3, uapi_path_flags,
-                                             STATIC_ARRAY_SIZE(uapi_path_flags), true)));
-#else
-                    a0 = -UAPI_ENOSYS;
-#endif
-                    break;
-                case 90: // capget: Linux capability ABI uses fixed-width 32-bit fields
-                    a0 = errno_ret(syscall(SYS_capget, to_ptr(a0), to_ptr(a1)));
-                    break;
-                case 91: // capset: change only the calling thread, as the guest syscall does
-                    a0 = errno_ret(syscall(SYS_capset, to_ptr(a0), to_ptr(a1)));
-                    break;
                 case 93: // exit
-                    if (thread->process_thread && user_vm_fd >= 0 && !user_vm_child)
-                        shutdown(user_vm_fd, SHUT_WR);
                     user_ptrace_exit(cpu);
                     exit_status = a0;
                     running = false;
@@ -2759,342 +1724,15 @@ static void* rvvm_user_thread_wrap(void* arg)
                     user_ptrace_exit(cpu);
                     _Exit(a0);
                     break;
-                case 95: { // waitid: includes P_PIDFD and the raw syscall's rusage argument
-                    long queued;
-                    int type = a0;
-                    bool started = false;
-                    if (type == P_PID && user_service_find(a1)) { a0 = -ECHILD; break; }
-                    do {
-                        bool poll = !(a3 & WNOHANG) && (user_ptrace_events_tracing()
-                            || (a3 & (WNOWAIT | WSTOPPED)) == (WNOWAIT | WSTOPPED));
-                        if (poll && type == 3 && (fcntl((int)a1, F_GETFL) & O_NONBLOCK))
-                            poll = false;
-                        uint32_t generation = poll ? user_ptrace_events_generation() : 0;
-                        siginfo_t scratch = {0};
-                        siginfo_t* caller_info = a2 ? to_ptr(a2) : &scratch;
-                        if (user_ptrace_waitid_ready(type, a1, caller_info, a3, to_ptr(a4), &queued)) { a0 = queued; break; }
-                        siginfo_t* native_info = poll ? &scratch : caller_info;
-                        a0 = errno_ret(USER_SYSCALL(SYS_waitid, type, (unsigned int)a1,
-                            native_info, (int)a3 | (poll ? WNOHANG : 0), a4, 0));
-                        if (!(long)a0 && native_info->si_pid && !(a3 & WNOWAIT)
-                            && (native_info->si_code == CLD_EXITED || native_info->si_code == CLD_KILLED
-                                || native_info->si_code == CLD_DUMPED))
-                            user_fork_cache_reaped(native_info->si_pid);
-                        if (!(long)a0 && native_info->si_pid && user_service_find(native_info->si_pid)) {
-                            int status = native_info->si_code == CLD_EXITED
-                                ? native_info->si_status << 8 : native_info->si_status;
-                            user_service_wait(native_info->si_pid, status, !(a3 & WNOWAIT));
-                            a0 = USER_PTRACE_WAIT_AGAIN;
-                            continue;
-                        }
-                        if (started && (long)a0 == -EINTR) user_sig.syscall_unstarted = false;
-                        if (poll && !a0 && !scratch.si_pid) {
-                            started = true;
-                            a0 = user_ptrace_wait_pause(generation);
-                            continue;
-                        }
-                        a0 = user_ptrace_waitid((long)a0, native_info, a3);
-                        if (poll && !a0 && a2)
-                            a0 = uapi_extra_copy(&scratch, to_ptr(a2), sizeof(scratch), true);
-                    } while ((long)a0 == USER_PTRACE_WAIT_AGAIN);
-                    break;
-                }
                 case 96: // set_tid_address
                     thread->child_cleartid = to_ptr(a0);
                     a0 = thread->process_thread
                         ? syscall(SYS_set_tid_address, a0) : rvvm_sys_gettid();
                     break;
-                case 98: // futex
-                    a0 = rvvm_sys_futex(to_ptr(a0), a1, a2, a3, to_ptr(a4), a5);
-                    break;
-                case 99: // set_robust_list
-                    // Guest TIDs are host TIDs; the LP64 robust-list ABI is shared.
-                    // Kernel cleanup also covers SIGKILL and exec, not just SYS_exit.
-                    a0 = errno_ret(syscall(SYS_set_robust_list, to_ptr(a0), a1));
-                    break;
-                case 100: // get_robust_list
-                    a0 = errno_ret(syscall(SYS_get_robust_list, a0, to_ptr(a1), to_ptr(a2)));
-                    break;
-                case 101: // nanosleep
-                    // TODO: Struct conversion
-                    a0 = errno_ret(USER_SYSCALL(SYS_nanosleep, a0, a1, 0, 0, 0, 0));
-                    break;
-                case 102: // getitimer: RV64 and the supported hosts use 64-bit timeval
-                    BUILD_ASSERT(sizeof(struct itimerval) == 32);
-                    a0 = errno_ret(syscall(SYS_getitimer, (int)a0, to_ptr(a1)));
-                    break;
-                case 103: // setitimer
-                    rvvm_info("sys_setitimer(%lx, %lx, %lx)", a0, a1, a2);
-                    a0 = errno_ret(setitimer(a0, to_ptr(a1), to_ptr(a2)));
-                    break;
-                case 112: // clock_settime: let the kernel validate pointers and permissions
-                    BUILD_ASSERT(sizeof(struct timespec) == 16);
-                    a0 = errno_ret(syscall(SYS_clock_settime, (int)a0, to_ptr(a1)));
-                    break;
-                case 113: // clock_gettime
-                    // TODO: Struct conversion!
-                    rvvm_info("sys_clock_gettime(%lx, %lx)", a0, a1);
-                    a0 = errno_ret(clock_gettime(a0, to_ptr(a1)));
-                    break;
-                case 114: // clock_getres
-                    rvvm_info("sys_clock_getres(%lx, %lx)", a0, a1);
-                    a0 = errno_ret(clock_getres(a0, to_ptr(a1)));
-                    break;
-#ifdef __linux__
-                case 115: // clock_nanosleep
-                    // TODO: struct conversion?
-                    rvvm_info("sys_clock_nanosleep(%lx, %lx, %lx, %lx)", a0, a1, a2, a3);
-                    a0 = errno_ret(USER_SYSCALL(SYS_clock_nanosleep, a0, a1, a2, a3, 0, 0));
-                    break;
-#endif
-                case 118: // sched_setparam
-                case 119: // sched_setscheduler
-                case 120: // sched_getscheduler
-                case 121: // sched_getparam
-                case 125: // sched_get_priority_max
-                case 126: // sched_get_priority_min
-                case 127: // sched_rr_get_interval
-                    a0 = user_posix_scheduler(a7, a0, a1, a2);
-                    break;
-                case 122: // sched_setaffinity
-#ifdef __linux__
-                    a0 = errno_ret(syscall(SYS_sched_setaffinity, a0, a1, to_ptr(a2)));
-#else
-                    a0 = 0;
-#endif
-                    break;
-                case 123: { // sched_getaffinity - pass through the host affinity mask,
-                    // guest allocators (f.e. Zig SmpAllocator) size per-CPU arenas by it
-#ifdef __linux__
-                    // The raw ABI returns bytes, unlike libc's zero-on-success wrapper.
-                    // Let Linux validate the PID, buffer size, and guest pointer.
-                    a0 = errno_ret(syscall(SYS_sched_getaffinity, a0, a1, to_ptr(a2)));
-#else
-                    if (a2 && a1) {
-                        memset(to_ptr(a2), 0, a1);
-                        cpu_set_t host_mask;
-                        CPU_ZERO(&host_mask);
-                        if (!sched_getaffinity(0, sizeof(host_mask), &host_mask)) {
-                            size_t copy_len = sizeof(host_mask) < a1 ? sizeof(host_mask) : a1;
-                            memcpy(to_ptr(a2), &host_mask, copy_len);
-                        } else {
-                            *(uint8_t*)to_ptr(a2) = 1;
-                        }
-                    }
-                    // Syscall ABI: return the amount of bytes written into the mask
-                    a0 = (a1 >= sizeof(unsigned long)) ? sizeof(unsigned long) : a1;
-#endif
-                    break;
-                }
-                case 124: // sched_yield
-                    sleep_ms(0);
-                    a0 = 0;
-                    break;
-                case 129: // kill
-                    rvvm_debug("sys_kill(%lx, %lx)", a0, a1);
-                    a0 = user_service_find((pid_t)a0) ? -ESRCH : errno_ret(kill(a0, a1));
-                    break;
-#ifdef __linux__
-                case 130: // tkill
-                    rvvm_debug("sys_tkill(%lx, %lx)", a0, a1);
-                    a0 = user_service_find((pid_t)a0) ? -ESRCH : errno_ret(syscall(SYS_tkill, (int)a0, (int)a1));
-                    break;
-                case 131: // tgkill
-                    rvvm_debug("sys_tgkill(%lx, %lx, %ld)", a0, a1, a2);
-                    a0 = user_service_find((pid_t)a1) ? -ESRCH : errno_ret(tgkill(a0, a1, a2));
-                    break;
-#endif
-                case 133: // rt_sigsuspend
-                    a0 = errno_ret(USER_SYSCALL(SYS_rt_sigsuspend, a0, a1, 0, 0, 0, 0));
-                    break;
-                case 134: // rt_sigaction
-                    a0 = user_rt_sigaction(a0, to_ptr(a1), to_ptr(a2), a3);
-                    break;
-                case 135: // rt_sigprocmask
-                    a0 = user_rt_sigprocmask(a0, to_ptr(a1), to_ptr(a2), a3);
-                    break;
-                case 136: // rt_sigpending
-                    a0 = user_rt_sigpending(to_ptr(a0), a1);
-                    break;
-                case 137: { // rt_sigtimedwait
-                    a0 = user_rt_sigtimedwait(to_ptr(a0), to_ptr(a1), to_ptr(a2), a3);
-                    break;
-                }
                 case 139: // rt_sigreturn restores a0 and PC itself
                     user_rt_sigreturn(cpu);
                     user_ptrace_syscall_end(cpu);
                     continue;
-                case 138: // rt_sigqueueinfo
-                    a0 = user_sigqueue(a0, 0, a1, to_ptr(a2), false);
-                    break;
-                case 240: // rt_tgsigqueueinfo
-                    a0 = user_sigqueue(a0, a1, a2, to_ptr(a3), true);
-                    break;
-                case 140: // setpriority
-                    a0 = errno_ret(syscall(SYS_setpriority, (int)a0, (int)a1, (int)a2));
-                    break;
-                case 141: // getpriority: libc converts the kernel's 20-nice result
-                    a0 = errno_ret(syscall(SYS_getpriority, (int)a0, (int)a1));
-                    break;
-                case 143: // setregid
-                    if (!fake_root) a0 = errno_ret(syscall(SYS_setregid, (uint32_t)a0, (uint32_t)a1));
-                    else {
-                        if ((uint32_t)a1 != UINT32_MAX) fake_gid = a1;
-                        else if ((uint32_t)a0 != UINT32_MAX) fake_gid = a0;
-                        a0 = 0;
-                    }
-                    break;
-                case 145: // setreuid
-                    if (!fake_root) a0 = errno_ret(syscall(SYS_setreuid, (uint32_t)a0, (uint32_t)a1));
-                    else {
-                        if ((uint32_t)a1 != UINT32_MAX) fake_uid = a1;
-                        else if ((uint32_t)a0 != UINT32_MAX) fake_uid = a0;
-                        a0 = 0;
-                    }
-                    break;
-                case 144: // setgid
-                    a0 = rvvm_sys_setgid(a0);
-                    break;
-                case 146: // setuid
-                    a0 = rvvm_sys_setuid(a0);
-                    break;
-                case 147: // setresuid - semi stub
-#ifdef __linux__
-                    if (!fake_root) {
-                        a0 = errno_ret(syscall(SYS_setresuid, a0, a1, a2));
-                        break;
-                    }
-#endif
-                    a0 = rvvm_sys_setuid(a0);
-                    break;
-                case 148: // getresuid - semi stub
-                    a0 = rvvm_sys_getresuid(to_ptr(a0), to_ptr(a1), to_ptr(a2));
-                    break;
-                case 149: // setresgid - semi stub
-#ifdef __linux__
-                    if (!fake_root) {
-                        a0 = errno_ret(syscall(SYS_setresgid, a0, a1, a2));
-                        break;
-                    }
-#endif
-                    a0 = rvvm_sys_setgid(a0);
-                    break;
-                case 150: // getresgid - semi stub
-                    a0 = rvvm_sys_getresgid(to_ptr(a0), to_ptr(a1), to_ptr(a2));
-                    break;
-                case 151: // setfsuid - ignore
-                    a0 = rvvm_sys_getuid();
-                    break;
-                case 152: // setfsgid - ignore
-                    a0 = rvvm_sys_getgid();
-                    break;
-                case 153: // times
-                    // TODO: Struct conversion!
-                    rvvm_info("sys_times(%lx)", a0);
-                    a0 = errno_ret(times(to_ptr(a0)));
-                    break;
-#ifdef __linux__
-                case 154: // setpgid
-                    rvvm_info("sys_setpgid(%lx, %lx)", a0, a1);
-                    a0 = errno_ret(setpgid(a0, a1));
-                    break;
-                case 155: // getpgid
-                    rvvm_info("sys_getpgid(%lx)", a0);
-                    a0 = errno_ret(getpgid(a0));
-                    break;
-#endif
-                case 156: // getsid
-                    a0 = errno_ret(syscall(SYS_getsid, (int)a0));
-                    break;
-                case 161: // sethostname
-                    a0 = errno_ret(syscall(SYS_sethostname, to_ptr(a0), a1));
-                    break;
-                case 157: // setsid
-                    rvvm_info("sys_setsid()");
-                    a0 = errno_ret(setsid());
-                    break;
-                case 158: // getgroups
-                    rvvm_info("sys_getgroups(%lx, %lx)", a0, a1);
-                    a0 = errno_ret(getgroups(a0, to_ptr(a1)));
-                    break;
-                case 159: // setgroups
-                    if (fake_root) {
-                        a0 = 0;
-                    } else {
-                        a0 = errno_ret(syscall(SYS_setgroups, a0, to_ptr(a1)));
-                    }
-                    break;
-                case 160: // newuname
-                    rvvm_info("sys_newuname(%lx)", a0);
-                    {
-                        // Preserve the emulated machine/version identity, but
-                        // hostname changes belong to the real UTS namespace.
-                        struct uapi_new_utsname host;
-                        struct uapi_new_utsname name = {
-                            .sysname = "Linux",
-                            .release = "6.6.6",
-                            .version = "RVVM " RVVM_VERSION,
-                            .machine = "riscv64",
-                        };
-                        long ret = errno_ret(syscall(SYS_uname, &host));
-                        if (!ret) {
-                            memcpy(name.nodename, host.nodename, sizeof(name.nodename));
-                            memcpy(name.domainname, host.domainname, sizeof(name.domainname));
-                            ret = uapi_extra_copy(&name, to_ptr(a0), sizeof(name), true);
-                        }
-                        a0 = ret;
-                    }
-                    break;
-                case 163: // getrlimit
-                    a0 = errno_ret(syscall(SYS_prlimit64, 0, a0, NULL, to_ptr(a1)));
-                    break;
-                case 164: // setrlimit
-                    a0 = errno_ret(syscall(SYS_prlimit64, 0, a0, to_ptr(a1), NULL));
-                    break;
-                case 165: // getrusage
-                    rvvm_info("sys_getrusage(%lx, %lx)", a0, a1);
-                    a0 = errno_ret(getrusage(a0, to_ptr(a1)));
-                    break;
-                case 166: // umask
-                    rvvm_info("sys_umask(%lx)", a0);
-                    a0 = errno_ret(umask(a0));
-                    break;
-                case 167: // prctl
-                    a0 = uapi_extra_prctl(a0, a1, a2, a3, a4);
-                    break;
-#ifdef __linux__
-                case 168: // getcpu
-                    a0 = errno_ret(syscall(SYS_getcpu, to_ptr(a0), to_ptr(a1), to_ptr(a2)));
-                    break;
-#endif
-                case 172: // getpid
-                    a0 = errno_ret(getpid());
-                    break;
-                case 173: // getppid
-                    a0 = errno_ret(getppid());
-                    break;
-                case 174: // getuid
-                    a0 = rvvm_sys_getuid();
-                    break;
-                case 175: // geteuid
-                    a0 = fake_root ? fake_uid : geteuid();
-                    break;
-                case 176: // getgid
-                    a0 = rvvm_sys_getgid();
-                    break;
-                case 177: // getegid
-                    a0 = fake_root ? fake_gid : getegid();
-                    break;
-                case 178: // gettid
-                    a0 = rvvm_sys_gettid();
-                    break;
-#ifdef __linux__
-                case 179: // sysinfo
-                    // TODO: struct conversion(?)
-                    rvvm_info("sys_sysinfo(%lx)", a0);
-                    a0 = errno_ret(sysinfo(to_ptr(a0)));
-                    break;
-#endif
                 case 194: // shmget
                     rvvm_info("sys_shmget(%lx, %lx, %lx)", a0, a1, a2);
                     a0 = errno_ret(shmget(a0, a1, a2));
@@ -3115,75 +1753,6 @@ static void* rvvm_user_thread_wrap(void* arg)
                     user_fd_lock();
                     a0 = errno_ret(user_vma_shmdt(to_ptr(a0)));
                     user_fd_unlock();
-                    break;
-                case 198: // socket
-                    rvvm_info("sys_socket(%lx, %lx, %lx)", a0, a1, a2);
-                    a0 = errno_ret(socket(a0, a1, a2));
-                    break;
-                case 199: // socketpair
-                    rvvm_info("sys_socketpair(%lx, %lx, %lx, %lx)", a0, a1, a2, a3);
-                    a0 = errno_ret(socketpair(a0, a1, a2, to_ptr(a3)));
-                    break;
-                case 200: // bind
-                    // TODO struct conversion
-                    rvvm_info("sys_bind(%ld, %lx, %lx)", a0, a1, a2);
-                    a0 = errno_ret(bind(a0, to_ptr(a1), a2));
-                    break;
-                case 201: // listen
-                    rvvm_info("sys_listen(%ld, %lx)", a0, a1);
-                    a0 = errno_ret(listen(a0, a1));
-                    break;
-                case 202: // accept
-                    // TODO: struct conversion(?)
-                    rvvm_info("sys_accept(%ld, %lx, %lx)", a0, a1, a2);
-                    a0 = errno_ret(USER_SYSCALL(SYS_accept, a0, a1, a2, 0, 0, 0));
-                    break;
-                case 203: // connect
-                    // TODO: struct conversion(?)
-                    rvvm_info("sys_connect(%ld, %lx, %lx)", a0, a1, a2);
-                    a0 = errno_ret(USER_SYSCALL(SYS_connect, a0, a1, a2, 0, 0, 0));
-                    break;
-                case 204: // getsockname
-                    // TODO: struct conversion(?)
-                    rvvm_info("sys_getsockname(%ld, %lx, %lx)", a0, a1, a2);
-                    a0 = errno_ret(getsockname(a0, to_ptr(a1), to_ptr(a2)));
-                    break;
-                case 205: // getpeername
-                    // TODO: struct conversion(?)
-                    rvvm_info("sys_getpeername(%ld, %lx, %lx)", a0, a1, a2);
-                    a0 = errno_ret(getpeername(a0, to_ptr(a1), to_ptr(a2)));
-                    break;
-                case 206: // sendto
-                    // TODO: struct conversion(?)
-                    rvvm_info("sys_sendto(%ld, %lx, %lx, %lx, %lx, %lx)", a0, a1, a2, a3, a4, a5);
-                    a0 = errno_ret(USER_SYSCALL(SYS_sendto, a0, a1, a2, a3, a4, a5));
-                    break;
-                case 207: // recvfrom
-                    // TODO: struct conversion(?)
-                    rvvm_info("sys_recvfrom(%ld, %lx, %lx, %lx, %lx, %lx)", a0, a1, a2, a3, a4, a5);
-                    a0 = errno_ret(USER_SYSCALL(SYS_recvfrom, a0, a1, a2, a3, a4, a5));
-                    break;
-                case 208: // setsockopt
-                    rvvm_info("sys_setsockopt(%ld, %lx, %lx, %lx, %lx)", a0, a1, a2, a3, a4);
-                    a0 = errno_ret(setsockopt(a0, a1, a2, to_ptr(a3), a4));
-                    break;
-                case 209: // getsockopt
-                    rvvm_info("sys_getsockopt(%ld, %lx, %lx, %lx, %lx)", a0, a1, a2, a3, a4);
-                    a0 = errno_ret(getsockopt(a0, a1, a2, to_ptr(a3), to_ptr(a4)));
-                    break;
-                case 210: // shutdown
-                    rvvm_info("sys_shutdown(%ld, %lx)", a0, a1);
-                    a0 = errno_ret(shutdown(a0, a1));
-                    break;
-                case 211: // sendmsg
-                    // TODO: struct conversion(?)
-                    rvvm_info("sys_sendmsg(%ld, %lx, %lx)", a0, a1, a2);
-                    a0 = errno_ret(USER_SYSCALL(SYS_sendmsg, a0, a1, a2, 0, 0, 0));
-                    break;
-                case 212: // recvmsg
-                    // TODO: struct conversion(?)
-                    rvvm_info("sys_recvmsg(%ld, %lx, %lx)", a0, a1, a2);
-                    a0 = errno_ret(USER_SYSCALL(SYS_recvmsg, a0, a1, a2, 0, 0, 0));
                     break;
                 case 214: // brk
                     rvvm_info("sys_brk(%lx)", a0);
@@ -3222,26 +1791,11 @@ static void* rvvm_user_thread_wrap(void* arg)
                         a0 = user_execve(to_str(a0), to_ptr(a1), to_ptr(a2));
                         break;
                     }
-                    if (access(wrap_path(path_buf, to_str(a0)), F_OK)) {
-                        a0 = -ENOENT;
-                        break;
-                    }
-                    char** orig_argv = to_ptr(a1);
-                    char* new_argv[256] = {"/proc/self/exe", "-user", 0};
-                    for (size_t i=2; i<255 && orig_argv[i - 2]; ++i) new_argv[i] = orig_argv[i - 2];
-                    new_argv[2] = to_ptr(a0);
-                    a0 = errno_ret(USER_SYSCALL(SYS_execve, "/proc/self/exe", new_argv, a2, 0, 0, 0));
+                    a0 = user_exec_interpreter(to_str(a0), to_ptr(a1), to_ptr(a2));
                     break;
                 }
                 case 222: // mmap
                     a0 = rvvm_sys_mmap(to_ptr(a0), a1, a2, a3, a4, a5);
-                    break;
-                case 223: // fadvise64: raw syscall returns -1/errno, unlike posix_fadvise()
-#ifdef __linux__
-                    a0 = errno_ret(USER_SYSCALL(SYS_fadvise64, a0, a1, a2, a3, 0, 0));
-#else
-                    a0 = -UAPI_ENOSYS;
-#endif
                     break;
                 case 226: // mprotect
                     rvvm_info("sys_mprotect(%lx, %lx, %x)", a0, a1, a2);
@@ -3251,7 +1805,11 @@ static void* rvvm_user_thread_wrap(void* arg)
                     {
                         uintptr_t start = a0;
                         size_t size = a1;
-                        rvvm_addr_t ret = user_vma_protect_span(&start, &size, a2)
+                        rvvm_addr_t ret =
+#ifdef USER_NATIVE_VFORK_POC
+                            !user_exec_reserve(2) ? -ENOMEM :
+#endif
+                            user_vma_protect_span(&start, &size, a2)
                             ? last_errno() : errno_ret(mprotect(to_ptr(a0), a1, rvvm_sys_prot(a2)));
                         if (!ret) user_exec_update(start, size, a2 & UAPI_PROT_EXEC);
                         a0 = ret;
@@ -3276,9 +1834,11 @@ static void* rvvm_user_thread_wrap(void* arg)
                     a0 = errno_ret(USER_SYSCALL(SYS_accept4, a0, a1, a2, a3, 0, 0));
                     break;
 #endif
+#ifndef __linux__
                 case 258: // riscv_hwprobe
                     a0 = user_cpu_hwprobe(to_ptr(a0), a1, a2, to_ptr(a3), (unsigned int)a4);
                     break;
+#endif
                 case 259: // riscv_flush_icache
                     //rvvm_warn("riscv_flush_icache(%lx, %lx, %lx)", a0, a1, a2);
                     rvvm_flush_icache(userland, a0, a1 - a0);
@@ -3302,39 +1862,6 @@ static void* rvvm_user_thread_wrap(void* arg)
                     }
                     a0 = 0;
                     break;
-                case 260: { // wait4
-                    long queued;
-                    pid_t selector = a0;
-                    bool started = false;
-                    if (user_service_find(selector)) { a0 = -ECHILD; break; }
-                    do {
-                        bool tracing = user_ptrace_events_tracing();
-                        bool poll = tracing && !(a2 & WNOHANG);
-                        uint32_t generation = poll ? user_ptrace_events_generation() : 0;
-                        int scratch;
-                        int* status = a1 ? to_ptr(a1) : &scratch;
-                        if (user_ptrace_wait_ready(selector, status, a2, to_ptr(a3), &queued)) { a0 = queued; break; }
-                        a0 = errno_ret(USER_SYSCALL(SYS_wait4, selector, status,
-                            a2 | (poll ? WNOHANG : 0), a3, 0, 0));
-                        if ((long)a0 > 0 && (WIFEXITED(*status) || WIFSIGNALED(*status)))
-                            user_fork_cache_reaped((pid_t)a0);
-                        if ((long)a0 > 0 && user_service_wait((pid_t)a0, *status, true)) {
-                            a0 = USER_PTRACE_WAIT_AGAIN;
-                            continue;
-                        }
-                        if (started && (long)a0 == -EINTR) user_sig.syscall_unstarted = false;
-                        if (poll && !a0) {
-                            started = true;
-                            a0 = user_ptrace_wait_pause(generation);
-                            continue;
-                        }
-                        a0 = user_ptrace_wait((long)a0, status);
-                    } while ((long)a0 == USER_PTRACE_WAIT_AGAIN);
-                    break;
-                }
-                case 261: // prlimit64: Linux rlimit64 is two uint64_t fields
-                    a0 = errno_ret(syscall(SYS_prlimit64, a0, a1, to_ptr(a2), to_ptr(a3)));
-                    break;
 #ifdef __linux__
                 case 269: // sendmmsg
                     // TODO: Struct conversion
@@ -3348,43 +1875,12 @@ static void* rvvm_user_thread_wrap(void* arg)
                     a0 = errno_ret(USER_SYSCALL(SYS_process_vm_writev, a0, a1, a2, a3, a4, a5));
                     break;
 #endif
-                case 276: // renameat2
-                    rvvm_info("sys_renameat2(%ld, %s, %ld, %s, %lx)", a0, to_str(a1), a2, to_str(a3), a4);
-#ifdef __linux__
-                    a0 = errno_ret(syscall(SYS_renameat2, a0, wrap_path(path_buf, to_str(a1)),
-                                          a2, wrap_path(path_buf1, to_str(a3)), a4));
-#else
-                    a0 = -UAPI_ENOSYS;
-#endif
-                    break;
                 case 277: // Guest filters cannot safely constrain the emulator's host syscalls.
                     a0 = -UAPI_ENOSYS;
                     break;
-                case 424: // pidfd_send_signal: LP64 Linux siginfo ABI
-                    a0 = errno_ret(syscall(SYS_pidfd_send_signal, (int)a0, (int)a1, to_ptr(a2), (unsigned int)a3));
-                    break;
-                case 434: // pidfd_open: guest process IDs are host process IDs
-                    a0 = errno_ret(syscall(SYS_pidfd_open, (int)a0, (unsigned int)a1));
-                    break;
-                case 278: // getrandom
 #ifdef __linux__
-                    a0 = errno_ret(USER_SYSCALL(SYS_getrandom, a0, a1, a2, 0, 0, 0));
-#else
-                    a0 = -UAPI_ENOSYS;
-#endif
-                    break;
-#ifdef __linux__
-                case 279: // memfd_create
-                    rvvm_info("sys_memfd_create(%s, %lx)", to_str(a0), a1);
-                    a0 = errno_ret(memfd_create(to_str(a0), a1));
-                    break;
                 case 280: // bpf: fixed-width UAPI, programs run in the host kernel
                     a0 = user_bpf((unsigned int)a0, to_ptr(a1), (unsigned int)a2);
-                    break;
-                case 291: // statx
-                    // TODO: Struct conversion!
-                    rvvm_info("sys_statx(%ld, %s, %lx, %lx, %lx)", a0, to_str(a1), a2, a3, a4);
-                    a0 = errno_ret(statx(a0, wrap_path(path_buf, to_str(a1)), a2, a3, to_ptr(a4)));
                     break;
 #endif
                 case 425: // io_uring_setup - guest event loop falls back to poll on ENOSYS
@@ -3397,17 +1893,11 @@ static void* rvvm_user_thread_wrap(void* arg)
                 case 436: // close_range
                     a0 = user_fd_close_range(a0, a1, a2);
                     break;
-                case 439: // faccessat2
-                    rvvm_info("sys_faccessat2(%ld, %s, %lx, %lx)", a0, to_str(a1), a2, a3);
-                    a0 = errno_ret(faccessat(a0, wrap_path(path_buf, to_str(a1)), a2, a3));
-                    break;
+#ifndef SYS_openat2
                 case 437: // openat2
-#if defined(__linux__) && defined(SYS_openat2)
-                    a0 = rvvm_sys_openat2((int)a0, to_str(a1), to_ptr(a2), a3);
-#else
                     a0 = -UAPI_ENOSYS;
-#endif
                     break;
+#endif
                 case 452: // fchmodat2
 #if defined(__linux__) && defined(SYS_fchmodat2)
                     a0 = errno_ret(syscall(SYS_fchmodat2, (int)a0,
@@ -3427,9 +1917,7 @@ static void* rvvm_user_thread_wrap(void* arg)
 #endif
                     break;
             }
-            if (vm_mutation) user_vm_leave();
-            }
-            if (vm_mutation || a7 == 164 || a7 == 261) rvvm_user_jit_pressure(cpu);
+            if (memory_mutation || a7 == 164 || a7 == 261) rvvm_user_jit_pressure(cpu);
             if ((int64_t)a0 < 0) {
                 //rvvm_warn("Syscall %ld failed: %ld", a7, a0);
             }
@@ -3536,7 +2024,6 @@ static void* rvvm_user_thread_wrap(void* arg)
     user_sig.cpu = NULL;
     current_user_hart = NULL;
     user_sig.pending = 0;
-    if (user_vm_pi_owned) atomic_sub_uint32(&user_vm_pi_users, user_vm_pi_owned);
     bool process_thread = thread->process_thread;
     user_ptrace_destroy();
     user_fd_table_leave();
@@ -3583,8 +2070,6 @@ static void jump_start(void* entry, void* stack_top)
     userland = rvvm_create_userland("rv64");
 #if defined(__linux__) && defined(USE_JIT) && defined(USER_FAULT_META)
     userland->user_memory_probe = user_jit_memory_probe;
-    userland->user_jit_enter = user_vm_enter;
-    userland->user_jit_leave = user_vm_leave;
 #endif
     rvvm_user_thread_t* thread = safe_new_obj(rvvm_user_thread_t);
     thread->cpu = rvvm_create_user_thread(userland);

@@ -3,6 +3,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include "core/user_ptrace/user_ptrace_replay.h"
 
@@ -20,6 +21,17 @@ static void take(pid_t pid, struct user_ptrace_replay_entry* entry)
     tagged.si_value.sival_ptr = (void*)(uintptr_t)entry->token;
     assert(user_ptrace_replay_take(pid, &tagged, &original));
     assert(original.si_value.sival_int == entry->info.si_value.sival_int);
+}
+
+static void* allocate(void* opaque, size_t size, void* release)
+{
+    int* retained = opaque;
+    if (release) { free(release); --*retained; return NULL; }
+    void* next = malloc(size);
+    assert(next);
+    memset(next, 0xa5, size);
+    ++*retained;
+    return next;
 }
 
 int main(void)
@@ -54,5 +66,40 @@ int main(void)
     assert(entries[0].info.si_value.sival_int == 4);
     user_ptrace_replay_remove(0);
     free(entries);
+    store(pid, 91);
+    struct user_ptrace_replay_context original, isolated = {0};
+    user_ptrace_replay_context_save(&original);
+    int owned = 0;
+    isolated.records = user_ptrace_replay_records_new(allocate, &owned);
+    assert(isolated.records);
+    user_ptrace_replay_context_load(&isolated);
+    assert(!user_ptrace_replay_count(pid));
+    store(pid, 92);
+    struct user_ptrace_replay_entry one;
+    assert(user_ptrace_replay_export(pid, &one, 1) == 1 && one.info.si_value.sival_int == 92);
+    take(pid, &one);
+    assert(!owned);
+    user_ptrace_replay_context_load(&original);
+    assert(user_ptrace_replay_export(pid, &one, 1) == 1 && one.info.si_value.sival_int == 91);
+    user_ptrace_replay_remove(0);
+    user_ptrace_replay_records_free(isolated.records);
+    struct user_ptrace_replay_entry* parent = user_ptrace_replay_allocate(1);
+    assert(parent); parent->token = 42;
+    struct user_ptrace_replay_context saved, borrowed;
+    user_ptrace_replay_context_save(&saved);
+    int retained = 0;
+    borrowed = (struct user_ptrace_replay_context){.allocate = allocate, .opaque = &retained};
+    user_ptrace_replay_context_load(&borrowed);
+    struct user_ptrace_replay_entry* child = user_ptrace_replay_allocate(2);
+    assert(child && !child[0].token && !child[1].token);
+    child[0].token = 17;
+    assert(user_ptrace_replay_allocate(1));
+    user_ptrace_replay_context_save(&borrowed);
+    assert(borrowed.mailbox[0].token == 17 && retained == 1);
+    user_ptrace_replay_context_load(&saved);
+    assert(parent->token == 42);
+    user_ptrace_replay_context_release(&borrowed);
+    assert(!retained);
+    user_ptrace_replay_thread_destroy();
     puts("PASS replay backlog ordering, tail removal and queue reset");
 }
