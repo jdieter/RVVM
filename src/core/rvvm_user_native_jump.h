@@ -24,13 +24,21 @@ __asm__(".text\n.balign 4\n.global user_native_jump_save\n.hidden user_native_ju
         "ldp d8,d9,[x0,#104]\nldp d10,d11,[x0,#120]\n"
         "ldp d12,d13,[x0,#136]\nldp d14,d15,[x0,#152]\nmov x0,1\nret\n");
 #elif defined(__x86_64__)
+/* With a CET shadow stack, the saved SSP is the one after save returns;
+ * restore pops back to it, at most 255 entries per incsspq, as longjmp
+ * does. Without one, rdsspq leaves zero and incsspq is a NOP. */
 __asm__(".text\n.global user_native_jump_save\n.hidden user_native_jump_save\n"
         "user_native_jump_save:\nendbr64\nmov %rbx,0(%rdi)\nmov %rbp,8(%rdi)\n"
         "mov %r12,16(%rdi)\nmov %r13,24(%rdi)\nmov %r14,32(%rdi)\nmov %r15,40(%rdi)\n"
         "lea 8(%rsp),%rax\nmov %rax,48(%rdi)\nmov (%rsp),%rax\nmov %rax,56(%rdi)\n"
-        "xor %eax,%eax\nret\n"
+        "xor %eax,%eax\nrdsspq %rax\ntest %rax,%rax\njz 1f\nadd $8,%rax\n"
+        "1:\nmov %rax,64(%rdi)\nxor %eax,%eax\nret\n"
         ".global user_native_jump_restore\n.hidden user_native_jump_restore\n"
-        "user_native_jump_restore:\nendbr64\nmov 0(%rdi),%rbx\nmov 8(%rdi),%rbp\n"
+        "user_native_jump_restore:\nendbr64\nmov 64(%rdi),%rcx\ntest %rcx,%rcx\njz 3f\n"
+        "xor %eax,%eax\nrdsspq %rax\nsub %rax,%rcx\nshr $3,%rcx\n"
+        "2:\ncmp $255,%rcx\njbe 2f\nmov $255,%eax\nincsspq %rax\nsub $255,%rcx\njmp 2b\n"
+        "2:\nincsspq %rcx\n"
+        "3:\nmov 0(%rdi),%rbx\nmov 8(%rdi),%rbp\n"
         "mov 16(%rdi),%r12\nmov 24(%rdi),%r13\nmov 32(%rdi),%r14\nmov 40(%rdi),%r15\n"
         "mov 48(%rdi),%rsp\nmov 56(%rdi),%rdx\nmov $1,%eax\nnotrack jmp *%rdx\n");
 #else

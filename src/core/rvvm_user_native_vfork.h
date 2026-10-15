@@ -40,17 +40,7 @@ static int user_native_vfork_preflight(uint32_t flags)
     if (fstatat(AT_FDCWD, "/proc/thread-self/ns/pid_for_children", &child_pid, 0))
         mode = errno == ENOENT ? 2 : 0;
     else mode = active_pid.st_dev == child_pid.st_dev && active_pid.st_ino == child_pid.st_ino ? 1 : 2;
-    if (!mode) return 0;
-#if defined(__x86_64__)
-    unsigned long features = 0;
-    /* The owned jump primitive does not yet restore a CET shadow stack.
-     * Reject before entering shared-mm execution until that platform gap is closed. */
-    long ret = syscall(SYS_arch_prctl, 0x5005, &features); // ARCH_SHSTK_STATUS
-    if (!ret) return features ? 0 : mode;
-    return errno == EINVAL || errno == ENOSYS ? mode : 0;
-#else
     return mode;
-#endif
 }
 
 struct user_native_allocation {
