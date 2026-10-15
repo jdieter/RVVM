@@ -19,6 +19,9 @@ struct user_observer {
      * ancestor of the active one; owner_proc is the owner's PID there. */
     bool nested;
     unsigned long owner_proc;
+    /* The NSpid position of the caller's (and observer's) namespace: a task
+     * in a deeper namespace, such as a child that is its init, lists more. */
+    unsigned ns_index;
     /* Init or subreaper owners keep the observer as a direct child. */
     bool direct;
     struct stat identity;
@@ -26,6 +29,8 @@ struct user_observer {
 };
 static struct user_observer* user_observer;
 static struct user_native_vfork* user_native_requests;
+static void user_native_spares_provision(void);
+static void user_native_spares_fork_child(void);
 
 /* Internal tasks the guest must not see: mapping helpers' alive words
  * (their TID while alive, cleared by the kernel at exit). A claimed but
@@ -126,10 +131,11 @@ static bool user_observer_lines(struct user_observer* observer, int fd, bool cow
 }
 
 /* Read a numeric status/fdinfo field below the pinned proc root. For NSpid,
- * first is the proc mount's namespace and last the task's active one. */
+ * first is the proc mount's namespace and chosen the caller's (ns_index). */
 static bool user_observer_field(struct user_observer* observer, const char* path, const char* field,
-                                unsigned long* first, unsigned long* last, unsigned* count)
+                                unsigned long* first, unsigned long* chosen, unsigned* count)
 {
+    *chosen = 0;
     int fd = user_observer_raw(SYS_openat, observer->root, (long)path, O_RDONLY | O_CLOEXEC, 0, 0, 0);
     if (fd < 0) return false;
     size_t length = strlen(field), used = 0;
@@ -152,8 +158,9 @@ static bool user_observer_field(struct user_observer* observer, const char* path
                 while (*at == ' ' || *at == '\t') ++at;
                 if (*at < '0' || *at > '9') break;
                 unsigned long value = user_observer_number(&at, 10);
-                if (!(*count)++) *first = value;
-                *last = value;
+                if (!*count) *first = value;
+                if (*count == observer->ns_index) *chosen = value;
+                ++*count;
             }
         }
     }
@@ -380,6 +387,7 @@ static __attribute__((no_stack_protector)) int user_observer_main(void* opaque)
         unsigned count;
         observer->nested = user_observer_field(observer, "self/status", "NSpid:", &first, &last, &count)
             && count > 1;
+        if (observer->nested) observer->ns_index = count - 1;
         char path[48];
         memcpy(path, "self/fdinfo/", 12);
         user_observer_decimal(path + 12, observer->owner_fd);
@@ -512,6 +520,7 @@ static void user_observer_fork_child(void)
     user_native_requests = NULL;
     user_observer_transient = 0;
     user_observer_direct_pid = 0;
+    user_native_spares_fork_child();
     user_observer_init_lock = (user_fd_mutex_t){0};
 }
 
@@ -642,6 +651,18 @@ static void user_observer_provision(uint64_t soft, uint64_t hard)
 }
 
 static long user_observer_call(struct user_observer* observer, int operation);
+
+/* New tasks join pid_for_children. An observer created after it changes
+ * would be the first task, and so init, of the new namespace: it would die
+ * with its intermediate. Create it while the namespace is still ours. */
+static void user_observer_namespace(unsigned long flags)
+{
+    if (user_native_child_active || !(flags & CLONE_NEWPID)) return;
+    int saved = errno;
+    user_observer_get();
+    user_native_spares_provision();
+    errno = saved;
+}
 
 /* The observer is this process's direct child (init or subreaper owner). */
 static struct user_observer* user_observer_direct(void)

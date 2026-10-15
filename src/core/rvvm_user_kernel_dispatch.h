@@ -192,7 +192,16 @@ static bool user_kernel_dispatch(rvvm_hart_t* cpu, long nr, long a[6], long* res
         case 224: *result = user_host_path_call(SYS_swapon, a[0], a[1], 0, 0, 0); return true;
         case 225: *result = user_host_path_call(SYS_swapoff, a[0], 0, 0, 0, 0); return true;
         case 41: *result = user_host_path_call(SYS_pivot_root, a[0], a[1], 0, 0, 0); return true;
-        case 268: *result = user_host_fd_call(SYS_setns, a[0], a[1], 0); return true;
+        case 268:
+#ifdef USER_NATIVE_VFORK_POC
+            /* Prepare only for a PID namespace: the workers are threads, and
+             * entering a user namespace needs a single-threaded caller. */
+            if (!(a[1] & CLONE_NEWUSER)) {
+                long type = a[1] ? a[1] : (long)ioctl((int)a[0], 0xb703 /* NS_GET_NSTYPE */);
+                if (type > 0 && (type & CLONE_NEWPID)) user_observer_namespace(CLONE_NEWPID);
+            }
+#endif
+            *result = user_host_fd_call(SYS_setns, a[0], a[1], 0); return true;
         case 428: *result = user_host_path_call(SYS_open_tree, a[0], a[1], a[2], 0, 0); return true;
         case 429: *result = user_host_path_call(SYS_move_mount, a[0], a[1], a[2], a[3], a[4]); return true;
         case 431: *result = user_host_fsconfig(a[0], a[1], (void*)a[2], (void*)a[3], a[4]); return true;

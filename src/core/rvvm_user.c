@@ -1761,6 +1761,20 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
 #ifdef __linux__
                 case 97: // unshare
+#ifdef USER_NATIVE_VFORK_POC
+                    /* A user namespace needs a single-threaded caller, and
+                     * the VFORK workers prepared for a new PID namespace are
+                     * threads: enter the user namespace first. If the PID
+                     * step then fails, the user namespace stays entered. */
+                    if ((a0 & CLONE_NEWPID) && (a0 & CLONE_NEWUSER)) {
+                        a0 = user_fd_unshare(a0 & ~CLONE_NEWPID);
+                        if (a0) break;
+                        user_observer_namespace(CLONE_NEWPID);
+                        a0 = user_fd_unshare(CLONE_NEWPID);
+                        break;
+                    }
+                    user_observer_namespace(a0);
+#endif
                     a0 = user_fd_unshare(a0);
                     break;
                 case 281: // execveat: the kernel handles ELF/script dispatch through binfmt

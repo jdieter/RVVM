@@ -18,30 +18,38 @@ __asm__(".text\n.global user_native_clone3\n.hidden user_native_clone3\n"
         " pop %rax\n pop %rdi\n call *%rax\n mov %eax,%edi\n mov $60,%eax\n syscall\n ud2\n1: ret\n");
 #endif
 
-static bool user_native_vfork_preflight(uint32_t flags)
+/* 0: unsupported, 1: supported, 2: supported with the child entering a new
+ * PID namespace, as its init. */
+static int user_native_vfork_preflight(uint32_t flags)
 {
 #ifndef RVVM_STATIC_GLIBC_FORK
-    if (!(flags & UAPI_CLONE_VM)) return false;
+    if (!(flags & UAPI_CLONE_VM)) return 0;
 #else
-    if (!(flags & UAPI_CLONE_VM) && (!user_fork_native_tid || !user_fork_native_robust)) return false;
+    if (!(flags & UAPI_CLONE_VM) && (!user_fork_native_tid || !user_fork_native_robust)) return 0;
 #endif
-    if (syscall(SYS_clone3, NULL, 0) != -1 || errno != EINVAL) return false;
+    if (syscall(SYS_clone3, NULL, 0) != -1 || errno != EINVAL) return 0;
     struct stat active_pid, child_pid;
-    /* A newly entered PID namespace makes this child its init. Its death
-     * forcibly kills transaction helpers; this configuration remains a parity gap for that
-     * configuration, including when namespace identity cannot be verified. */
-    if (fstatat(AT_FDCWD, "/proc/thread-self/ns/pid", &active_pid, 0)
-        || fstatat(AT_FDCWD, "/proc/thread-self/ns/pid_for_children", &child_pid, 0)
-        || active_pid.st_dev != child_pid.st_dev || active_pid.st_ino != child_pid.st_ino) return false;
+    /* In a new PID namespace the child's own TIDs, and those of any helper
+     * it creates, mean nothing to the parent: prepare identifies it through
+     * the observer and it serves its own mapping calls. Without proc the
+     * namespaces cannot be compared, and a wrong guess could signal an
+     * unrelated process: refuse. */
+    if (fstatat(AT_FDCWD, "/proc/thread-self/ns/pid", &active_pid, 0)) return 0;
+    int mode;
+    /* A namespace entered by unshare has no link until its first task. */
+    if (fstatat(AT_FDCWD, "/proc/thread-self/ns/pid_for_children", &child_pid, 0))
+        mode = errno == ENOENT ? 2 : 0;
+    else mode = active_pid.st_dev == child_pid.st_dev && active_pid.st_ino == child_pid.st_ino ? 1 : 2;
+    if (!mode) return 0;
 #if defined(__x86_64__)
     unsigned long features = 0;
     /* The owned jump primitive does not yet restore a CET shadow stack.
      * Reject before entering shared-mm execution until that platform gap is closed. */
     long ret = syscall(SYS_arch_prctl, 0x5005, &features); // ARCH_SHSTK_STATUS
-    if (!ret) return !features;
-    return errno == EINVAL || errno == ENOSYS;
+    if (!ret) return features ? 0 : mode;
+    return errno == EINVAL || errno == ENOSYS ? mode : 0;
 #else
-    return true;
+    return mode;
 #endif
 }
 
@@ -60,6 +68,7 @@ struct user_native_source {
     struct user_sigstack signal_stack;
     user_fd_table_t* table;
     struct user_signal_process* signals;
+    bool pidns;
 };
 
 struct user_native_vfork {
@@ -113,6 +122,11 @@ struct user_native_vfork {
     size_t marker_size;
     bool executable_ready;
     bool nested;
+    /* The child is init of a new PID namespace (see preflight). */
+    bool pidns;
+    /* A pooled worker serves this request (see user_native_spares). */
+    struct user_native_spare* spare;
+    uint32_t service_done;
     /* A clone requested by this request's shared-mm child, which the worker
      * prepares and finishes with the child's tracing context loaded. */
     struct user_native_source nested_source;
@@ -467,6 +481,67 @@ static void user_native_mapping_service(struct user_native_vfork* request)
 
 static long user_native_vfork_prepare(const struct user_native_source*, uint32_t, size_t,
                                       uint32_t*, size_t, uint32_t*, struct user_native_vfork**);
+static void* user_native_service(void* opaque);
+
+/* After unshare(CLONE_NEWPID) or setns into another PID namespace, Linux
+ * refuses new threads (CLONE_THREAD) while pid_for_children differs, but
+ * each VFORK needs a worker. Keep a few workers created beforehand; a
+ * request uses one when a fresh thread cannot be made. */
+struct user_native_spare {
+    rvvm_thread_t* thread;
+    uint32_t state; // 0 idle, 1 claimed, 2 serving
+    struct user_native_vfork* request;
+};
+static struct user_native_spare user_native_spares[4];
+
+static void* user_native_spare_main(void* opaque)
+{
+    struct user_native_spare* spare = opaque;
+    for (;;) {
+        uint32_t state = atomic_load_uint32(&spare->state);
+        if (state != 2) {
+            rvvm_futex_wait(&spare->state, state, RVVM_FUTEX_INFINITE);
+            continue;
+        }
+        struct user_native_vfork* request = spare->request;
+        user_native_service(request);
+        user_signal_process = NULL;
+        atomic_store_uint32(&spare->state, 0);
+        atomic_store_uint32(&request->service_done, 1);
+        rvvm_futex_wake(&request->service_done, INT_MAX);
+    }
+    return NULL;
+}
+
+static void user_native_spares_provision(void)
+{
+    uint64_t all = UINT64_MAX, saved;
+    syscall(SYS_rt_sigprocmask, SIG_SETMASK, &all, &saved, 8);
+    for (size_t i = 0; i < sizeof(user_native_spares) / sizeof(*user_native_spares); ++i)
+        if (!user_native_spares[i].thread)
+            user_native_spares[i].thread = rvvm_thread_create(user_native_spare_main, &user_native_spares[i]);
+    syscall(SYS_rt_sigprocmask, SIG_SETMASK, &saved, NULL, 8);
+}
+
+/* Threads do not survive fork: forget the copies. */
+static void user_native_spares_fork_child(void)
+{
+    memset(user_native_spares, 0, sizeof(user_native_spares));
+}
+
+static struct user_native_spare* user_native_spare_claim(struct user_native_vfork* request)
+{
+    for (size_t i = 0; i < sizeof(user_native_spares) / sizeof(*user_native_spares); ++i) {
+        struct user_native_spare* spare = &user_native_spares[i];
+        if (spare->thread && atomic_cas_uint32(&spare->state, 0, 1)) {
+            spare->request = request;
+            atomic_store_uint32(&spare->state, 2);
+            rvvm_futex_wake(&spare->state, 1);
+            return spare;
+        }
+    }
+    return NULL;
+}
 static void user_native_vfork_finish(struct user_native_vfork*);
 
 static void* user_native_service(void* opaque)
@@ -684,10 +759,14 @@ static long user_native_mapping(struct user_native_vfork* request, long nr, long
         user_native_internal(SYS_futex, (long)&request->service_state, FUTEX_WAIT_PRIVATE, 1, 0, 0, 0);
     uint64_t all = UINT64_MAX, saved_mask;
     user_native_internal(SYS_rt_sigprocmask, SIG_SETMASK, (long)&all, (long)&saved_mask, 8, 0, 0);
-    int pid = clone(user_native_mapping_helper, request->helper_stack + sizeof(request->helper_stack),
-                    CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_PARENT_SETTID
-                    | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID, request,
-                    &request->helper_pid, NULL, request->helper_alive);
+    /* A helper's PID would be numbered in the child's new PID namespace,
+     * meaningless to the worker that signals it: serve calls directly. */
+    int pid = -1;
+    if (request->pidns) errno = EAGAIN;
+    else pid = clone(user_native_mapping_helper, request->helper_stack + sizeof(request->helper_stack),
+                     CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_PARENT_SETTID
+                     | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID, request,
+                     &request->helper_pid, NULL, request->helper_alive);
     if (pid < 0 && (errno == EAGAIN || errno == ENOMEM)) {
         /* Linux would not need another task for this call. Serve the
          * worker from this child, with every signal blocked meanwhile. */
@@ -922,7 +1001,7 @@ static long user_native_dispatch(struct user_native_vfork* request, long nr, lon
 static int user_native_child(void* opaque)
 {
     struct user_native_vfork* request = opaque;
-    if (request->observer)
+    if (request->observer && !request->pidns)
         atomic_store_uint32(request->clone_marker, user_native_internal(SYS_gettid, 0, 0, 0, 0, 0, 0));
     user_fake_current = &request->credentials;
     atomic_store_uint32(&request->child_ready, 1);
@@ -1035,8 +1114,10 @@ static long user_native_vfork_prepare(const struct user_native_source* source, u
     request->parent_tid = parent_tid;
     request->child_tid = child_tid;
     request->caller = source->caller;
-    if ((flags & UAPI_CLONE_PARENT_SETTID)
-        && (flags & (UAPI_CLONE_CHILD_SETTID | UAPI_CLONE_CHILD_CLEARTID))) {
+    request->pidns = source->pidns;
+    if (((flags & UAPI_CLONE_PARENT_SETTID)
+         && (flags & (UAPI_CLONE_CHILD_SETTID | UAPI_CLONE_CHILD_CLEARTID)))
+        || (source->pidns && (flags & UAPI_CLONE_VM))) {
         request->observer = user_observer_get();
         if (!request->observer) { int error = errno; free(request); return -error; }
     }
@@ -1088,7 +1169,8 @@ static long user_native_vfork_prepare(const struct user_native_source* source, u
     if (guest_stack) rvvm_write_cpu_reg(request->cpu, RVVM_REGID_X0 + 2, guest_stack);
     if (flags & UAPI_CLONE_SETTLS) rvvm_write_cpu_reg(request->cpu, RVVM_REGID_X0 + 4, tls);
     request->worker = rvvm_thread_create(user_native_service, request);
-    if (!request->worker) {
+    if (!request->worker) request->spare = user_native_spare_claim(request);
+    if (!request->worker && !request->spare) {
         user_fd_table_release(request->source_table);
         user_native_vfork_free(request);
         return -ENOMEM;
@@ -1201,7 +1283,9 @@ static void user_native_vfork_finish(struct user_native_vfork* request)
     atomic_store_uint32(&request->service_state, 3);
     rvvm_futex_wake(&request->service_state, 1);
     rvvm_futex_wake(&request->child_ready, 1);
-    thread_join(request->worker);
+    if (request->worker) thread_join(request->worker);
+    else while (!atomic_load_uint32(&request->service_done))
+        rvvm_futex_wait(&request->service_done, 0, RVVM_FUTEX_INFINITE);
     user_native_vfork_free(request);
 }
 
@@ -1217,10 +1301,11 @@ static int user_native_vfork(rvvm_user_thread_t* current, uint32_t flags, size_t
                              uint32_t* parent_tid, size_t tls, uint32_t* child_tid)
 {
     if (!user_native_vfork_flags(&flags)) return -EINVAL;
-    if (!user_native_vfork_preflight(flags)) return -EOPNOTSUPP;
+    int mode = user_native_vfork_preflight(flags);
+    if (!mode) return -EOPNOTSUPP;
     struct user_native_source source = {
         current->cpu, gettid(), {fake_uid, fake_gid}, user_sig.mask, user_sig.stack,
-        user_fd_table(), user_signal_process_current(),
+        user_fd_table(), user_signal_process_current(), mode == 2,
     };
     uint64_t all = UINT64_MAX, saved_mask;
     syscall(SYS_rt_sigprocmask, SIG_SETMASK, &all, &saved_mask, 8);
@@ -1243,10 +1328,11 @@ static long user_native_nested_clone(struct user_native_vfork* request, uint32_t
 {
     if (flags & UAPI_CLONE_THREAD) return -EAGAIN;
     if (!user_native_vfork_flags(&flags)) return -EINVAL;
-    if (!user_native_vfork_preflight(flags)) return -EOPNOTSUPP;
+    int mode = user_native_vfork_preflight(flags);
+    if (!mode) return -EOPNOTSUPP;
     request->nested_source = (struct user_native_source){
         request->cpu, user_native_internal(SYS_gettid, 0, 0, 0, 0, 0, 0), {fake_uid, fake_gid},
-        user_sig.mask, user_sig.stack, user_fd_current, user_signal_process_current(),
+        user_sig.mask, user_sig.stack, user_fd_current, user_signal_process_current(), mode == 2,
     };
     user_ptrace_context_save(&request->nested_ptrace);
     request->nested_flags = flags;
