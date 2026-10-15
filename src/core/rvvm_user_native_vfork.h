@@ -50,6 +50,18 @@ struct user_native_allocation {
     void* pointer;
 };
 
+/* Calling-thread state a VFORK copies. A shared-mm child supplies its own:
+ * its worker prepares nested requests on its behalf. */
+struct user_native_source {
+    rvvm_hart_t* cpu;
+    pid_t caller;
+    struct user_fake_credentials credentials;
+    uint64_t mask;
+    struct user_sigstack signal_stack;
+    user_fd_table_t* table;
+    struct user_signal_process* signals;
+};
+
 struct user_native_vfork {
     struct user_native_vfork* observer_next;
     struct user_observer* observer;
@@ -82,6 +94,26 @@ struct user_native_vfork {
     void* allocation_pointer;
     struct user_native_allocation* allocations;
     char path[4096], descriptor[64], marker[64];
+    /* Prepared clone, issued by the calling thread or a shared-mm child. */
+    uint32_t flags;
+    uint32_t* parent_tid;
+    uint32_t* child_tid;
+    rvvm_thread_t* worker;
+    void* native_stack;
+    void* marker_page;
+    size_t marker_size;
+    bool executable_ready;
+    bool nested;
+    /* A clone requested by this request's shared-mm child, which the worker
+     * prepares and finishes with the child's tracing context loaded. */
+    struct user_native_source nested_source;
+    struct user_ptrace_context nested_ptrace;
+    struct user_native_vfork* nested_request;
+    size_t nested_stack, nested_tls;
+    uint32_t nested_flags;
+    uint32_t* nested_parent_tid;
+    uint32_t* nested_child_tid;
+    long nested_result;
 };
 
 #ifdef RVVM_STATIC_GLIBC_FORK
@@ -153,6 +185,17 @@ static int user_native_cow_child(void* opaque)
     spin_unlock(&request->source_signals->lock);
     user_native_child_active = false;
     user_native_fault_target = NULL;
+    if (request->nested) {
+        /* Issued by a shared-mm child: this TLS still names its allocator,
+         * executable reader and tracing contexts, all served by a parent
+         * worker that has no copy in this mm. Use process defaults; a fork
+         * child inherits neither pending replays nor tracees. */
+        user_runtime_allocator = (__typeof__(user_runtime_allocator)){0};
+        user_native_exec_reader = NULL;
+        user_signal_process = NULL;
+        user_ptrace_events_context_select(NULL);
+        user_ptrace_replay_context_load(&(struct user_ptrace_replay_context){0});
+    }
     thread->signals = malloc(sizeof(*thread->signals));
     if (!thread->signals) _exit(127);
     *thread->signals = request->signals;
@@ -390,6 +433,10 @@ static void user_native_mapping_service(struct user_native_vfork* request)
     user_native_mapping_finish(request);
 }
 
+static long user_native_vfork_prepare(const struct user_native_source*, uint32_t, size_t,
+                                      uint32_t*, size_t, uint32_t*, struct user_native_vfork**);
+static void user_native_vfork_finish(struct user_native_vfork*);
+
 static void* user_native_service(void* opaque)
 {
     struct user_native_vfork* request = opaque;
@@ -483,6 +530,27 @@ static void* user_native_service(void* opaque)
             spin_unlock(&mmap_lock);
             continue;
         }
+        if (request->operation == 6 || request->operation == 7) {
+            /* A nested clone from this request's child: prepare and finish
+             * it with the child's tracing context, as the child would. */
+            struct user_ptrace_context own;
+            user_ptrace_context_save(&own);
+            user_ptrace_context_load(&request->nested_ptrace);
+            if (request->operation == 6) {
+                request->nested_request = NULL;
+                request->nested_result = user_native_vfork_prepare(&request->nested_source,
+                    request->nested_flags, request->nested_stack, request->nested_parent_tid,
+                    request->nested_tls, request->nested_child_tid, &request->nested_request);
+                if (!request->nested_result) request->nested_request->nested = true;
+            } else {
+                user_native_vfork_finish(request->nested_request);
+                request->nested_request = NULL;
+            }
+            user_ptrace_context_load(&own);
+            atomic_store_uint32(&request->service_state, 2);
+            rvvm_futex_wake(&request->service_state, 1);
+            continue;
+        }
         if (request->operation == 3) {
             rvvm_flush_icache(userland, request->mapping_args[0],
                               request->mapping_args[1] - request->mapping_args[0]);
@@ -549,6 +617,17 @@ static void* user_native_allocate(struct user_native_vfork* request, size_t size
     void* pointer = request->allocation_pointer;
     atomic_store_uint32(&request->service_state, 0);
     return pointer;
+}
+
+/* Run one worker operation for the shared-mm child and wait for it. */
+static void user_native_operation(struct user_native_vfork* request, uint32_t operation)
+{
+    request->operation = operation;
+    atomic_store_uint32(&request->service_state, 1);
+    user_native_internal(SYS_futex, (long)&request->service_state, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0);
+    while (atomic_load_uint32(&request->service_state) != 2)
+        user_native_internal(SYS_futex, (long)&request->service_state, FUTEX_WAIT_PRIVATE, 1, 0, 0, 0);
+    atomic_store_uint32(&request->service_state, 0);
 }
 
 static void* user_native_ptrace_allocate(void* opaque, size_t size, void* release)
@@ -700,6 +779,8 @@ static long user_native_exec(struct user_native_vfork* request, long nr, long a[
     return ret;
 }
 
+static long user_native_nested_clone(struct user_native_vfork*, uint32_t, size_t, uint32_t*, size_t, uint32_t*);
+
 #define NATIVE_RAW(n) user_native_raw(SYS_##n, a[0], a[1], a[2], a[3], a[4], a[5])
 static long user_native_dup3(struct user_native_vfork* request, int oldfd, int newfd, unsigned flags)
 {
@@ -776,6 +857,7 @@ static long user_native_dispatch(struct user_native_vfork* request, long nr, lon
          * here never shares files, so CLONE_FILES needs no metadata copy. */
         case 97: return NATIVE_RAW(unshare);
         case 139: user_rt_sigreturn(request->cpu); return 0;
+        case 220: return user_native_nested_clone(request, a[0], a[1], (void*)a[2], a[3], (void*)a[4]);
         case 221: case 281: return user_native_exec(request, nr, a);
         case 436: return user_native_close_range(request, a[0], a[1], a[2]);
         default: return -ENOSYS;
@@ -868,186 +950,265 @@ static int user_native_child(void* opaque)
     __builtin_unreachable();
 }
 
-static int user_native_vfork(rvvm_user_thread_t* current, uint32_t flags, size_t guest_stack,
-                             uint32_t* parent_tid, size_t tls, uint32_t* child_tid)
+#define USER_NATIVE_STACK_SIZE (1024 * 1024)
+
+static void user_native_vfork_free(struct user_native_vfork* request)
 {
-    flags &= ~UAPI_CLONE_IGNORED_FLAGS;
-    const uint32_t allowed = 0xff | UAPI_CLONE_OPTIONAL_FLAGS | UAPI_CLONE_VM | UAPI_CLONE_VFORK | UAPI_CLONE_PIDFD;
-    if ((flags & ~allowed)
-        || ((flags & UAPI_CLONE_PIDFD) && (flags & UAPI_CLONE_PARENT_SETTID))) return -EINVAL;
-    if (!user_native_vfork_preflight(flags)) return -EOPNOTSUPP;
+    if (request->native_stack && request->native_stack != MAP_FAILED)
+        munmap(request->native_stack, USER_NATIVE_STACK_SIZE);
+    if (request->marker_page && request->marker_page != MAP_FAILED)
+        munmap(request->marker_page, request->marker_size);
+    if (request->executable_ready) user_exec_native_leave(&request->exec_reader);
+    if (request->child_table) user_fd_table_release(request->child_table);
+    if (request->ptrace_context.bridge) user_ptrace_cancel(request->ptrace_context.bridge);
+    user_ptrace_events_context_free(request->ptrace_context.events);
+    user_ptrace_replay_records_free(request->ptrace_context.replay.records);
+    if (request->cpu) rvvm_free_user_thread(request->cpu);
+    free(request->private_thread);
+    free(request);
+}
+
+/* Allocate the request and start its worker. Runs on a trusted thread that
+ * may use libc, with all signals blocked and the source's tracing context
+ * loaded. A zero return can still carry a clone_error for issue to report. */
+static long user_native_vfork_prepare(const struct user_native_source* source, uint32_t flags,
+                                      size_t guest_stack, uint32_t* parent_tid, size_t tls,
+                                      uint32_t* child_tid, struct user_native_vfork** out)
+{
     struct user_native_vfork* request = calloc(1, sizeof(*request));
     if (!request) return -ENOMEM;
-    request->caller = gettid();
+    request->flags = flags;
+    request->parent_tid = parent_tid;
+    request->child_tid = child_tid;
+    request->caller = source->caller;
     if ((flags & UAPI_CLONE_PARENT_SETTID)
         && (flags & (UAPI_CLONE_CHILD_SETTID | UAPI_CLONE_CHILD_CLEARTID))) {
         request->observer = user_observer_get();
         if (!request->observer) { int error = errno; free(request); return -error; }
     }
     request->clone_marker = &request->clone_pid;
-    request->credentials = (struct user_fake_credentials){fake_uid, fake_gid};
-    request->cpu = user_clone_cpu_mode(current->cpu, true);
+    request->credentials = source->credentials;
+    request->cpu = user_clone_cpu_mode(source->cpu, true);
     if (!request->cpu) { free(request); return -ENOMEM; }
+    request->ptrace_context.bridge = user_ptrace_prepare(request->cpu, user_cpu_auxv,
+        user_cpu_auxv_size, source->mask);
+    if (!request->ptrace_context.bridge) { user_native_vfork_free(request); return -ENOMEM; }
+    if (flags & UAPI_CLONE_VM) {
+        request->ptrace_context.events = user_ptrace_events_context_new();
+        if (!request->ptrace_context.events) { user_native_vfork_free(request); return -ENOMEM; }
+        user_ptrace_events_context_allocator(request->ptrace_context.events, user_native_ptrace_allocate, request);
+        request->ptrace_context.replay.allocate = user_native_ptrace_allocate;
+        request->ptrace_context.replay.opaque = request;
+        request->ptrace_context.replay.records = user_ptrace_replay_records_new(user_native_ptrace_allocate, request);
+        if (!request->ptrace_context.replay.records) { user_native_vfork_free(request); return -ENOMEM; }
+    } else {
+        request->private_thread = calloc(1, sizeof(*request->private_thread));
+        if (!request->private_thread) { user_native_vfork_free(request); return -ENOMEM; }
+        *request->private_thread = (rvvm_user_thread_t){
+            .cpu = request->cpu, .refs = 1, .process_thread = true,
+            .signal_mask = source->mask, .inherit_signal_stack = true,
+            .signal_stack = source->signal_stack,
+            .child_settid = flags & UAPI_CLONE_CHILD_SETTID ? child_tid : NULL,
+            .child_cleartid = flags & UAPI_CLONE_CHILD_CLEARTID ? child_tid : NULL,
+            .ptrace_state = request->ptrace_context.bridge,
+        };
+    }
+    request->executable_ready = user_exec_native_enter(&request->exec_reader);
+    request->native_stack = mmap(NULL, USER_NATIVE_STACK_SIZE, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    request->marker_size = user_vma_page();
+    if (flags & UAPI_CLONE_PARENT_SETTID)
+        request->marker_page = mmap(NULL, request->marker_size, PROT_READ | PROT_WRITE,
+                                    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (request->native_stack == MAP_FAILED || request->marker_page == MAP_FAILED
+        || !request->executable_ready) {
+        user_native_vfork_free(request);
+        return -ENOMEM;
+    }
+    if (request->marker_page) request->clone_marker = request->marker_page;
+    request->mask = source->mask;
+    request->signal_stack = source->signal_stack;
+    atomic_add_uint32(source->table->refs, 1);
+    request->source_table = source->table;
+    request->source_signals = source->signals;
+    if (guest_stack) rvvm_write_cpu_reg(request->cpu, RVVM_REGID_X0 + 2, guest_stack);
+    if (flags & UAPI_CLONE_SETTLS) rvvm_write_cpu_reg(request->cpu, RVVM_REGID_X0 + 4, tls);
+    request->worker = rvvm_thread_create(user_native_service, request);
+    if (!request->worker) {
+        user_fd_table_release(request->source_table);
+        user_native_vfork_free(request);
+        return -ENOMEM;
+    }
+    while (!atomic_load_uint32(&request->clone_ready))
+        rvvm_futex_wait(&request->clone_ready, 0, RVVM_FUTEX_INFINITE);
+    *out = request;
+    return 0;
+}
+
+/* Create the child from the issuing thread: it becomes that thread's child
+ * with its credentials, files and limits. Raw syscalls only, so a shared-mm
+ * child may issue nested clones. A shared-mm grandchild borrows this
+ * thread's TLS until kernel VFORK release; restore it even after SIGKILL. */
+static long user_native_vfork_issue(struct user_native_vfork* request)
+{
+    if (!request->child_table || request->clone_error)
+        return request->clone_error ? request->clone_error : -ENOMEM;
+    uint32_t flags = request->flags;
     struct user_ptrace_context saved_ptrace;
     user_ptrace_context_save(&saved_ptrace);
     __typeof__(user_ptrace_restart) saved_restart = user_ptrace_restart;
     __typeof__(user_runtime_allocator) saved_allocator = user_runtime_allocator;
     struct stat saved_exe_link = user_fork_exe_link;
     bool saved_exe_link_ready = user_fork_exe_link_ready;
-    request->ptrace_context.bridge = user_ptrace_prepare(request->cpu, user_cpu_auxv,
-        user_cpu_auxv_size, user_sig.mask);
-    if (!request->ptrace_context.bridge) {
-        rvvm_free_user_thread(request->cpu); free(request); return -ENOMEM;
-    }
-    if (flags & UAPI_CLONE_VM) {
-        request->ptrace_context.events = user_ptrace_events_context_new();
-        if (!request->ptrace_context.events) {
-            user_ptrace_cancel(request->ptrace_context.bridge);
-            rvvm_free_user_thread(request->cpu); free(request); return -ENOMEM;
-        }
-        user_ptrace_events_context_allocator(request->ptrace_context.events, user_native_ptrace_allocate, request);
-        request->ptrace_context.replay.allocate = user_native_ptrace_allocate;
-        request->ptrace_context.replay.opaque = request;
-        request->ptrace_context.replay.records = user_ptrace_replay_records_new(user_native_ptrace_allocate, request);
-        if (!request->ptrace_context.replay.records) {
-            user_ptrace_events_context_free(request->ptrace_context.events);
-            user_ptrace_cancel(request->ptrace_context.bridge);
-            rvvm_free_user_thread(request->cpu); free(request); return -ENOMEM;
-        }
-    }
-    if (!(flags & UAPI_CLONE_VM)) {
-        request->private_thread = calloc(1, sizeof(*request->private_thread));
-        if (!request->private_thread) {
-            user_ptrace_cancel(request->ptrace_context.bridge);
-            rvvm_free_user_thread(request->cpu); free(request); return -ENOMEM;
-        }
-        *request->private_thread = (rvvm_user_thread_t){
-            .cpu = request->cpu, .refs = 1, .process_thread = true,
-            .signal_mask = user_sig.mask, .inherit_signal_stack = true,
-            .signal_stack = user_sig.stack,
-            .child_settid = flags & UAPI_CLONE_CHILD_SETTID ? child_tid : NULL,
-            .child_cleartid = flags & UAPI_CLONE_CHILD_CLEARTID ? child_tid : NULL,
-            .ptrace_state = request->ptrace_context.bridge,
-        };
-    }
-    bool executable_ready = user_exec_native_enter(&request->exec_reader);
-    const size_t stack_size = 1024 * 1024;
-    void* native_stack = mmap(NULL, stack_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    size_t marker_size = user_vma_page();
-    void* marker = flags & UAPI_CLONE_PARENT_SETTID
-        ? mmap(NULL, marker_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0) : NULL;
-    if (marker && marker != MAP_FAILED) request->clone_marker = marker;
-    int result = -ENOMEM;
-    if (native_stack != MAP_FAILED && marker != MAP_FAILED && executable_ready) {
-        request->mask = user_sig.mask;
-        request->signal_stack = user_sig.stack;
-        request->source_table = user_fd_table_retain();
-        request->source_signals = user_signal_process_current();
-        if (guest_stack) rvvm_write_cpu_reg(request->cpu, RVVM_REGID_X0 + 2, guest_stack);
-        if (flags & UAPI_CLONE_SETTLS) rvvm_write_cpu_reg(request->cpu, RVVM_REGID_X0 + 4, tls);
-        /* The real calling thread cannot touch this TLS until kernel VFORK
-         * release. Restore even after child SIGKILL; no child lock cleanup. */
-        __typeof__(user_sig) saved_signal = user_sig;
-        struct user_signal_process* saved_process = user_signal_process;
-        rvvm_hart_t* saved_cpu = current_user_hart;
-        struct user_native_jump* saved_target = user_native_fault_target;
-        user_fd_context_t saved_guard;
-        user_fd_context_save(&saved_guard);
-        user_fd_table_t* saved_table = user_fd_current;
-        user_fd_owner_t* saved_owner = user_fd_owner_override;
-        struct user_fake_credentials* saved_credentials = user_fake_current;
-        uint_fast8_t saved_rounding = softfloat_roundingMode;
-        uint_fast8_t saved_tininess = softfloat_detectTininess;
-        uint_fast8_t saved_exceptions = softfloat_exceptionFlags;
+    __typeof__(user_sig) saved_signal = user_sig;
+    struct user_signal_process* saved_process = user_signal_process;
+    rvvm_hart_t* saved_cpu = current_user_hart;
+    bool saved_active = user_native_child_active;
+    struct user_exec_reader* saved_reader = user_native_exec_reader;
+    struct user_native_jump* saved_target = user_native_fault_target;
+    user_fd_context_t saved_guard;
+    user_fd_context_save(&saved_guard);
+    user_fd_table_t* saved_table = user_fd_current;
+    user_fd_owner_t* saved_owner = user_fd_owner_override;
+    struct user_fake_credentials* saved_credentials = user_fake_current;
+    uint_fast8_t saved_rounding = softfloat_roundingMode;
+    uint_fast8_t saved_tininess = softfloat_detectTininess;
+    uint_fast8_t saved_exceptions = softfloat_exceptionFlags;
 #ifdef USER_FAULT_POC
-        sigjmp_buf saved_fault;
-        memcpy(saved_fault, user_fault_resume, sizeof(saved_fault));
-        sig_atomic_t saved_armed = user_fault_armed;
-        uint32_t saved_control = user_fault_fp_control;
+    sigjmp_buf saved_fault;
+    memcpy(saved_fault, user_fault_resume, sizeof(saved_fault));
+    sig_atomic_t saved_armed = user_fault_armed;
+    uint32_t saved_control = user_fault_fp_control;
 #if defined(__aarch64__)
-        uint32_t saved_status = user_fault_fp_status;
+    uint32_t saved_status = user_fault_fp_status;
 #endif
 #endif
-        uint64_t all = UINT64_MAX, saved_mask;
-        syscall(SYS_rt_sigprocmask, SIG_SETMASK, &all, &saved_mask, 8);
-        int saved_errno = errno;
-        rvvm_thread_t* worker = rvvm_thread_create(user_native_service, request);
-        if (worker) while (!atomic_load_uint32(&request->clone_ready))
-            rvvm_futex_wait(&request->clone_ready, 0, RVVM_FUTEX_INFINITE);
-        if (worker && request->child_table && !request->clone_error) {
-            uintptr_t* packet = (void*)((char*)native_stack + stack_size - 2 * sizeof(uintptr_t));
-            packet[0] = (uintptr_t)user_native_child;
+    int saved_errno = errno;
+    uintptr_t* packet = (void*)((char*)request->native_stack + USER_NATIVE_STACK_SIZE - 2 * sizeof(uintptr_t));
+    packet[0] = (uintptr_t)user_native_child;
 #ifdef RVVM_STATIC_GLIBC_FORK
-            if (request->private_thread) packet[0] = (uintptr_t)user_native_cow_child;
+    if (request->private_thread) packet[0] = (uintptr_t)user_native_cow_child;
 #endif
-            packet[1] = (uintptr_t)request;
-            struct {
-                uint64_t flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls;
-            } args = {
-                .flags = (flags & ~(UINT64_C(0xff) | UAPI_CLONE_SETTLS)) | UAPI_CLONE_PARENT_SETTID
-                    | (flags & UAPI_CLONE_PARENT_SETTID ? UAPI_CLONE_CHILD_SETTID : 0),
-                .pidfd = flags & UAPI_CLONE_PIDFD ? (uintptr_t)parent_tid : 0,
-                /* schedule_tail stores the marker before pending STOP. The
-                 * shared VMA keeps it visible even without CLONE_VM. */
-                .child_tid = (uintptr_t)(flags & UAPI_CLONE_PARENT_SETTID ? request->clone_marker : child_tid),
-                .parent_tid = (uintptr_t)(flags & UAPI_CLONE_PARENT_SETTID ? parent_tid : request->clone_marker),
-                .exit_signal = flags & 0xff,
-                .stack = (uintptr_t)native_stack,
-                .stack_size = stack_size - 2 * sizeof(uintptr_t),
-            };
-            if (request->observer) {
-                args.flags = flags & ~(UINT64_C(0xff) | UAPI_CLONE_SETTLS);
-                args.child_tid = (uintptr_t)child_tid;
-                args.parent_tid = (uintptr_t)parent_tid;
-            }
-            result = user_native_clone3(&args, sizeof(args));
-        } else result = request->clone_error ? request->clone_error : -ENOMEM;
-        user_sig = saved_signal;
-        user_signal_process = saved_process;
-        current_user_hart = saved_cpu;
-        user_native_child_active = false;
-        user_native_fault_target = saved_target;
-        user_fd_context_load(&saved_guard);
-        user_fd_current = saved_table;
-        user_fd_owner_override = saved_owner;
-        user_fake_current = saved_credentials;
-        user_ptrace_context_load(&saved_ptrace);
-        user_ptrace_restart = saved_restart;
-        user_runtime_allocator = saved_allocator;
-        user_fork_exe_link = saved_exe_link;
-        user_fork_exe_link_ready = saved_exe_link_ready;
-        softfloat_roundingMode = saved_rounding;
-        softfloat_detectTininess = saved_tininess;
-        softfloat_exceptionFlags = saved_exceptions;
-#ifdef USER_FAULT_POC
-        memcpy(user_fault_resume, saved_fault, sizeof(saved_fault));
-        user_fault_armed = saved_armed;
-        user_fault_fp_control = saved_control;
-#if defined(__aarch64__)
-        user_fault_fp_status = saved_status;
-#endif
-#endif
-        user_native_exec_reader = NULL;
-        errno = saved_errno;
-        if (worker) {
-            atomic_store_uint32(&request->service_stop, 1);
-            atomic_store_uint32(&request->service_state, 3);
-            rvvm_futex_wake(&request->service_state, 1);
-            rvvm_futex_wake(&request->child_ready, 1);
-            thread_join(worker);
-        } else user_fd_table_release(request->source_table);
-        syscall(SYS_rt_sigprocmask, SIG_SETMASK, &saved_mask, NULL, 8);
+    packet[1] = (uintptr_t)request;
+    struct {
+        uint64_t flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls;
+    } args = {
+        .flags = (flags & ~(UINT64_C(0xff) | UAPI_CLONE_SETTLS)) | UAPI_CLONE_PARENT_SETTID
+            | (flags & UAPI_CLONE_PARENT_SETTID ? UAPI_CLONE_CHILD_SETTID : 0),
+        .pidfd = flags & UAPI_CLONE_PIDFD ? (uintptr_t)request->parent_tid : 0,
+        /* schedule_tail stores the marker before pending STOP. The
+         * shared VMA keeps it visible even without CLONE_VM. */
+        .child_tid = (uintptr_t)(flags & UAPI_CLONE_PARENT_SETTID ? request->clone_marker : request->child_tid),
+        .parent_tid = (uintptr_t)(flags & UAPI_CLONE_PARENT_SETTID ? request->parent_tid : request->clone_marker),
+        .exit_signal = flags & 0xff,
+        .stack = (uintptr_t)request->native_stack,
+        .stack_size = USER_NATIVE_STACK_SIZE - 2 * sizeof(uintptr_t),
+    };
+    if (request->observer) {
+        args.flags = flags & ~(UINT64_C(0xff) | UAPI_CLONE_SETTLS);
+        args.child_tid = (uintptr_t)request->child_tid;
+        args.parent_tid = (uintptr_t)request->parent_tid;
     }
-    if (native_stack != MAP_FAILED) munmap(native_stack, stack_size);
-    if (marker && marker != MAP_FAILED) munmap(marker, marker_size);
-    if (executable_ready) user_exec_native_leave(&request->exec_reader);
-    if (request->child_table) user_fd_table_release(request->child_table);
-    user_ptrace_cancel(request->ptrace_context.bridge);
-    user_ptrace_events_context_free(request->ptrace_context.events);
-    user_ptrace_replay_records_free(request->ptrace_context.replay.records);
-    rvvm_free_user_thread(request->cpu);
-    free(request->private_thread);
-    free(request);
+    long result = user_native_clone3(&args, sizeof(args));
+    user_sig = saved_signal;
+    user_signal_process = saved_process;
+    current_user_hart = saved_cpu;
+    user_native_child_active = saved_active;
+    user_native_fault_target = saved_target;
+    user_fd_context_load(&saved_guard);
+    user_fd_current = saved_table;
+    user_fd_owner_override = saved_owner;
+    user_fake_current = saved_credentials;
+    user_ptrace_context_load(&saved_ptrace);
+    user_ptrace_restart = saved_restart;
+    user_runtime_allocator = saved_allocator;
+    user_fork_exe_link = saved_exe_link;
+    user_fork_exe_link_ready = saved_exe_link_ready;
+    softfloat_roundingMode = saved_rounding;
+    softfloat_detectTininess = saved_tininess;
+    softfloat_exceptionFlags = saved_exceptions;
+#ifdef USER_FAULT_POC
+    memcpy(user_fault_resume, saved_fault, sizeof(saved_fault));
+    user_fault_armed = saved_armed;
+    user_fault_fp_control = saved_control;
+#if defined(__aarch64__)
+    user_fault_fp_status = saved_status;
+#endif
+#endif
+    user_native_exec_reader = saved_reader;
+    errno = saved_errno;
+    return result;
+}
+
+/* Stop the worker and release the request; same thread rules as prepare. */
+static void user_native_vfork_finish(struct user_native_vfork* request)
+{
+    atomic_store_uint32(&request->service_stop, 1);
+    atomic_store_uint32(&request->service_state, 3);
+    rvvm_futex_wake(&request->service_state, 1);
+    rvvm_futex_wake(&request->child_ready, 1);
+    thread_join(request->worker);
+    user_native_vfork_free(request);
+}
+
+static bool user_native_vfork_flags(uint32_t* flags)
+{
+    *flags &= ~UAPI_CLONE_IGNORED_FLAGS;
+    const uint32_t allowed = 0xff | UAPI_CLONE_OPTIONAL_FLAGS | UAPI_CLONE_VM | UAPI_CLONE_VFORK | UAPI_CLONE_PIDFD;
+    return !(*flags & ~allowed)
+        && !((*flags & UAPI_CLONE_PIDFD) && (*flags & UAPI_CLONE_PARENT_SETTID));
+}
+
+static int user_native_vfork(rvvm_user_thread_t* current, uint32_t flags, size_t guest_stack,
+                             uint32_t* parent_tid, size_t tls, uint32_t* child_tid)
+{
+    if (!user_native_vfork_flags(&flags)) return -EINVAL;
+    if (!user_native_vfork_preflight(flags)) return -EOPNOTSUPP;
+    struct user_native_source source = {
+        current->cpu, gettid(), {fake_uid, fake_gid}, user_sig.mask, user_sig.stack,
+        user_fd_table(), user_signal_process_current(),
+    };
+    uint64_t all = UINT64_MAX, saved_mask;
+    syscall(SYS_rt_sigprocmask, SIG_SETMASK, &all, &saved_mask, 8);
+    struct user_native_vfork* request;
+    long result = user_native_vfork_prepare(&source, flags, guest_stack, parent_tid, tls, child_tid, &request);
+    if (!result) {
+        result = user_native_vfork_issue(request);
+        user_native_vfork_finish(request);
+    }
+    syscall(SYS_rt_sigprocmask, SIG_SETMASK, &saved_mask, NULL, 8);
+    return result;
+}
+
+/* clone from a shared-mm child before exec. Fork-like and VFORK children
+ * reuse the native backend: the child's worker prepares and finishes the
+ * request, and the child issues clone3 itself. A thread would need TLS of
+ * its own while this child borrows its caller's: report the thread limit. */
+static long user_native_nested_clone(struct user_native_vfork* request, uint32_t flags, size_t stack,
+                                     uint32_t* parent_tid, size_t tls, uint32_t* child_tid)
+{
+    if (flags & UAPI_CLONE_THREAD) return -EAGAIN;
+    if (!user_native_vfork_flags(&flags)) return -EINVAL;
+    if (!user_native_vfork_preflight(flags)) return -EOPNOTSUPP;
+    request->nested_source = (struct user_native_source){
+        request->cpu, user_native_internal(SYS_gettid, 0, 0, 0, 0, 0, 0), {fake_uid, fake_gid},
+        user_sig.mask, user_sig.stack, user_fd_current, user_signal_process_current(),
+    };
+    user_ptrace_context_save(&request->nested_ptrace);
+    request->nested_flags = flags;
+    request->nested_stack = stack;
+    request->nested_tls = tls;
+    request->nested_parent_tid = parent_tid;
+    request->nested_child_tid = child_tid;
+    uint64_t all = UINT64_MAX, saved_mask;
+    user_native_internal(SYS_rt_sigprocmask, SIG_SETMASK, (long)&all, (long)&saved_mask, 8, 0, 0);
+    user_native_operation(request, 6);
+    long result = request->nested_result;
+    if (!result) {
+        result = user_native_vfork_issue(request->nested_request);
+        user_native_operation(request, 7);
+    }
+    user_native_internal(SYS_rt_sigprocmask, SIG_SETMASK, (long)&saved_mask, 0, 8, 0, 0);
     return result;
 }
 #endif
