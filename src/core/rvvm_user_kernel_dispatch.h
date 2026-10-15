@@ -25,10 +25,39 @@ static void user_wait_reaped(pid_t pid)
     user_fork_cache_reaped(pid);
 }
 
+#ifdef USER_NATIVE_VFORK_POC
+/* An init or subreaper guest's __WALL/__WCLONE waits for any child would
+ * also select its direct observer: Linux can't exclude one child. Poll
+ * with WNOHANG instead, report ECHILD once only internal tasks remain, and
+ * otherwise sleep (1-10ms backoff) interruptibly by guest signals. */
+static long user_wait_backoff(unsigned* delay)
+{
+    struct timespec pause = {0, (long)*delay * 1000000};
+    long slept = (long)errno_ret(USER_SYSCALL(SYS_nanosleep, &pause, NULL, 0, 0, 0, 0));
+    if (slept == -EINTR) return -EINTR;
+    if (*delay < 10) *delay = *delay * 2 > 10 ? 10 : *delay * 2;
+    return USER_PTRACE_WAIT_AGAIN;
+}
+
+/* Whether a wait with no ready child should end: ECHILD without real
+ * children, 0 for WNOHANG, or a backoff before polling again. */
+static long user_wait_internal(struct user_observer* direct, bool nohang, unsigned* delay)
+{
+    if (!user_observer_others(direct)) return -ECHILD;
+    return nohang ? 0 : user_wait_backoff(delay);
+}
+#endif
+
 static long user_wait4(long a[6])
 {
     long ret, queued;
     bool started = false;
+#ifdef USER_NATIVE_VFORK_POC
+    struct user_observer* direct = a[0] == -1 && (a[2] & (__WALL | __WCLONE)) ? user_observer_direct() : NULL;
+    unsigned delay = 1;
+#else
+    const bool direct = false;
+#endif
     do {
         bool poll = user_ptrace_events_tracing() && !(a[2] & WNOHANG);
         uint32_t generation = poll ? user_ptrace_events_generation() : 0;
@@ -36,11 +65,16 @@ static long user_wait4(long a[6])
         int* status = a[1] ? (void*)a[1] : &scratch;
         if (user_ptrace_wait_ready(a[0], status, a[2], (void*)a[3], &queued)) return queued;
         ret = (long)errno_ret(USER_SYSCALL(SYS_wait4, a[0], status,
-            a[2] | (poll ? WNOHANG : 0), a[3], 0, 0));
+            a[2] | (poll || direct ? WNOHANG : 0), a[3], 0, 0));
 #ifdef USER_NATIVE_VFORK_POC
         if (user_observer_hidden(ret, ret > 0 && (WIFEXITED(*status) || WIFSIGNALED(*status)))) {
             ret = USER_PTRACE_WAIT_AGAIN;
             continue;
+        }
+        if (direct && !ret && !poll) {
+            started = true;
+            ret = user_wait_internal(direct, a[2] & WNOHANG, &delay);
+            if (ret == USER_PTRACE_WAIT_AGAIN) continue;
         }
 #endif
         if (ret > 0 && (WIFEXITED(*status) || WIFSIGNALED(*status))) user_wait_reaped(ret);
@@ -59,6 +93,12 @@ static long user_waitid(long a[6])
 {
     long ret, queued;
     bool started = false;
+#ifdef USER_NATIVE_VFORK_POC
+    struct user_observer* direct = a[0] == P_ALL && (a[3] & (__WALL | __WCLONE)) ? user_observer_direct() : NULL;
+    unsigned delay = 1;
+#else
+    const bool direct = false;
+#endif
     do {
         bool poll = !(a[3] & WNOHANG) && (user_ptrace_events_tracing()
             || (a[3] & (WNOWAIT | WSTOPPED)) == (WNOWAIT | WSTOPPED));
@@ -69,13 +109,18 @@ static long user_waitid(long a[6])
         if (user_ptrace_waitid_ready(a[0], a[1], caller, a[3], (void*)a[4], &queued)) return queued;
         siginfo_t* native = poll ? &scratch : caller;
         ret = (long)errno_ret(USER_SYSCALL(SYS_waitid, (int)a[0], (unsigned)a[1],
-            native, (int)a[3] | (poll ? WNOHANG : 0), a[4], 0));
+            native, (int)a[3] | (poll || direct ? WNOHANG : 0), a[4], 0));
 #ifdef USER_NATIVE_VFORK_POC
         if (!ret && user_observer_hidden(native->si_pid, !(a[3] & WNOWAIT)
                 && (native->si_code == CLD_EXITED || native->si_code == CLD_KILLED
                     || native->si_code == CLD_DUMPED))) {
             ret = USER_PTRACE_WAIT_AGAIN;
             continue;
+        }
+        if (direct && !ret && !native->si_pid && !poll) {
+            started = true;
+            ret = user_wait_internal(direct, a[3] & WNOHANG, &delay);
+            if (ret == USER_PTRACE_WAIT_AGAIN) continue;
         }
 #endif
         if (!ret && native->si_pid && !(a[3] & WNOWAIT)
@@ -104,9 +149,40 @@ static void user_observer_limit(pid_t pid, long resource, void* limit)
 }
 #endif
 
+#ifdef USER_NATIVE_VFORK_POC
+/* A guest call naming one of RVVM's internal tasks, or the process group
+ * each leads after setsid, finds no such process or child. */
+static long user_internal_target(long nr, const long* a)
+{
+    long pid = 0, thread = 0;
+    switch (nr) {
+        case 129: pid = a[0] < -1 ? -a[0] : a[0]; break; // kill
+        case 130: case 138: case 434: pid = a[0]; break; // tkill, rt_sigqueueinfo, pidfd_open
+        case 131: case 240: pid = a[0]; thread = a[1]; break; // tgkill, rt_tgsigqueueinfo
+        case 118: case 119: case 120: case 121: case 122: case 123: case 127: case 274: case 275:
+            pid = a[0]; break; // sched_*
+        case 140: case 141: if (a[0] == PRIO_PROCESS || a[0] == PRIO_PGRP) pid = a[1]; break;
+        case 30: case 31: if (a[0] == 1 || a[0] == 2) pid = a[1]; break; // ioprio: process, group
+        case 154: case 155: case 156: pid = a[0]; break; // setpgid, getpgid, getsid
+        case 100: case 238: case 239: case 261: case 270: case 271: pid = a[0]; break;
+        case 117: pid = a[1]; break; // ptrace
+        case 260:
+            return user_internal_task(a[0] < -1 ? -a[0] : a[0]) ? -ECHILD : 0;
+        case 95:
+            return (a[0] == P_PID || a[0] == P_PGID) && user_internal_task(a[1]) ? -ECHILD : 0;
+        default: return 0;
+    }
+    return user_internal_task(pid) || user_internal_task(thread) ? -ESRCH : 0;
+}
+#endif
+
 static bool user_kernel_dispatch(rvvm_hart_t* cpu, long nr, long a[6], long* result)
 {
     long host;
+#ifdef USER_NATIVE_VFORK_POC
+    long hidden = user_internal_target(nr, a);
+    if (hidden) { *result = hidden; return true; }
+#endif
     switch (nr) {
         case 95: *result = user_waitid(a); return true;
         case 117: *result = user_ptrace_request(a[0], a[1], a[2], a[3]); return true;
@@ -128,6 +204,8 @@ static bool user_kernel_dispatch(rvvm_hart_t* cpu, long nr, long a[6], long* res
         case 443: *result = user_host_quotactl_fd(a[0], a[1], a[2], a[3]); return true;
         case 260: *result = user_wait4(a); return true;
         case 17: *result = rvvm_sys_getcwd((void*)a[0], a[1]); return true;
+        /* Hides private descriptors, untraced tasks and internal tasks. */
+        case 61: *result = rvvm_sys_getdents64(a[0], (void*)a[1], a[2]); return true;
         case 78: *result = rvvm_sys_readlinkat(a[0], (void*)a[1], (void*)a[2], a[3]); return true;
         case 56: *result = rvvm_sys_openat(a[0], (const char*)a[1], a[2], a[3]); return true;
 #ifdef SYS_openat2

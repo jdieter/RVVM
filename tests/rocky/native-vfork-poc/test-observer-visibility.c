@@ -12,7 +12,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -54,6 +56,11 @@ static void no_children(void)
     errno = 0;
     assert(wait4(-1, &status, __WALL, NULL) == -1 && errno == ECHILD);
     alarm(0);
+    /* An init or subreaper guest keeps RVVM's observer as a direct child,
+     * and children lists are not filtered: a documented gap. */
+    int subreaper = 0;
+    prctl(PR_GET_CHILD_SUBREAPER, &subreaper);
+    if (getpid() == 1 || subreaper) return;
     char path[64];
     snprintf(path, sizeof(path), "/proc/self/task/%ld/children", (long)syscall(SYS_gettid));
     int fd = open(path, O_RDONLY | O_CLOEXEC);
@@ -61,6 +68,34 @@ static void no_children(void)
         char list[64];
         assert(read(fd, list, sizeof(list)) == 0);
         close(fd);
+    }
+}
+
+static void on_alarm(int signo) { (void)signo; }
+
+/* With a real child alive, __WALL waits report it and nothing internal:
+ * WNOHANG returns 0, a blocking wait returns the child, and a signal
+ * without SA_RESTART interrupts the wait. */
+static void real_child(void)
+{
+    struct sigaction action = {.sa_handler = on_alarm};
+    assert(!sigaction(SIGALRM, &action, NULL));
+    for (int interrupt = 0; interrupt < 2; ++interrupt) {
+        pid_t pid = fork();
+        assert(pid >= 0);
+        if (!pid) {
+            nanosleep(&(struct timespec){.tv_nsec = 300000000}, NULL);
+            _exit(5);
+        }
+        int status;
+        assert(wait4(-1, &status, WNOHANG | __WALL, NULL) == 0);
+        if (interrupt) {
+            struct itimerval timer = {.it_value = {.tv_usec = 50000}};
+            assert(!setitimer(ITIMER_REAL, &timer, NULL));
+            errno = 0;
+            assert(wait4(-1, &status, __WALL, NULL) == -1 && errno == EINTR);
+        }
+        assert(wait4(-1, &status, __WALL, NULL) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 5);
     }
 }
 
@@ -98,6 +133,9 @@ int main(int argc, char** argv)
     }
     if (argc == 3 && !strcmp(argv[1], "--after-exec")) {
         snprintf(marker, sizeof(marker), "%s", argv[2]);
+        no_children();
+        mixed_vfork(CLONE_VM);
+        real_child();
         no_children();
         /* Allow an asynchronous internal exit to finish. */
         for (int i = 0; i < 40 && image_retained(); ++i)

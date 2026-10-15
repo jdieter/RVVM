@@ -85,7 +85,12 @@ struct user_native_vfork {
     uint32_t clone_ready, clone_pid, child_ready, child_registered;
     uint32_t* clone_marker;
     uint32_t service_state, service_stop;
-    uint32_t operation, helper_pid, helper_alive, helper_state, helper_ready;
+    uint32_t operation, helper_pid, helper_state, helper_ready;
+    /* The helper's CHILD_SETTID/CLEARTID word: its TID while alive, zero
+     * after exit. It lives in user_internal_tasks when a slot is free, so
+     * guest-facing calls can hide the helper. */
+    uint32_t* helper_alive;
+    uint32_t helper_alive_private;
     bool helper_lost;
     /* No helper could be created (RLIMIT_NPROC, task limits): the child runs
      * its kernel operations itself. A stop of it then holds the mapping
@@ -364,7 +369,7 @@ static long user_native_mapping_kernel(long nr, long a, long b, long c, long d, 
     rvvm_futex_wake(&request->helper_state, 1);
     for (unsigned waits = 0; atomic_load_uint32(&request->helper_state) != 2; ++waits) {
         /* A child that served itself is gone once VFORK has released. */
-        if (!atomic_load_uint32(&request->helper_alive)
+        if (!atomic_load_uint32(request->helper_alive)
             || (request->helper_self && atomic_load_uint32(&request->service_stop))) {
             /* Contain the loss to the child, as if SIGKILL had arrived
              * during its syscall; it never observes the lost result. The
@@ -389,20 +394,20 @@ static long user_native_mapping_kernel(long nr, long a, long b, long c, long d, 
 static void user_native_mapping_finish(struct user_native_vfork* request)
 {
     if (!atomic_load_uint32(&request->helper_pid)) {
-        atomic_store_uint32(&request->helper_alive, 0);
+        atomic_store_uint32(request->helper_alive, 0);
         return;
     }
     atomic_store_uint32(&request->helper_state, 3);
     rvvm_futex_wake(&request->helper_state, 1);
     struct timespec timeout = {.tv_nsec = 10000000};
-    for (unsigned waits = 0; atomic_load_uint32(&request->helper_alive)
+    for (unsigned waits = 0; atomic_load_uint32(request->helper_alive)
          && !(request->helper_self && atomic_load_uint32(&request->service_stop)); ++waits) {
         /* As in user_native_mapping_kernel: resume a helper stopped by job
          * control so it can exit. */
         if (!request->helper_self && waits % 10 == 0)
             syscall(SYS_kill, atomic_load_uint32(&request->helper_pid), SIGCONT);
-        syscall(SYS_futex, &request->helper_alive, FUTEX_WAIT,
-                atomic_load_uint32(&request->helper_alive), &timeout, NULL, 0);
+        syscall(SYS_futex, request->helper_alive, FUTEX_WAIT,
+                atomic_load_uint32(request->helper_alive), &timeout, NULL, 0);
     }
 }
 
@@ -549,7 +554,7 @@ static void* user_native_service(void* opaque)
             atomic_store_uint32(&request->service_state, 2);
             rvvm_futex_wake(&request->service_state, 1);
             while (!atomic_load_uint32(&request->helper_pid)
-                   && atomic_load_uint32(&request->helper_alive)
+                   && atomic_load_uint32(request->helper_alive)
                    && !atomic_load_uint32(&request->service_stop))
                 rvvm_futex_wait(&request->helper_ready, 0, 1000000);
             spin_unlock(&mmap_lock);
@@ -665,7 +670,7 @@ static long user_native_mapping(struct user_native_vfork* request, long nr, long
     request->mapping_nr = nr;
     memcpy(request->mapping_args, args, sizeof(request->mapping_args));
     atomic_store_uint32(&request->helper_pid, 0);
-    atomic_store_uint32(&request->helper_alive, UINT32_MAX);
+    request->helper_alive = user_internal_claim(&request->helper_alive_private);
     atomic_store_uint32(&request->helper_state, 0);
     atomic_store_uint32(&request->helper_ready, 0);
     request->helper_lost = false;
@@ -680,7 +685,7 @@ static long user_native_mapping(struct user_native_vfork* request, long nr, long
     int pid = clone(user_native_mapping_helper, request->helper_stack + sizeof(request->helper_stack),
                     CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_PARENT_SETTID
                     | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID, request,
-                    &request->helper_pid, NULL, &request->helper_alive);
+                    &request->helper_pid, NULL, request->helper_alive);
     if (pid < 0 && (errno == EAGAIN || errno == ENOMEM)) {
         /* Linux would not need another task for this call. Serve the
          * worker from this child, with every signal blocked meanwhile. */
@@ -691,8 +696,9 @@ static long user_native_mapping(struct user_native_vfork* request, long nr, long
         atomic_store_uint32(&request->service_state, 1);
         user_native_internal(SYS_futex, (long)&request->service_state, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0);
         user_native_mapping_serve(request);
-        atomic_store_uint32(&request->helper_alive, 0);
-        user_native_internal(SYS_futex, (long)&request->helper_alive, FUTEX_WAKE, INT_MAX, 0, 0, 0);
+        /* Self-serving leaves no task to hide; release the slot. */
+        atomic_store_uint32(request->helper_alive, 0);
+        user_native_internal(SYS_futex, (long)request->helper_alive, FUTEX_WAKE, INT_MAX, 0, 0, 0);
         while (atomic_load_uint32(&request->service_state) != 2)
             user_native_internal(SYS_futex, (long)&request->service_state, FUTEX_WAIT_PRIVATE, 1, 0, 0, 0);
         long ret = request->mapping_result;
@@ -703,7 +709,7 @@ static long user_native_mapping(struct user_native_vfork* request, long nr, long
     }
     if (pid < 0) {
         int error = errno;
-        atomic_store_uint32(&request->helper_alive, 0);
+        atomic_store_uint32(request->helper_alive, 0);
         atomic_store_uint32(&request->service_state, 0);
         user_native_internal(SYS_futex, (long)&request->helper_ready, FUTEX_WAKE_PRIVATE, INT_MAX, 0, 0, 0);
         user_native_internal(SYS_rt_sigprocmask, SIG_SETMASK, (long)&saved_mask, 0, 8, 0, 0);
@@ -711,7 +717,7 @@ static long user_native_mapping(struct user_native_vfork* request, long nr, long
     }
     for (unsigned waits = 0; !atomic_load_uint32(&request->helper_ready); ++waits) {
         if (waits % 10 == 9) user_native_internal(SYS_kill, pid, SIGCONT, 0, 0, 0, 0);
-        if (!atomic_load_uint32(&request->helper_alive)) {
+        if (!atomic_load_uint32(request->helper_alive)) {
             /* Killed before it could run anything. Contain it like a later
              * loss rather than return an errno this call never produces. */
             atomic_store_uint32(&request->service_state, 0);
@@ -897,7 +903,6 @@ static long user_native_dispatch(struct user_native_vfork* request, long nr, lon
             return (int)a[1] == F_GETFL && ret >= 0 ? uapi_open_flags_to_guest(ret) : ret;
         }
         case 57: return NATIVE_RAW(close);
-        case 61: return NATIVE_RAW(getdents64);
         case 93: case 94: user_ptrace_exit(request->cpu); return NATIVE_RAW(exit_group);
         case 96: return NATIVE_RAW(set_tid_address);
         /* Descriptor metadata is already this child's private copy: VFORK

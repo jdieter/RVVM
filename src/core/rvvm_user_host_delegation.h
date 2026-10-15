@@ -39,6 +39,7 @@
 
 static void user_host_path(char* snapshot, char* wrapped, const char** path)
 {
+    if (*path && user_internal_proc_path(wrapped, *path)) { *path = wrapped; return; }
     if (!prefix_path || !*prefix_path || !*path) return;
     long ret = user_path_copy(snapshot, *path, UAPI_PATH_MAX);
     /* Hand bad paths to Linux as bad paths, rather than returning before its

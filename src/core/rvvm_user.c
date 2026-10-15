@@ -528,6 +528,36 @@ static const char* wrap_path(char* buffer, const char* path)
 }
 
 #include "rvvm_user_path.h"
+
+/* "/proc/<internal pid>[/...]" becomes "/proc/0[/...]": Linux has no PID 0
+ * entry, so every path operation fails with its native ENOENT. Reads the
+ * guest path fault-safely; returns whether out holds the rewritten path. */
+#ifdef USER_NATIVE_VFORK_POC
+static bool user_internal_task(long pid);
+#endif
+static bool user_internal_proc_path(char* out, const char* path)
+{
+#ifdef USER_NATIVE_VFORK_POC
+    static const char prefix[] = "/proc/";
+    size_t at = 0;
+    for (; prefix[at]; ++at) if (user_peek_byte(path + at) != prefix[at]) return false;
+    long pid = 0;
+    int byte;
+    while ((byte = user_peek_byte(path + at)) >= '0' && byte <= '9' && pid < INT32_MAX) {
+        pid = pid * 10 + byte - '0';
+        ++at;
+    }
+    if ((byte != 0 && byte != '/') || !user_internal_task(pid)) return false;
+    char tail[UAPI_PATH_MAX];
+    if (user_path_copy(tail, path + at, sizeof(tail) - 8) < 0) return false;
+    snprintf(out, UAPI_PATH_MAX, "/proc/0%s", tail);
+    return true;
+#else
+    UNUSED(out); UNUSED(path);
+    return false;
+#endif
+}
+
 #include "user_ptrace/user_ptrace.h"
 #include "user_ptrace/user_ptrace_events.h"
 static uint32_t user_reaper_tid;
@@ -1247,10 +1277,19 @@ static int64_t rvvm_sys_getdents64(int fd, void* dirp, size_t size)
     char link[64], path[128];
     snprintf(link, sizeof(link), "/proc/thread-self/fd/%d", fd);
     ssize_t n = readlink(link, path, sizeof(path) - 1);
-    unsigned pid;
+    unsigned pid = 0;
     int end = 0;
     if (n >= 0) path[n] = 0;
-    if (n >= 0 && sscanf(path, "/proc/%u/task%n", &pid, &end) == 1 && end && !path[end]) {
+    bool task_list = n >= 0 && sscanf(path, "/proc/%u/task%n", &pid, &end) == 1 && end && !path[end];
+    bool proc_root = false;
+#ifdef USER_NATIVE_VFORK_POC
+    /* The proc root lists internal tasks. Identify it by name and inode 1
+     * without statfs, which a FUSE server would see. */
+    struct stat st;
+    proc_root = !task_list && n >= 5 && !strcmp(path + n - 5, "/proc")
+        && !fstat(fd, &st) && S_ISDIR(st.st_mode) && st.st_ino == 1;
+#endif
+    if (task_list || proc_root) {
         char buffer[4096];
         user_fd_lock();
         long result;
@@ -1263,7 +1302,13 @@ static int64_t rvvm_sys_getdents64(int fd, void* dirp, size_t size)
                 struct uapi_linux_dirent64* entry = (void*)(buffer + pos);
                 bool recognized = false;
                 unsigned tid = strtoul(entry->d_name, NULL, 10);
+#ifdef USER_NATIVE_VFORK_POC
+                if (proc_root) recognized = tid && user_internal_task(tid);
+                bool visible = proc_root ? !recognized
+                    : !tid || user_ptrace_guest_task(pid, tid, &recognized);
+#else
                 bool visible = !tid || user_ptrace_guest_task(pid, tid, &recognized);
+#endif
                 if (visible || !recognized) {
                     memmove(buffer + kept, entry, entry->d_reclen);
                     kept += entry->d_reclen;
@@ -1505,6 +1550,7 @@ static rvvm_addr_t rvvm_sys_readlinkat(int dirfd, const char* pathname, char* bu
     char snapshot[UAPI_PATH_MAX], path[UAPI_PATH_MAX], tmp[UAPI_PATH_MAX];
     long path_length = user_path_copy(snapshot, pathname, sizeof(snapshot));
     if (path_length < 0) return path_length;
+    if (user_internal_proc_path(tmp, snapshot)) return errno_ret(readlinkat(dirfd, tmp, buffer, size));
     const char* wrapped = wrap_path(path, snapshot);
     // readlink does not follow the final symlink. A proc executable link must
     // therefore end in the component "exe"; directory aliases still qualify.
@@ -1725,9 +1771,6 @@ static void* rvvm_user_thread_wrap(void* arg)
 #endif
                 case 57: // close
                     a0 = user_exe_close(a0);
-                    break;
-                case 61: // getdents64
-                    a0 = rvvm_sys_getdents64(a0, to_ptr(a1), a2);
                     break;
                 case 93: // exit
                     user_ptrace_exit(cpu);

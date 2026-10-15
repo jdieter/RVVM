@@ -19,11 +19,26 @@ struct user_observer {
      * ancestor of the active one; owner_proc is the owner's PID there. */
     bool nested;
     unsigned long owner_proc;
+    /* Init or subreaper owners keep the observer as a direct child. */
+    bool direct;
     struct stat identity;
     char input[4096], line[256];
 };
 static struct user_observer* user_observer;
 static struct user_native_vfork* user_native_requests;
+
+/* Internal tasks the guest must not see: mapping helpers' alive words
+ * (their TID while alive, cleared by the kernel at exit). A claimed but
+ * unstarted slot holds UINT32_MAX, which is never a TID. */
+static uint32_t user_internal_tasks[128];
+
+static uint32_t* user_internal_claim(uint32_t* fallback)
+{
+    for (size_t i = 0; i < sizeof(user_internal_tasks) / sizeof(*user_internal_tasks); ++i)
+        if (atomic_cas_uint32(&user_internal_tasks[i], 0, UINT32_MAX)) return &user_internal_tasks[i];
+    atomic_store_uint32(fallback, UINT32_MAX);
+    return fallback;
+}
 
 static long user_observer_raw(long nr, long a, long b, long c, long d, long e, long f)
 {
@@ -257,6 +272,56 @@ static long user_observer_find(struct user_observer* observer)
     return pid ? user_observer_candidate(observer, pid) : 0;
 }
 
+/* Whether the owner has a child other than internal tasks: read each of
+ * its threads' children lists through the pinned proc. */
+static long user_observer_other_children(struct user_observer* observer)
+{
+    unsigned long owner = observer->nested ? observer->owner_proc : (unsigned long)observer->owner;
+    if (!owner) return -ESRCH;
+    char path[96];
+    user_observer_decimal(path, owner);
+    size_t base = strlen(path);
+    memcpy(path + base, "/task", 6);
+    int dir = user_observer_raw(SYS_openat, observer->root, (long)path,
+                                O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0, 0, 0);
+    if (dir < 0) return dir;
+    char entries[1024], children[512];
+    long found = 0, bytes;
+    while (!found && (bytes = user_observer_raw(SYS_getdents64, dir, (long)entries,
+                                                sizeof(entries), 0, 0, 0)) > 0) {
+        for (long at = 0; at < bytes && !found;) {
+            const char* name = entries + at + 19;
+            unsigned short length;
+            memcpy(&length, entries + at + 16, sizeof(length));
+            if (!length) break;
+            at += length;
+            if (*name < '1' || *name > '9') continue;
+            const char* digits = name;
+            unsigned long tid = user_observer_number(&digits, 10);
+            path[base] = '/';
+            memcpy(path + base + 1, "task/", 5);
+            user_observer_decimal(path + base + 6, tid);
+            memcpy(path + strlen(path), "/children", 10);
+            int list = user_observer_raw(SYS_openat, observer->root, (long)path, O_RDONLY | O_CLOEXEC, 0, 0, 0);
+            if (list < 0) continue;
+            unsigned long pid = 0;
+            long count;
+            while (!found && (count = user_observer_raw(SYS_read, list, (long)children,
+                                                        sizeof(children), 0, 0, 0)) > 0) {
+                for (long i = 0; i < count && !found; ++i) {
+                    if (children[i] >= '0' && children[i] <= '9') { pid = pid * 10 + children[i] - '0'; continue; }
+                    unsigned long active = pid ? user_observer_active_pid(observer, pid) : 0;
+                    found = active && !user_internal_task(active);
+                    pid = 0;
+                }
+            }
+            user_observer_raw(SYS_close, list, 0, 0, 0, 0, 0);
+        }
+    }
+    user_observer_raw(SYS_close, dir, 0, 0, 0, 0, 0);
+    return found;
+}
+
 static void user_observer_cookie_close(struct user_observer* observer)
 {
     if (observer->children >= 0) user_observer_raw(SYS_close, observer->children, 0, 0, 0, 0, 0);
@@ -337,6 +402,7 @@ static __attribute__((no_stack_protector)) int user_observer_main(void* opaque)
         }
         if (observer->operation == 1) observer->result = user_observer_cookie_open(observer);
         else if (observer->operation == 2) observer->result = user_observer_find(observer);
+        else if (observer->operation == 4) observer->result = user_observer_other_children(observer);
         else { user_observer_cookie_close(observer); observer->result = 0; }
         atomic_store_uint32(&observer->state, 2);
         user_observer_raw(SYS_futex, (long)&observer->state, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0);
@@ -350,6 +416,24 @@ static __attribute__((no_stack_protector)) int user_observer_main(void* opaque)
  * __WCLONE waits therefore neither block on it nor lose ECHILD. Until one
  * party reaps the exiting intermediate, guest waits hide its PID. */
 static uint32_t user_observer_transient;
+/* A direct observer's PID until it is reaped, since an init or subreaper
+ * guest's wait could otherwise collect its exit. */
+static uint32_t user_observer_direct_pid;
+
+/* True for this process's internal tasks: the observer while it lives, its
+ * exiting intermediate and mapping helpers. Guest-facing calls hide them. */
+static bool user_internal_task(long pid)
+{
+    if (pid <= 0 || pid >= UINT32_MAX) return false;
+    if ((uint32_t)pid == atomic_load_uint32(&user_observer_transient)
+        || (uint32_t)pid == atomic_load_uint32(&user_observer_direct_pid)) return true;
+    struct user_observer* observer = atomic_load_pointer(&user_observer);
+    if (observer && atomic_load_uint32(&observer->alive) && (uint32_t)pid == (uint32_t)observer->pid)
+        return true;
+    for (size_t i = 0; i < sizeof(user_internal_tasks) / sizeof(*user_internal_tasks); ++i)
+        if (atomic_load_uint32(&user_internal_tasks[i]) == (uint32_t)pid) return true;
+    return false;
+}
 
 static __attribute__((no_stack_protector)) int user_observer_spawn(void* opaque)
 {
@@ -376,11 +460,25 @@ static __attribute__((no_stack_protector)) int user_observer_spawn(void* opaque)
 static bool user_observer_hidden(pid_t pid, bool reaped)
 {
     if (pid <= 0) return false;
-    uint32_t transient = atomic_load_uint32(&user_observer_transient);
-    if ((uint32_t)pid != transient) return false;
-    if (reaped) atomic_cas_uint32(&user_observer_transient, transient, 0);
+    uint32_t* record = &user_observer_transient;
+    if ((uint32_t)pid != atomic_load_uint32(record)) {
+        record = &user_observer_direct_pid;
+        if ((uint32_t)pid != atomic_load_uint32(record)) return false;
+    }
+    if (reaped) atomic_cas_uint32(record, pid, 0);
     else sched_yield();
     return true;
+}
+
+/* Reap a stopped direct observer unless a guest wait already hid it. */
+static void user_observer_reap(struct user_observer* observer)
+{
+    if (!observer->direct || !atomic_load_uint32(&user_observer_direct_pid)) return;
+    long reaped;
+    int status;
+    do reaped = user_native_internal(SYS_wait4, observer->pid, (long)&status, __WALL, 0, 0, 0);
+    while (reaped == -EINTR);
+    if (reaped == observer->pid) atomic_cas_uint32(&user_observer_direct_pid, observer->pid, 0);
 }
 
 static void user_observer_stop(struct user_observer* observer)
@@ -389,6 +487,7 @@ static void user_observer_stop(struct user_observer* observer)
     rvvm_futex_wake(&observer->state, 1);
     while (atomic_load_uint32(&observer->alive))
         rvvm_futex_wait(&observer->alive, atomic_load_uint32(&observer->alive), 10000000);
+    user_observer_reap(observer);
     /* CHILD_CLEARTID runs after the observer's last user stack access. */
     munmap(observer->stack, 1024 * 1024);
     observer->stack = NULL;
@@ -412,6 +511,7 @@ static void user_observer_fork_child(void)
     user_observer = NULL;
     user_native_requests = NULL;
     user_observer_transient = 0;
+    user_observer_direct_pid = 0;
     user_observer_init_lock = (user_fd_mutex_t){0};
 }
 
@@ -476,8 +576,9 @@ static struct user_observer* user_observer_get(void)
          * SIGCHLD child. A direct exit_signal-0 child is visible only to its
          * __WALL/__WCLONE waits: keep that remaining gap instead. */
         int subreaper = 0;
-        long ret = getpid() == 1 || (!prctl(PR_GET_CHILD_SUBREAPER, &subreaper) && subreaper)
-            ? user_observer_spawn(observer) : user_native_clone3(&args, sizeof(args));
+        observer->direct = getpid() == 1 || (!prctl(PR_GET_CHILD_SUBREAPER, &subreaper) && subreaper);
+        long ret = observer->direct ? user_observer_spawn(observer) : user_native_clone3(&args, sizeof(args));
+        if (observer->direct && observer->pid) atomic_store_uint32(&user_observer_direct_pid, observer->pid);
         if (ret > 0) {
             long reaped;
             int status;
@@ -522,6 +623,7 @@ static void user_observer_release(bool wait)
         rvvm_futex_wake(&observer->state, 1);
         while (wait && atomic_load_uint32(&observer->alive))
             rvvm_futex_wait(&observer->alive, atomic_load_uint32(&observer->alive), 10000000);
+        if (wait) user_observer_reap(observer);
     }
     user_fd_mutex_unlock(&user_observer_init_lock);
 }
@@ -537,6 +639,26 @@ static void user_observer_provision(uint64_t soft, uint64_t hard)
     int saved = errno;
     user_observer_get();
     errno = saved;
+}
+
+static long user_observer_call(struct user_observer* observer, int operation);
+
+/* The observer is this process's direct child (init or subreaper owner). */
+static struct user_observer* user_observer_direct(void)
+{
+    if (user_native_child_active) return NULL;
+    struct user_observer* observer = atomic_load_pointer(&user_observer);
+    return observer && observer->direct && observer->owner == getpid()
+        && atomic_load_uint32(&observer->alive) ? observer : NULL;
+}
+
+/* 1 when a child other than internal tasks exists, 0 when none, else -errno. */
+static long user_observer_others(struct user_observer* observer)
+{
+    user_fd_mutex_lock(&observer->lock);
+    long result = user_observer_call(observer, 4);
+    user_fd_mutex_unlock(&observer->lock);
+    return result;
 }
 
 static long user_observer_call(struct user_observer* observer, int operation)

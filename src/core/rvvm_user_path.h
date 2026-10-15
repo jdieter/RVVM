@@ -71,6 +71,8 @@ static bool user_path_fault(void* context)
         uc->uc_mcontext.pc = (uintptr_t)user_copy_abort;
     else if (pc >= (uintptr_t)user_match_begin && pc < (uintptr_t)user_match_end)
         uc->uc_mcontext.pc = (uintptr_t)user_match_abort;
+    else if (pc >= (uintptr_t)user_peek_begin && pc < (uintptr_t)user_peek_end)
+        uc->uc_mcontext.pc = (uintptr_t)user_peek_abort;
     else return false;
 #elif defined(__x86_64__)
     uintptr_t pc = uc->uc_mcontext.gregs[REG_RIP];
@@ -80,6 +82,8 @@ static bool user_path_fault(void* context)
         uc->uc_mcontext.gregs[REG_RIP] = (uintptr_t)user_copy_abort;
     else if (pc >= (uintptr_t)user_match_begin && pc < (uintptr_t)user_match_end)
         uc->uc_mcontext.gregs[REG_RIP] = (uintptr_t)user_match_abort;
+    else if (pc >= (uintptr_t)user_peek_begin && pc < (uintptr_t)user_peek_end)
+        uc->uc_mcontext.gregs[REG_RIP] = (uintptr_t)user_peek_abort;
     else return false;
 #endif
     return true;
