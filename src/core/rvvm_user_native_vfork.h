@@ -189,7 +189,9 @@ static int user_native_cow_child(void* opaque)
     rvvm_user_fork_child(request->cpu);
     rvvm_user_fork_unlock();
     user_reaper_lock = (user_fd_mutex_t){0};
-    user_exe_lock = (user_fd_mutex_t){0};
+    /* user_exe_lock is the current table's lock, and that table lives in a
+     * shared mapping: with CLONE_FILES it is the parent's own, and the
+     * worker that holds it releases it there. Never reset it here. */
     user_exec_fork_child();
     user_observer_fork_child();
     user_exe_process_link_init(false);
