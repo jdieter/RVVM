@@ -1,3 +1,51 @@
+# Checkpoint: October 15, 2026 (Claude session)
+
+Latest ARM candidate `claude8`: source `/var/tmp/rvvm-native-vfork-poc-20261013/claude8/src.tar.gz`
+(SHA256 `80cac362...`), binary SHA256 `e5ffe9b4...`. Launch: `claude1/guest.sh`
+(user/mount/binfmt/pid namespaces, proc in root, `/sys` bind, UID993/GID135,
+empty bounding set, guest not PID 1). No commit, merge or deployment.
+
+Changes since the 48-case observer checkpoint, each with a regression that
+fails before the change and passes after it on ARM:
+
+- Partial mprotect keeps the kernel's completed prefix in the executable
+  registry (`test-mprotect-partial-exec.c`, now also mid-range EACCES).
+- The observer is no longer the guest's child: a raw intermediate creates
+  it and exits, so `__WALL`/`__WCLONE` waits keep ECHILD. Guest waits hide
+  that intermediate until reaped. An init or subreaper guest keeps a direct
+  exit_signal-0 child (remaining `__WALL` gap). Exec and exit_group stop an
+  idle observer, which previously kept the pre-exec mm alive
+  (`test-observer-visibility.c`).
+- Proc PIDs are translated through NSpid when the pinned proc belongs to an
+  ancestor PID namespace (`GUEST_PROC=outer`; fixes a `test-tids` regression
+  against the installed baseline).
+- Mapping-helper death no longer exits the parent. The child is killed, as
+  if SIGKILL arrived in its syscall; the operation's outcome is read from
+  kernel mappings (mincore/maps) for bookkeeping; nothing is replayed.
+  ELF segments, stack and signal trampoline keep host EXEC so maps mirror
+  guest execute intent (`test-helper-death.c` with `helper-death-killer.c`
+  covers mmap, populate, mprotect and munmap kills).
+- The observer is provisioned before the guest lowers NOFILE below 16, so
+  `test-observer-cow-limits.c` passes (installed baseline: EMFILE).
+
+Later candidate `claude10` (binary SHA256 `d2474edc...`) also routes every
+syscall the parent handles in a shared-mm VFORK child: mount, umount2,
+mincore, accept4, sendmmsg, process_vm_readv/writev, shmget/shmctl, bpf and
+fchmodat2 through the shared dispatcher; shmat/shmdt through the mapping
+helper; unshare directly. clone from such a child supports fork and nested
+VFORK (prepare/finish run on the child's worker with its tracing context;
+the child issues clone3). Thread creation from it returns EAGAIN: a thread
+would need TLS of its own while the child borrows its caller's. Tests:
+`test-child-routes.c`, `test-child-clone.c` (fail on `claude9`, pass on
+`claude10`). A fork with namespace or CLONE_FILES/FS flags from such a child
+still returns EINVAL, as for a native VFORK.
+
+All other fixtures pass on `claude8` and `claude10`. Not run here: fake-root/prefix
+direct-API launchers, native early-stop tracer, native-only kernel probes.
+Remaining: full acceptance (glibc in RPM context, builds, performance),
+platform/CET/static-glibc gating (private VFORK needs static glibc
+2.34-2.39), helper clone EAGAIN at RLIMIT_NPROC, observer `/proc` visibility.
+
 # Reboot checkpoint: October 14, 2026
 
 The first integrated observer candidate passes all 48 parent-TID cases on
