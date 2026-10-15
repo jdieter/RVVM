@@ -15,9 +15,6 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include <sys/syscall.h>
 #include <signal.h>
 #include <unistd.h>
-#ifdef __GLIBC__
-#include <malloc.h>
-#endif
 #endif
 
 #include <rvvm/rvvm.h>
@@ -1288,15 +1285,6 @@ PUBLIC bool rvvm_attach_msi_target(rvvm_machine_t* machine, const rvvm_mmio_dev_
 
 PUBLIC rvvm_machine_t* rvvm_create_userland(const char* isa)
 {
-#if defined(RVVM_USER_TEST) && defined(__linux__) && defined(USE_JIT) && defined(__GLIBC__)
-    struct rlimit host_limit;
-    if (!getrlimit(RLIMIT_AS, &host_limit) && host_limit.rlim_cur != RLIM_INFINITY) {
-        /* Native per-thread malloc arenas reserve large address ranges even
-         * when mostly empty. Keep that optional overhead out of a finite
-         * guest's headroom; its own allocator is unaffected. */
-        mallopt(M_ARENA_MAX, 1);
-    }
-#endif
     // TODO: Proper ISA string parsing
     bool rv64 = !isa || (rvvm_strfind(isa, "rv64") == isa);
     bool rv32 = isa && (rvvm_strfind(isa, "rv32") == isa);

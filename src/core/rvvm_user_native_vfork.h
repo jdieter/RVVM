@@ -130,9 +130,6 @@ struct user_native_vfork {
 };
 
 #ifdef RVVM_STATIC_GLIBC_FORK
-extern void __malloc_fork_lock_parent(void);
-extern void __malloc_fork_unlock_parent(void);
-extern void __malloc_fork_unlock_child(void);
 extern void _IO_list_lock(void);
 extern void _IO_list_unlock(void);
 extern void _IO_list_resetlock(void);
@@ -145,12 +142,12 @@ static void user_native_cow_snapshot_lock(void)
     user_fd_mutex_lock(&user_reaper_lock);
     rvvm_user_fork_lock();
     _IO_list_lock();
-    __malloc_fork_lock_parent();
+    user_malloc_fork_lock();
 }
 
 static void user_native_cow_snapshot_unlock(void)
 {
-    __malloc_fork_unlock_parent();
+    user_malloc_fork_unlock();
     _IO_list_unlock();
     rvvm_user_fork_unlock();
     user_fd_mutex_unlock(&user_reaper_lock);
@@ -169,7 +166,7 @@ static int user_native_cow_child(void* opaque)
     /* Snapshot locks belong to vanished parent threads in this private mm.
      * Unlock allocator state first, then let libc reset FILE/loader/NPTL
      * state through its ordinary child recovery. */
-    __malloc_fork_unlock_child();
+    user_malloc_fork_child();
     _IO_list_resetlock();
     user_fork_recover_cow = true;
     if (fork() != 0) _exit(127);

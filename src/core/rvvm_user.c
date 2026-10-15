@@ -943,6 +943,7 @@ static rvvm_hart_t* user_clone_cpu(rvvm_hart_t* parent)
 
 // long sys_clone(unsigned long flags, void *stack, int *parent_tid, unsigned long tls, int *child_tid);
 static int rvvm_sys_vfork(rvvm_user_thread_t*, uint32_t, size_t, uint32_t*, size_t, uint32_t*);
+#include "rvvm_user_malloc.h"
 #include "rvvm_user_fork.h"
 #include "rvvm_user_fork_cache.h"
 

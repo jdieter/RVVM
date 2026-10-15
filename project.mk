@@ -181,7 +181,9 @@ override LIB_TARGETS := rvvm # TODO: rvvm_libretro FTBFS
 override bin_src_rvvm          := $(SRCDIR)/main.c
 # The userland syscall layer is rvvm_user's alone: keeping it out of librvvm
 # keeps its static-glibc fork code out of the dynamic rvvm and librvvm links.
+# Its allocator replaces malloc for the whole program it is linked into.
 override bin_src_rvvm_user     := $(SRCDIR)/rvvm_user_main.c $(SRCDIR)/core/rvvm_user.c \
+                                  $(SRCDIR)/core/rvvm_user_malloc.c \
                                   $(wildcard $(SRCDIR)/core/user_ptrace/*.c)
 override lib_src_rvvm_libretro := $(SRCDIR)/bindings/libretro/libretro.c
 

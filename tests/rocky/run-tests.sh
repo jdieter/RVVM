@@ -15,6 +15,9 @@ for name in test-exe-fd test-fd-lock test-fd-limits test-fork-cache test-process
         -ldl -lm -o "$build/$name"
     timeout 20 "$build/$name"
 done
+"$cc" "${flags[@]}" "$root/tests/rocky/test-user-malloc.c" "$root/src/core/rvvm_user_malloc.c" \
+    -o "$build/test-user-malloc"
+timeout 60 "$build/test-user-malloc"
 "$cc" "${flags[@]}" -DUSE_JIT -Wl,--wrap=realloc -Wl,--wrap=calloc \
     "$root/tests/rocky/test-jit-oom.c" "$root"/src/rvjit/*.c "$root"/src/util/*.c \
     -ldl -lm -o "$build/test-jit-oom"
