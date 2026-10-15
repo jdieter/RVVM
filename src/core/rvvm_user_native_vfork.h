@@ -409,6 +409,8 @@ static void user_native_mapping_finish(struct user_native_vfork* request)
         syscall(SYS_futex, request->helper_alive, FUTEX_WAIT,
                 atomic_load_uint32(request->helper_alive), &timeout, NULL, 0);
     }
+    /* A self-serving child that died never released its registry slot. */
+    if (request->helper_self) atomic_store_uint32(request->helper_alive, 0);
 }
 
 static void user_native_mapping_service(struct user_native_vfork* request)
