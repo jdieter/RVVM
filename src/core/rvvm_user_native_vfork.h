@@ -371,6 +371,16 @@ static void user_native_mapping_service(struct user_native_vfork* request)
             break;
         }
         case 233: request->mapping_result = user_native_mapping_kernel(SYS_madvise, a[0], a[1], a[2], 0, 0, 0); break;
+        case 196:
+            user_fd_lock();
+            request->mapping_result = (long)errno_ret((size_t)user_vma_shmat(a[0], (void*)a[1], a[2]));
+            user_fd_unlock();
+            break;
+        case 197:
+            user_fd_lock();
+            request->mapping_result = (long)errno_ret(user_vma_shmdt((void*)a[0]));
+            user_fd_unlock();
+            break;
         default: request->mapping_result = -ENOSYS;
     }
     user_vma_executor = NULL;
@@ -742,7 +752,8 @@ static long user_native_dispatch(struct user_native_vfork* request, long nr, lon
         atomic_store_uint32(&request->service_state, 0);
         return 0;
     }
-    if (nr == 214 || nr == 215 || nr == 216 || nr == 222 || nr == 226 || nr == 233) {
+    if (nr == 196 || nr == 197 || nr == 214 || nr == 215 || nr == 216 || nr == 222
+        || nr == 226 || nr == 233) {
         user_exe_filter_args(nr, a);
         return user_native_mapping(request, nr, a);
     }
@@ -761,6 +772,9 @@ static long user_native_dispatch(struct user_native_vfork* request, long nr, lon
         case 61: return NATIVE_RAW(getdents64);
         case 93: case 94: user_ptrace_exit(request->cpu); return NATIVE_RAW(exit_group);
         case 96: return NATIVE_RAW(set_tid_address);
+        /* Descriptor metadata is already this child's private copy: VFORK
+         * here never shares files, so CLONE_FILES needs no metadata copy. */
+        case 97: return NATIVE_RAW(unshare);
         case 139: user_rt_sigreturn(request->cpu); return 0;
         case 221: case 281: return user_native_exec(request, nr, a);
         case 436: return user_native_close_range(request, a[0], a[1], a[2]);

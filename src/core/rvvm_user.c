@@ -1558,7 +1558,6 @@ static void* rvvm_user_thread_wrap(void* arg)
     user_signal_init(cpu, thread->signal_mask);
     if (thread->inherit_signal_stack) user_sig.stack = thread->signal_stack;
 
-    char path_buf[UAPI_PATH_MAX] = {0};
 
     // Set up thread tid, child_tid
     uint32_t tid = rvvm_sys_gettid();
@@ -1651,12 +1650,6 @@ static void* rvvm_user_thread_wrap(void* arg)
                     a0 = -UAPI_ENOSYS;
                     break;
 #ifdef __linux__
-                case 39: // umount2: Linux mount flags are architecture independent
-                    a0 = errno_ret(syscall(SYS_umount2, to_str(a0), (int)a1));
-                    break;
-                case 40: // mount: leave namespace and privilege checks to Linux
-                    a0 = errno_ret(syscall(SYS_mount, to_str(a0), to_str(a1), to_str(a2), a3, to_ptr(a4)));
-                    break;
                 case 97: // unshare
                     a0 = user_fd_unshare(a0);
                     break;
@@ -1741,15 +1734,6 @@ static void* rvvm_user_thread_wrap(void* arg)
                     user_rt_sigreturn(cpu);
                     user_ptrace_syscall_end(cpu);
                     continue;
-                case 194: // shmget
-                    rvvm_info("sys_shmget(%lx, %lx, %lx)", a0, a1, a2);
-                    a0 = errno_ret(shmget(a0, a1, a2));
-                    break;
-                case 195: // shmctl
-                    // TODO: struct conversion?
-                    rvvm_info("sys_shmctl(%ld, %lx, %lx)", a0, a1, a2);
-                    a0 = errno_ret(shmctl(a0, a1, to_ptr(a2)));
-                    break;
                 case 196: // shmat
                     rvvm_info("sys_shmat(%ld, %lx, %lx)", a0, a1, a2);
                     user_fd_lock();
@@ -1836,17 +1820,9 @@ static void* rvvm_user_thread_wrap(void* arg)
 #endif
                     break;
 #ifdef __linux__
-                case 232: // mincore: host mapping residency, one byte per host page
-                    a0 = errno_ret(syscall(SYS_mincore, to_ptr(a0), a1, to_ptr(a2)));
-                    break;
                 case 233: // madvise
                     rvvm_info("sys_madvise(%lx, %lx, %lx)", a0, a1, a2);
                     a0 = errno_ret(madvise(to_ptr(a0), a1, a2));
-                    break;
-                case 242: // accept4
-                    // TODO: struct conversion(?)
-                    rvvm_info("sys_accept4(%ld, %lx, %lx, %lx)", a0, a1, a2, a3);
-                    a0 = errno_ret(USER_SYSCALL(SYS_accept4, a0, a1, a2, a3, 0, 0));
                     break;
 #endif
 #ifndef __linux__
@@ -1877,27 +1853,9 @@ static void* rvvm_user_thread_wrap(void* arg)
                     }
                     a0 = 0;
                     break;
-#ifdef __linux__
-                case 269: // sendmmsg
-                    // TODO: Struct conversion
-                    rvvm_info("sys_sendmmsg(%ld, %lx, %lx, %lx)", a0, a1, a2, a3);
-                    a0 = errno_ret(USER_SYSCALL(SYS_sendmmsg, a0, a1, a2, a3, 0, 0));
-                    break;
-                case 270: // process_vm_readv: Linux LP64 iovec and address-space identity
-                    a0 = errno_ret(USER_SYSCALL(SYS_process_vm_readv, a0, a1, a2, a3, a4, a5));
-                    break;
-                case 271: // process_vm_writev
-                    a0 = errno_ret(USER_SYSCALL(SYS_process_vm_writev, a0, a1, a2, a3, a4, a5));
-                    break;
-#endif
                 case 277: // Guest filters cannot safely constrain the emulator's host syscalls.
                     a0 = -UAPI_ENOSYS;
                     break;
-#ifdef __linux__
-                case 280: // bpf: fixed-width UAPI, programs run in the host kernel
-                    a0 = user_bpf((unsigned int)a0, to_ptr(a1), (unsigned int)a2);
-                    break;
-#endif
                 case 425: // io_uring_setup - guest event loop falls back to poll on ENOSYS
                     a0 = -UAPI_ENOSYS;
                     break;
@@ -1913,16 +1871,6 @@ static void* rvvm_user_thread_wrap(void* arg)
                     a0 = -UAPI_ENOSYS;
                     break;
 #endif
-                case 452: // fchmodat2
-#if defined(__linux__) && defined(SYS_fchmodat2)
-                    a0 = errno_ret(syscall(SYS_fchmodat2, (int)a0,
-                        wrap_path(path_buf, to_str(a1)), (unsigned int)a2,
-                        uapi_translate_flags(a3, uapi_path_flags,
-                                             STATIC_ARRAY_SIZE(uapi_path_flags), true)));
-#else
-                    a0 = -UAPI_ENOSYS;
-#endif
-                    break;
                 default:
 #ifndef __riscv
                     rvvm_error("Unknown syscall %ld!", a7);

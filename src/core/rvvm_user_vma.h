@@ -30,11 +30,18 @@ static long user_vma_execute(long nr, long a, long b, long c, long d, long e, lo
 #define user_vma_kernel_unmap(a,b) ((int)user_vma_execute(SYS_munmap,(long)(a),b,0,0,0,0))
 #define user_vma_kernel_remap(a,b,c,d,e) ((void*)user_vma_execute(SYS_mremap,(long)(a),b,c,d,(long)(e),0))
 #define user_vma_kernel_valid(fd) user_vma_execute(SYS_fcntl,fd,F_GETFD,0,0,0,0)
+/* SysV permission checks and IPC namespaces follow the calling process. */
+#define user_vma_kernel_shmctl(a,b,c) ((int)user_vma_execute(SYS_shmctl,a,b,(long)(c),0,0,0))
+#define user_vma_kernel_shmat(a,b,c) ((void*)user_vma_execute(SYS_shmat,a,(long)(b),c,0,0,0))
+#define user_vma_kernel_shmdt(a) ((int)user_vma_execute(SYS_shmdt,(long)(a),0,0,0,0,0))
 #else
 #define user_vma_kernel_map mmap
 #define user_vma_kernel_unmap munmap
 #define user_vma_kernel_remap mremap
 #define user_vma_kernel_valid(fd) fcntl(fd,F_GETFD)
+#define user_vma_kernel_shmctl shmctl
+#define user_vma_kernel_shmat shmat
+#define user_vma_kernel_shmdt shmdt
 #endif
 
 struct user_vma_layout {
@@ -492,22 +499,22 @@ static void* user_vma_remap(void* addr, size_t oldsize, size_t newsize, int flag
 static void* user_vma_shmat(int id, void* addr, int flags)
 {
     struct shmid_ds info;
-    if (shmctl(id, IPC_STAT, &info)) return (void*)-1;
+    if (user_vma_kernel_shmctl(id, IPC_STAT, &info)) return (void*)-1;
     if (!addr && (flags & SHM_REMAP)) { errno = EINVAL; return (void*)-1; }
     if (addr) {
         if (!user_vma_range((uintptr_t)addr, info.shm_segsz)) { errno = EINVAL; return (void*)-1; }
         if (!user_vma_reserve(1)) return (void*)-1;
-        void* ret = shmat(id, addr, flags);
+        void* ret = user_vma_kernel_shmat(id, addr, flags);
         if (ret != (void*)-1) user_vma_remember((uintptr_t)ret, info.shm_segsz);
         return ret;
     }
     if (!user_vma_reserve(1)) return (void*)-1;
     void* dest = user_vma_map_raw(NULL, info.shm_segsz, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (dest == MAP_FAILED) return dest;
-    void* ret = shmat(id, dest, flags | SHM_REMAP);
+    void* ret = user_vma_kernel_shmat(id, dest, flags | SHM_REMAP);
     if (ret == (void*)-1) {
         int error = errno;
-        munmap(dest, info.shm_segsz);
+        user_vma_kernel_unmap(dest, info.shm_segsz);
         errno = error;
     } else user_vma_remember((uintptr_t)ret, info.shm_segsz);
     return ret;
@@ -543,7 +550,7 @@ static int user_vma_shmdt(void* addr)
         errno = error;
         return -1;
     }
-    int ret = shmdt(addr), saved = errno;
+    int ret = user_vma_kernel_shmdt(addr), saved = errno;
     if (!ret) {
         for (size_t i = 0; i < count; ++i) {
             struct fragment old = fragments[i];

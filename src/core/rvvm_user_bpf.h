@@ -40,8 +40,10 @@ static no_inline long user_bpf(unsigned int command, void* attr, unsigned int si
     if (size > (unsigned long)sysconf(_SC_PAGESIZE))
         return errno_ret(syscall(SYS_bpf, command, attr, size));
     size_t bytes = size > path_offset + 8 ? size : path_offset + 8;
-    unsigned char* snapshot = calloc(1, bytes);
+    /* Shared-mm VFORK children allocate through their parent worker. */
+    unsigned char* snapshot = user_runtime_allocate(bytes);
     if (!snapshot) return -ENOMEM;
+    memset(snapshot, 0, bytes);
     long ret = user_memory_copy(snapshot, attr, size);
     uint64_t address = 0;
     if (!ret) memcpy(&address, snapshot + path_offset, sizeof(address));
@@ -62,7 +64,7 @@ static no_inline long user_bpf(unsigned int command, void* attr, unsigned int si
     /* These commands return a descriptor or status, never modify attr.
      * Preserve the entire extension tail, including nonzero reserved bytes. */
     if (!ret) ret = errno_ret(syscall(SYS_bpf, command, snapshot, address ? bytes : size));
-    free(snapshot);
+    user_runtime_release(snapshot);
     return ret;
 }
 #endif

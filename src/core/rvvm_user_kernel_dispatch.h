@@ -407,6 +407,23 @@ static bool user_kernel_dispatch(rvvm_hart_t* cpu, long nr, long a[6], long* res
         case 218: host = SYS_request_key; break;
         case 223: host = SYS_fadvise64; break;
         case 227: host = SYS_msync; break;
+        /* Plain pass-throughs, shared so shared-mm VFORK children get them. */
+        case 39: host = SYS_umount2; break; // flags are architecture independent
+        case 40: host = SYS_mount; break; // namespace and privilege checks stay with Linux
+        case 194: host = SYS_shmget; break;
+        case 195: host = SYS_shmctl; break; // TODO: struct conversion?
+        case 232: host = SYS_mincore; break; // host mapping residency, one byte per host page
+        case 242: host = SYS_accept4; break;
+        case 269: host = SYS_sendmmsg; break;
+        case 270: host = SYS_process_vm_readv; break; // LP64 iovec, same address space
+        case 271: host = SYS_process_vm_writev; break;
+        case 280: *result = user_bpf((unsigned int)a[0], (void*)a[1], (unsigned int)a[2]); return true;
+        case 452:
+#ifdef SYS_fchmodat2
+            host = SYS_fchmodat2; break;
+#else
+            *result = -ENOSYS; return true;
+#endif
         case 261:
 #ifdef USER_NATIVE_VFORK_POC
             user_observer_limit(a[0], a[1], (void*)a[2]);
@@ -446,14 +463,14 @@ static bool user_kernel_dispatch(rvvm_hart_t* cpu, long nr, long a[6], long* res
         a[arg] = uapi_translate_flags(a[arg], uapi_splice_flags,
                                       STATIC_ARRAY_SIZE(uapi_splice_flags), true);
     }
-    if (nr == 88 || nr == 439)
+    if (nr == 88 || nr == 439 || nr == 452)
         a[3] = uapi_translate_flags(a[3], uapi_path_flags, STATIC_ARRAY_SIZE(uapi_path_flags), true);
     unsigned paths = 0;
     switch (nr) {
         case 5: case 6: case 8: case 9: case 11: case 12: case 14: case 15:
         case 45: case 49: paths = 1; break;
         case 33: case 34: case 35: case 48: case 53: case 54: case 88:
-        case 27: case 264: case 291: case 439: paths = 2; break;
+        case 27: case 264: case 291: case 439: case 452: paths = 2; break;
         case 36: paths = 5; break;
         case 37: case 38: case 276: paths = 10; break;
     }
