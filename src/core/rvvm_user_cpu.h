@@ -162,10 +162,10 @@ static bool user_cpu_self_auxv(const char* path)
     unsigned pid, tid;
     int end = 0;
     if (sscanf(path, "/proc/%u/auxv%n", &pid, &end) == 1 && end && !path[end])
-        return pid == (unsigned)getpid() || pid == (unsigned)syscall(SYS_gettid);
+        return user_proc_is_self(pid, true);
     end = 0;
     if (sscanf(path, "/proc/%u/task/%u/auxv%n", &pid, &tid, &end) == 2 && end && !path[end])
-        return pid == (unsigned)getpid();
+        return user_proc_is_self(pid, false);
     return false;
 }
 

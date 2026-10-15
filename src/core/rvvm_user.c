@@ -534,6 +534,21 @@ static const char* wrap_path(char* buffer, const char* path)
  * guest path fault-safely; returns whether out holds the rewritten path. */
 #ifdef USER_NATIVE_VFORK_POC
 static bool user_internal_task(long pid);
+static unsigned user_exe_local_pid(unsigned pid);
+
+/* Whether /proc numbers tasks in an ancestor PID namespace. This depends
+ * on the process's PID namespace, fixed for its lifetime. */
+static bool user_proc_foreign(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        char self[32];
+        ssize_t n = readlink("/proc/self", self, sizeof(self) - 1);
+        if (n > 0) self[n] = 0;
+        cached = n > 0 && strtoul(self, NULL, 10) != (unsigned long)getpid();
+    }
+    return cached > 0;
+}
 #endif
 static bool user_internal_proc_path(char* out, const char* path)
 {
@@ -547,7 +562,8 @@ static bool user_internal_proc_path(char* out, const char* path)
         pid = pid * 10 + byte - '0';
         ++at;
     }
-    if ((byte != 0 && byte != '/') || !user_internal_task(pid)) return false;
+    if (byte != 0 && byte != '/') return false;
+    if (!user_internal_task(user_proc_foreign() ? (long)user_exe_local_pid(pid) : pid)) return false;
     char tail[UAPI_PATH_MAX];
     if (user_path_copy(tail, path + at, sizeof(tail) - 8) < 0) return false;
     snprintf(out, UAPI_PATH_MAX, "/proc/0%s", tail);
@@ -1272,6 +1288,31 @@ static int rvvm_sys_futex(uint32_t* addr, int futex_op, uint32_t val, size_t val
 #endif
 }
 
+#ifdef USER_NATIVE_VFORK_POC
+/* An entry of a proc root as getpid() numbers it; a foreign proc (from an
+ * ancestor PID namespace) lists NSpid last in each status. */
+static unsigned user_proc_entry_local(int dirfd, unsigned pid)
+{
+    char path[32], text[1024];
+    snprintf(path, sizeof(path), "%u/status", pid);
+    int status = openat(dirfd, path, O_RDONLY | O_CLOEXEC);
+    if (status < 0) return 0;
+    ssize_t n = read(status, text, sizeof(text) - 1);
+    close(status);
+    if (n <= 0) return 0;
+    text[n] = 0;
+    char* line = strstr(text, "\nNSpid:");
+    if (!line) return pid;
+    unsigned local = pid;
+    for (char* at = line + 7;;) {
+        while (*at == ' ' || *at == '\t') ++at;
+        if (*at < '0' || *at > '9') break;
+        local = strtoul(at, &at, 10);
+    }
+    return local;
+}
+#endif
+
 static int64_t rvvm_sys_getdents64(int fd, void* dirp, size_t size)
 {
     char link[64], path[128];
@@ -1288,6 +1329,13 @@ static int64_t rvvm_sys_getdents64(int fd, void* dirp, size_t size)
     struct stat st;
     proc_root = !task_list && n >= 5 && !strcmp(path + n - 5, "/proc")
         && !fstat(fd, &st) && S_ISDIR(st.st_mode) && st.st_ino == 1;
+    bool foreign = false;
+    if (proc_root) {
+        char self[32];
+        ssize_t length = readlinkat(fd, "self", self, sizeof(self) - 1);
+        if (length > 0) self[length] = 0;
+        foreign = length > 0 && strtoul(self, NULL, 10) != (unsigned long)getpid();
+    }
 #endif
     if (task_list || proc_root) {
         char buffer[4096];
@@ -1303,7 +1351,7 @@ static int64_t rvvm_sys_getdents64(int fd, void* dirp, size_t size)
                 bool recognized = false;
                 unsigned tid = strtoul(entry->d_name, NULL, 10);
 #ifdef USER_NATIVE_VFORK_POC
-                if (proc_root) recognized = tid && user_internal_task(tid);
+                if (proc_root) recognized = tid && user_internal_task(foreign ? user_proc_entry_local(fd, tid) : tid);
                 bool visible = proc_root ? !recognized
                     : !tid || user_ptrace_guest_task(pid, tid, &recognized);
 #else

@@ -105,9 +105,12 @@ static int image_retained(void)
     DIR* proc = opendir("/proc");
     assert(proc);
     int found = 0;
+    /* Proc may number tasks in an ancestor PID namespace. */
+    char self[32] = {0};
+    assert(readlink("/proc/self", self, sizeof(self) - 1) > 0);
     struct dirent* entry;
     while ((entry = readdir(proc))) {
-        if (entry->d_name[0] < '1' || entry->d_name[0] > '9' || atoi(entry->d_name) == getpid()) continue;
+        if (entry->d_name[0] < '1' || entry->d_name[0] > '9' || !strcmp(entry->d_name, self)) continue;
         char path[300], line[4096];
         snprintf(path, sizeof(path), "/proc/%s/cmdline", entry->d_name);
         int fd = open(path, O_RDONLY | O_CLOEXEC);

@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Native companion for test-internal-hidden: prints the PID of another
  * process sharing the guest's command line (RVVM's observer shares its mm),
- * or 0. Its proc view is unfiltered. Usage: find-internal <guest-pid> */
+ * as the guest's own PID namespace numbers it, or 0. Its proc view is
+ * unfiltered. Usage: find-internal <guest's /proc/self name> */
 #include <dirent.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -32,7 +33,27 @@ int main(int argc, char** argv)
         if (entry->d_name[0] < '1' || entry->d_name[0] > '9') continue;
         if (!strcmp(entry->d_name, argv[1]) || !strcmp(entry->d_name, self)) continue;
         if (cmdline(entry->d_name, other, sizeof(other)) == length && !memcmp(guest, other, length)) {
-            printf("%s\n", entry->d_name);
+            /* NSpid lists the guest's namespace number last. */
+            char path[300], status[4096];
+            snprintf(path, sizeof(path), "/proc/%s/status", entry->d_name);
+            int fd = open(path, O_RDONLY | O_CLOEXEC);
+            ssize_t n = fd < 0 ? -1 : read(fd, status, sizeof(status) - 1);
+            if (fd >= 0) close(fd);
+            const char* pid = entry->d_name;
+            char last[32];
+            if (n > 0) {
+                status[n] = 0;
+                char* line = strstr(status, "\nNSpid:");
+                for (char* at = line ? line + 7 : NULL; at;) {
+                    while (*at == ' ' || *at == '\t') ++at;
+                    if (*at < '0' || *at > '9') break;
+                    size_t digits = strspn(at, "0123456789");
+                    snprintf(last, sizeof(last), "%.*s", (int)digits, at);
+                    pid = last;
+                    at += digits;
+                }
+            }
+            printf("%s\n", pid);
             return 0;
         }
     }

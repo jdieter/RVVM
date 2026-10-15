@@ -42,8 +42,8 @@ static long internal_pid(const char* finder)
 {
     int channel[2];
     assert(!pipe(channel));
-    char guest[16];
-    snprintf(guest, sizeof(guest), "%d", getpid());
+    char guest[32] = {0};
+    assert(readlink("/proc/self", guest, sizeof(guest) - 1) > 0);
     pid_t pid = fork();
     if (!pid) {
         dup2(channel[1], 1);
@@ -72,8 +72,9 @@ int main(int argc, char** argv)
     char own[4096], other[4096];
     ssize_t length = cmdline("self", own, sizeof(own));
     assert(length > 0);
-    char self[16];
-    snprintf(self, sizeof(self), "%d", getpid());
+    /* Proc may number tasks in an ancestor PID namespace. */
+    char self[32] = {0};
+    assert(readlink("/proc/self", self, sizeof(self) - 1) > 0);
     DIR* proc = opendir("/proc");
     assert(proc);
     struct dirent* entry;

@@ -36,7 +36,17 @@ static const char* user_exe_path(void)
     // Numeric TID paths address this thread's table after UNSHARE, without
     // resolving the thread-self magic link on every executable operation.
     if (fd != saved_fd || tid != saved_tid) {
-        snprintf(path, sizeof(path), "/proc/%u/fd/%d", (unsigned)tid, fd);
+        /* Proc may number tasks in an ancestor PID namespace: name this
+         * thread as proc does, from its thread-self link. */
+        unsigned number = tid;
+        char self[64];
+        ssize_t n = tid == syscall(SYS_gettid) ? readlink("/proc/thread-self", self, sizeof(self) - 1) : -1;
+        if (n > 0) {
+            self[n] = 0;
+            const char* task = strstr(self, "/task/");
+            if (task) number = strtoul(task + 6, NULL, 10);
+        }
+        snprintf(path, sizeof(path), "/proc/%u/fd/%d", number, fd);
         saved_fd = fd;
         saved_tid = tid;
     }
@@ -118,15 +128,48 @@ static bool user_exe_init(const char* path)
     return user_exe_fd >= 0;
 }
 
+/* A PID parsed from a resolved proc path, numbered as getpid() numbers it.
+ * Proc may belong to an ancestor PID namespace, as after unshare -p without
+ * a new proc: NSpid then lists the proc's number first, ours last. */
+static unsigned user_exe_local_pid(unsigned pid)
+{
+    char path[48], line[160];
+    snprintf(path, sizeof(path), "/proc/%u/status", pid);
+    struct user_proc_reader reader;
+    if (!user_proc_open(&reader, path)) return pid;
+    unsigned local = pid;
+    while (user_proc_line(&reader, line, sizeof(line))) {
+        if (strncmp(line, "NSpid:", 6)) continue;
+        for (char* at = line + 6;;) {
+            while (*at == ' ' || *at == '\t') ++at;
+            if (*at < '0' || *at > '9') break;
+            local = strtoul(at, &at, 10);
+        }
+        break;
+    }
+    user_proc_close(&reader);
+    return local;
+}
+
+/* Whether a proc path's PID names this process (or, with thread, this
+ * thread), however proc numbers it. */
+static bool user_proc_is_self(unsigned pid, bool thread)
+{
+    unsigned self = getpid(), tid = thread ? (unsigned)syscall(SYS_gettid) : self;
+    if (pid == self || pid == tid) return true;
+    pid = user_exe_local_pid(pid);
+    return pid == self || pid == tid;
+}
+
 static bool user_exe_self(const char* path)
 {
     unsigned pid, tid;
     int end = 0;
     if (sscanf(path, "/proc/%u/exe%n", &pid, &end) == 1 && end && !path[end])
-        return pid == (unsigned)getpid() || pid == (unsigned)syscall(SYS_gettid);
+        return user_proc_is_self(pid, true);
     end = 0;
     return sscanf(path, "/proc/%u/task/%u/exe%n", &pid, &tid, &end) == 2
-        && end && !path[end] && pid == (unsigned)getpid();
+        && end && !path[end] && user_proc_is_self(pid, false);
 }
 
 static user_fd_table_t* user_exe_fd_directory(int fd)
@@ -141,11 +184,17 @@ static user_fd_table_t* user_exe_fd_directory(int fd)
     if (fstat(fd, &st) || user_fs_type(st.st_dev) != PROC_SUPER_MAGIC) return NULL;
     unsigned pid, tid;
     int end = 0;
-    if (sscanf(path, "/proc/%u/task/%u/fd%n", &pid, &tid, &end) == 2
-        && end && !path[end] && pid == (unsigned)getpid()) return user_fd_table_lookup(tid);
+    if (sscanf(path, "/proc/%u/task/%u/fd%n", &pid, &tid, &end) == 2 && end && !path[end]) {
+        unsigned self = getpid();
+        if (pid != self && user_exe_local_pid(pid) != self) return NULL;
+        user_fd_table_t* table = user_fd_table_lookup(tid);
+        return table ? table : user_fd_table_lookup(user_exe_local_pid(tid));
+    }
     end = 0;
-    if (sscanf(path, "/proc/%u/fd%n", &pid, &end) == 1 && end && !path[end])
-        return user_fd_table_lookup(pid);
+    if (sscanf(path, "/proc/%u/fd%n", &pid, &end) == 1 && end && !path[end]) {
+        user_fd_table_t* table = user_fd_table_lookup(pid);
+        return table ? table : user_fd_table_lookup(user_exe_local_pid(pid));
+    }
     return NULL;
 }
 
