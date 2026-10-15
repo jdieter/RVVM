@@ -543,6 +543,9 @@ override lib_base_src = $(call var_src,lib_src_$1)
 
 # Get list of libraries from target base, expects a `BIN_LIBS_$(name)` list by default
 override bin_base_libs = $(call var_src,bin_libs_$1)
+
+# Get extra link flags from target base, uses a `BIN_LDFLAGS_$(name)` list by default
+override bin_base_ldflags = $(call var_src,bin_ldflags_$1)
 override lib_base_libs = $(call var_src,lib_libs_$1)
 
 ###################################################################################################
@@ -568,6 +571,7 @@ override lib_base_libs = $(call var_src,lib_libs_$1)
 # - LIB_SRC_$(lib): List of source files to build a respective library target
 #
 # - BIN_LIBS_$(bin): List of pkg-config / project libraries to link into the respective binary target
+# - BIN_LDFLAGS_$(bin): Extra LDFLAGS for linking the respective binary target
 # - LIB_LIBS_$(lib): List of pkg-config / project libraries to link into the respective library target
 #
 # - USE_*:         Useflag, passed as -DUSE_FLAG=$(USE_FLAG) if set to non-zero value, controls build features
@@ -1037,7 +1041,7 @@ $(call path_shell,$(OBJDIR)/%.o: %.cc Makefile project.mk $(CC_TRIGGER))
 # Binaries
 $(call path_shell,$(BIN_TARGETS): $(BIN_OBJ) $(BIN_LIBS) $(CC_TRIGGER) $(LD_TRIGGER))
 	$(call println,$(TEXT)[$(GREEN)LD$(TEXT)] $@ $(RESET))
-	@$(foreach out,$(call path_wrap,$@),$(call shell_esc,$(call bin_target_ld,$(out)) $(CPPFLAGS) $(CFLAGS) $(PRE_LDFLAGS) $(call bin_target_link,$(out)) $(LDFLAGS) -o $(out)))
+	@$(foreach out,$(call path_wrap,$@),$(call shell_esc,$(call bin_target_ld,$(out)) $(CPPFLAGS) $(CFLAGS) $(PRE_LDFLAGS) $(call bin_target_link,$(out)) $(LDFLAGS) $(call bin_base_ldflags,$(call bin_base,$(out))) -o $(out)))
 
 
 

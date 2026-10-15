@@ -189,13 +189,26 @@ ifneq (,$(filter arm64 x86_64,$(ARCH)))
 override BIN_TARGETS        := $(BIN_TARGETS) rvvm_user
 override CPPFLAGS           := $(CPPFLAGS) -DRVVM_USER_TEST
 override bin_libs_rvvm_user := rvvm
+# Guest executables load at fixed low addresses, so the interpreter must be
+# position independent. Link it statically when possible: as a binfmt
+# interpreter it runs inside chroots without the host's libraries.
+override CFLAGS := $(CFLAGS) -fPIE
 ifneq (,$(filter -static -static-pie,$(LDFLAGS)))
+override USER_STATIC := 1
+else ifneq (,$(call check_compile,int main(void){return 0;},-fPIE -static-pie,static-pie))
+override USER_STATIC := 1
+override bin_ldflags_rvvm_user := -static-pie
+else
+override bin_ldflags_rvvm_user := -pie
+endif
+ifneq (,$(USER_STATIC))
 ifneq (,$(call check_compile,int main(void){_Static_assert(__GLIBC__ == 2 && __GLIBC_MINOR__ >= 34 && __GLIBC_MINOR__ <= 43$(COMMA) "glibc");return 0;},-include features.h,static-glibc-fork-34-43))
 # Keep libc's fork handlers while changing only its kernel creation step.
 # Audited through 2.43 against fork.c/_Fork.c (after 2.39, _Fork gained
-# abort()'s fork lock). Each newer glibc needs this audit first.
+# abort()'s fork lock). Each newer glibc needs this audit first. Only the
+# userland code uses it, and only a static link redirects libc's call.
 override CPPFLAGS := $(CPPFLAGS) -DRVVM_STATIC_GLIBC_FORK
-override LDFLAGS := $(LDFLAGS) -Wl$(COMMA)--wrap=_Fork
+override bin_ldflags_rvvm_user := $(bin_ldflags_rvvm_user) -Wl$(COMMA)--wrap=_Fork
 endif
 endif
 endif
