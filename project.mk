@@ -200,6 +200,9 @@ override bin_libs_rvvm_user := rvvm
 override CFLAGS := $(CFLAGS) -fPIE
 ifneq (,$(filter -static -static-pie,$(LDFLAGS)))
 override USER_STATIC := 1
+else ifneq (,$(filter -pie,$(LDFLAGS)))
+# An explicit dynamic PIE link.
+override bin_ldflags_rvvm_user := -pie
 else ifneq (,$(call check_compile,int main(void){return 0;},-fPIE -static-pie,static-pie))
 override USER_STATIC := 1
 override bin_ldflags_rvvm_user := -static-pie
