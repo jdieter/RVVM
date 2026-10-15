@@ -22,6 +22,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include <stdio.h>
 #if defined(__linux__) && defined(RVVM_USER_TEST)
 #include <sys/resource.h>
+#include <unistd.h>
 #endif
 
 #if defined(RVJIT_ARM64) && defined(__APPLE__) && __ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__ >= 110000
@@ -428,10 +429,20 @@ static void rvjit_linker_cleanup(rvjit_block_t* block)
 void rvjit_ctx_free(rvjit_block_t* block)
 {
     if (block->reuse_stats) {
-        fprintf(stderr, "JIT entry reuse: candidates=%llu links=%llu loads=%llu\n",
-                (unsigned long long)block->reuse_candidates,
-                (unsigned long long)block->reuse_links,
-                (unsigned long long)block->reuse_loads);
+        char line[128];
+        int  len = snprintf(line, sizeof(line), "JIT entry reuse: candidates=%llu links=%llu loads=%llu\n",
+                            (unsigned long long)block->reuse_candidates,
+                            (unsigned long long)block->reuse_links,
+                            (unsigned long long)block->reuse_loads);
+        if (len > 0) {
+            size_t size = (size_t)len < sizeof(line) ? (size_t)len : sizeof(line) - 1;
+#if defined(__linux__) && defined(RVVM_USER_TEST)
+            // Any userland thread may free its context: no stdio (rvvm_user_fork.h)
+            UNUSED(!write(STDERR_FILENO, line, size));
+#else
+            fwrite(line, 1, size, stderr);
+#endif
+        }
     }
     vma_free(block->heap.data, block->heap.size);
     if (block->heap.code != block->heap.data) {

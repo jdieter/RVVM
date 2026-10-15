@@ -2008,21 +2008,24 @@ static void* rvvm_user_thread_wrap(void* arg)
 
             if (proc_mem_readable((void*)pc_al, 32)) {
                 rvvm_warn("Instruction bytes around PC:");
+                /* Direct writes, as everywhere after startup: see the libc
+                 * rule in rvvm_user_fork.h. */
+                char line[2 * 32 + 2];
                 for (size_t i=0; i<32; ++i) {
-                    printf("%02x", *(uint8_t*)(pc_al + i));
+                    snprintf(line + 2 * i, 3, "%02x", *(uint8_t*)(pc_al + i));
                 }
-                printf("\n");
+                line[64] = '\n';
+                (void)!write(STDOUT_FILENO, line, 65);
                 for (size_t i=0; i<32; ++i) {
-                    printf("%s", (pc_al + i == pc) ? "^ " : "  ");
+                    memcpy(line + 2 * i, (pc_al + i == pc) ? "^ " : "  ", 2);
                 }
-                printf("\n");
+                (void)!write(STDOUT_FILENO, line, 65);
             } else {
                 rvvm_warn(" * * * PC points to inaccessible memory!");
             }
 
             /* A fault in any guest thread must fail the process, not return
              * through jump_start() and report a successful command. */
-            fflush(stdout);
             _Exit(EXIT_FAILURE);
         }
     }
