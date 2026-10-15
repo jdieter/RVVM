@@ -249,6 +249,17 @@ static void user_exec_partial(uintptr_t start, size_t size, int host_prot, bool 
     if (changed > start) user_exec_update(start, changed - start, executable);
 }
 
+/* Guest-executable memory keeps host EXEC too (see rvvm_sys_prot), so the
+ * kernel maps record execute intent for mapping recovery. A noexec mount or
+ * security policy may refuse it; guest execution needs only READ. */
+static int user_exec_protect(void* addr, size_t size, int prot, bool executable)
+{
+#ifdef USER_NATIVE_VFORK_POC
+    if (executable && !mprotect(addr, size, prot | PROT_READ | PROT_EXEC)) return 0;
+#endif
+    return mprotect(addr, size, executable ? prot | PROT_READ : prot);
+}
+
 static void user_exec_elf(const elf_desc_t* elf)
 {
     if (!elf->base || !elf->phdr_data) return;
@@ -263,12 +274,14 @@ static void user_exec_elf(const elf_desc_t* elf)
         user_exec_update(addr, size, flags & 1);
         uintptr_t start = addr & ~(uintptr_t)4095;
         int prot = (flags & 4 ? PROT_READ : 0) | (flags & 2 ? PROT_WRITE : 0) | (flags & 1 ? PROT_READ : 0);
-        if (mprotect((void*)start, (addr + size + 4095 - start) & ~(size_t)4095, prot)) abort();
+        if (user_exec_protect((void*)start, (addr + size + 4095 - start) & ~(size_t)4095, prot, flags & 1))
+            abort();
     }
 }
 
 static void user_exec_trampoline(void* addr)
 {
+    user_exec_protect(addr, 4096, PROT_READ, true);
     spin_lock(&mmap_lock);
     user_exec_update((uintptr_t)addr, 4096, true);
     spin_unlock(&mmap_lock);

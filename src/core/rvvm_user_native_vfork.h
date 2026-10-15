@@ -74,6 +74,7 @@ struct user_native_vfork {
     uint32_t* clone_marker;
     uint32_t service_state, service_stop;
     uint32_t operation, helper_pid, helper_alive, helper_state, helper_ready;
+    bool helper_lost;
     long mapping_nr, mapping_args[6], mapping_result;
     long kernel_nr, kernel_args[6], kernel_result;
     char helper_stack[65536] __attribute__((aligned(16)));
@@ -219,21 +220,102 @@ static __attribute__((no_stack_protector)) int user_native_mapping_helper(void* 
     }
 }
 
+/* Fd-free kernel queries for recovery paths that may not hold the fd guard:
+ * mincore fails with ENOMEM where any page of its range is unmapped. */
+static bool user_native_range_mapped(uintptr_t start, size_t size)
+{
+    unsigned char pages[256];
+    size_t page = user_vma_page(), chunk = sizeof(pages) * page;
+    for (; size; start += chunk, size -= chunk) {
+        if (chunk > size) chunk = size;
+        if (user_native_internal(SYS_mincore, start, chunk, (long)pages, 0, 0, 0) < 0) return false;
+    }
+    return true;
+}
+
+static bool user_native_range_unmapped(uintptr_t start, size_t size)
+{
+    unsigned char pages[256];
+    size_t page = user_vma_page(), chunk = sizeof(pages) * page;
+    for (; size; start += chunk, size -= chunk) {
+        if (chunk > size) chunk = size;
+        if (!user_native_internal(SYS_mincore, start, chunk, (long)pages, 0, 0, 0)) return false;
+        for (size_t at = 0; at < chunk; at += page)
+            if (user_native_internal(SYS_mincore, start + at, page, (long)pages, 0, 0, 0) != -ENOMEM)
+                return false;
+    }
+    return true;
+}
+
+/* A killed helper either never started its operation or completed it:
+ * Linux takes mmap_lock killably, then finishes mmap, munmap, mremap and
+ * mprotect without checking fatal signals. Only the result is lost. Report
+ * the outcome the kernel mappings prove, or an error when they don't, so
+ * the caller's bookkeeping matches the kernel. Nothing is replayed. */
+static long user_native_mapping_outcome(long nr, const long* a)
+{
+    size_t page = user_vma_page();
+    uintptr_t addr = a[0];
+    switch (nr) {
+        case SYS_munmap: {
+            size_t span = ((size_t)a[1] + page - 1) & ~(page - 1);
+            return span && user_native_range_unmapped(addr, span) ? 0 : -EINTR;
+        }
+        case SYS_mmap: {
+            size_t map_page = user_vma_map_page(a[3]);
+            size_t span = ((size_t)a[1] + map_page - 1) & ~(map_page - 1);
+            /* NOREPLACE found the range free, so any mapping there is ours.
+             * A replaced range is ours only with exactly the requested
+             * protection; an identical pre-existing one gets the same
+             * metadata either way, since host EXEC mirrors guest EXEC. */
+            if ((a[3] & MAP_FIXED_NOREPLACE) && user_native_range_mapped(addr, span)) return addr;
+            if ((a[3] & MAP_FIXED) && user_vma_kernel_prot(addr, addr + span, a[2]) == 1) return addr;
+            /* An unknown kernel-chosen address may remain mapped, as after a
+             * native child killed in mmap; no caller learned its address. */
+            return -EINTR;
+        }
+        case SYS_mremap: {
+            size_t old_size = a[1], new_size = a[2];
+            if (a[3] & MREMAP_FIXED) {
+                /* The source was mapped, or the move would have failed. */
+                if (old_size && !(a[3] & MREMAP_DONTUNMAP) && user_native_range_unmapped(addr, old_size))
+                    return a[4];
+                return -EINTR;
+            }
+            if (a[3] & MREMAP_MAYMOVE) return -EINTR;
+            if (new_size > old_size)
+                return user_native_range_mapped(addr + old_size, new_size - old_size) ? (long)addr : -EINTR;
+            if (new_size < old_size)
+                return user_native_range_unmapped(addr + new_size, old_size - new_size) ? (long)addr : -EINTR;
+            return addr;
+        }
+        default:
+            /* mprotect callers reconcile a failed change from kernel maps. */
+            return -EINTR;
+    }
+}
+
 static long user_native_mapping_kernel(long nr, long a, long b, long c, long d, long e, long f)
 {
     struct user_native_vfork* request = user_native_mapping_request;
+    if (request->helper_lost) {
+        /* Releasing memory needs neither the child's credentials nor its
+         * files: let callers drop transient reservations. */
+        return nr == SYS_munmap ? user_native_internal(nr, a, b, c, d, e, f) : -EINTR;
+    }
     request->kernel_nr = nr;
     long args[] = {a, b, c, d, e, f};
     memcpy(request->kernel_args, args, sizeof(args));
     atomic_store_uint32(&request->helper_state, 1);
     rvvm_futex_wake(&request->helper_state, 1);
     while (atomic_load_uint32(&request->helper_state) != 2) {
-        /* A killed helper may have committed the mutation before publication.
-         * There is no safe replay of MAP_FIXED. Match the old fail-closed
-         * transaction policy rather than continuing with unknown metadata. */
         if (!atomic_load_uint32(&request->helper_alive)) {
+            /* Contain the loss to the child, as if SIGKILL had arrived
+             * during its syscall; it never observes the lost result. The
+             * parent keeps running with metadata matching the kernel. */
+            request->helper_lost = true;
             syscall(SYS_kill, request->child_owner.tid, SIGKILL);
-            syscall(SYS_exit_group, 127);
+            return user_native_mapping_outcome(nr, args);
         }
         rvvm_futex_wait(&request->helper_state, 1, 10000000);
     }
@@ -472,6 +554,7 @@ static long user_native_mapping(struct user_native_vfork* request, long nr, long
     atomic_store_uint32(&request->helper_alive, UINT32_MAX);
     atomic_store_uint32(&request->helper_state, 0);
     atomic_store_uint32(&request->helper_ready, 0);
+    request->helper_lost = false;
     request->operation = 5;
     atomic_store_uint32(&request->service_state, 1);
     user_native_internal(SYS_futex, (long)&request->service_state, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0);
@@ -493,10 +576,15 @@ static long user_native_mapping(struct user_native_vfork* request, long nr, long
     }
     while (!atomic_load_uint32(&request->helper_ready)) {
         if (!atomic_load_uint32(&request->helper_alive)) {
-            user_native_internal(SYS_rt_sigprocmask, SIG_SETMASK, (long)&saved_mask, 0, 8, 0, 0);
+            /* Killed before it could run anything. Contain it like a later
+             * loss rather than return an errno this call never produces. */
+            atomic_store_uint32(&request->service_state, 0);
             int status;
             user_native_internal(SYS_wait4, pid, (long)&status, __WALL, 0, 0, 0);
-            return -EIO;
+            user_native_internal(SYS_kill, user_native_internal(SYS_getpid, 0, 0, 0, 0, 0, 0),
+                                 SIGKILL, 0, 0, 0, 0);
+            user_native_internal(SYS_rt_sigprocmask, SIG_SETMASK, (long)&saved_mask, 0, 8, 0, 0);
+            return -EINTR;
         }
         struct timespec timeout = {.tv_nsec = 10000000};
         user_native_internal(SYS_futex, (long)&request->helper_ready, FUTEX_WAIT_PRIVATE, 0, (long)&timeout, 0, 0);

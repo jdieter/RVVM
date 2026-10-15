@@ -2391,6 +2391,7 @@ RVVM_PUBLIC int rvvm_user_linux(int argc, char** argv, char** envp)
         return -1;
     }
 #ifdef USER_FAULT_META
+    if (user_exec_stack(&elf)) user_exec_protect(stack_buffer, STACK_SIZE, PROT_READ | PROT_WRITE, true);
     user_exec_update((uintptr_t)stack_buffer, STACK_SIZE, user_exec_stack(&elf));
 #endif
     free(elf.phdr_data);

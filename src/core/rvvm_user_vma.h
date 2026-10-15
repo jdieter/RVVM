@@ -273,6 +273,51 @@ static int user_vma_protect_span(uintptr_t* addr, size_t* size, int prot)
     return -1;
 }
 
+/* Callers hold the fd guard. Returns 1 when [start, end) is entirely mapped
+ * with exactly the read/write/execute bits of prot, 0 when it is not, and
+ * -1 when the kernel maps cannot be read. */
+static int user_vma_kernel_prot(uintptr_t start, uintptr_t end, int prot)
+{
+    int fd = open("/proc/thread-self/maps", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    prot &= PROT_READ | PROT_WRITE | PROT_EXEC;
+    char buffer[4096], line[128];
+    size_t used = 0;
+    uintptr_t covered = start;
+    int result = 0;
+    ssize_t count;
+    while (!result && covered < end && (count = read(fd, buffer, sizeof(buffer))) != 0) {
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            result = -1;
+            break;
+        }
+        for (ssize_t i = 0; i < count && !result && covered < end; ++i) {
+            if (buffer[i] != '\n') {
+                if (used < sizeof(line) - 1) line[used++] = buffer[i];
+                continue;
+            }
+            line[used] = 0;
+            used = 0;
+            char* delimiter;
+            uintptr_t first = strtoull(line, &delimiter, 16);
+            if (*delimiter != '-') continue;
+            uintptr_t last = strtoull(delimiter + 1, &delimiter, 16);
+            if (last <= covered) continue;
+            if (first > covered || delimiter[0] != ' ' || !delimiter[1] || !delimiter[2] || !delimiter[3]
+                || ((delimiter[1] == 'r' ? PROT_READ : 0) | (delimiter[2] == 'w' ? PROT_WRITE : 0)
+                    | (delimiter[3] == 'x' ? PROT_EXEC : 0)) != prot) {
+                result = 2;
+                break;
+            }
+            covered = last;
+        }
+    }
+    close(fd);
+    if (result < 0) return -1;
+    return result == 0 && covered >= end;
+}
+
 /* Callers hold the fd guard before their mapping/brk locks. The slow path
  * inspects host VMAs too: never use MAP_FIXED to claim an unowned hole. */
 static uintptr_t user_vma_gap(size_t span, uintptr_t low, uintptr_t high)
