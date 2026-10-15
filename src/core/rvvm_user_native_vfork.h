@@ -184,6 +184,7 @@ static int user_native_cow_child(void* opaque)
     user_fd_table_fork_child();
     user_reap_threads = NULL;
     user_reaper_running = false;
+    user_reaper_thread = NULL;
     user_thread_lifetime = 1;
     user_reaper_tid = 0;
     rvvm_user_fork_child(request->cpu);

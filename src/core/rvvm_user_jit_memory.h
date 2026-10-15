@@ -3,7 +3,7 @@
 #define RVVM_USER_JIT_MEMORY_H
 
 #if defined(__linux__) && defined(USE_JIT)
-#include <pthread.h>
+#include "threading.h"
 
 static void* user_jit_probe_worker(void* opaque)
 {
@@ -44,20 +44,16 @@ static uint64_t user_jit_memory_probe(void)
         return atomic_load_uint64(&last_size);
     int saved_errno = errno;
     uint64_t size = 0;
-    pthread_attr_t attr;
-    pthread_t helper;
-    if (!pthread_attr_init(&attr)) {
-        pthread_attr_setstacksize(&attr, 256 * 1024);
-        /* Keep copied descriptors from outliving a guest close while the
-         * helper separates its table. The caller has blocked all signals. */
-        user_fd_lock();
-        if (!pthread_create(&helper, &attr, user_jit_probe_worker, &size)) {
-            pthread_join(helper, NULL);
-            user_private_signals_restore();
-        }
-        user_fd_unlock();
-        pthread_attr_destroy(&attr);
+    /* Keep copied descriptors from outliving a guest close while the
+     * helper separates its table. The caller has blocked all signals.
+     * rvvm_thread_* keeps the helper's lifecycle out of raw forks. */
+    user_fd_lock();
+    rvvm_thread_t* helper = rvvm_thread_create_ex(user_jit_probe_worker, &size, 256 * 1024);
+    if (helper) {
+        rvvm_thread_join(helper);
+        user_private_signals_restore();
     }
+    user_fd_unlock();
     atomic_store_uint64(&last_size, size);
     errno = saved_errno;
     /* Missing procfs, seccomp, NOFILE=0 or exhausted thread capacity disable

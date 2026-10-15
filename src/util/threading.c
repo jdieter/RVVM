@@ -158,13 +158,67 @@ struct rvvm_thread_ctx {
 #if defined(WIN32_THREADS_IMPL)
     HANDLE handle;
 #elif defined(POSIX_THREADS_IMPL)
-    pthread_t pthread;
+    pthread_t          pthread;
+    rvvm_thread_func_t func;
+    void*              arg;
+    uint32_t           state;
 #elif defined(C11_THREADS_IMPL)
     thrd_t thrd;
 #elif defined(SDL_THREADS_IMPL)
     SDL_Thread* thread;
 #endif
 };
+
+#if defined(POSIX_THREADS_IMPL)
+
+#define THREAD_STATE_RETURNED 1 // The thread function has returned
+#define THREAD_STATE_DETACHED 2 // Nobody joins, the thread frees its context
+
+/*
+ * Creating, joining or detaching a thread, and a detached thread's exit, update
+ * libc's thread list and stack cache under libc locks. A fork made with a raw
+ * clone runs no libc recovery, so one taken during such an update would copy
+ * those locks held forever. Every update except a detached thread's exit runs
+ * under this lock as a reader; rvvm_thread_fork_lock() takes it as a writer
+ */
+static rvvm_lock_t thread_lifecycle_lock = RVVM_LOCK_INIT;
+
+static void* thread_trampoline(void* arg)
+{
+    rvvm_thread_t* thread = arg;
+    void*          ret    = thread->func(thread->arg);
+    // Publish the return for joiners; past this point only libc touches the thread
+    uint32_t       state  = atomic_or_uint32(&thread->state, THREAD_STATE_RETURNED);
+    if (state & THREAD_STATE_DETACHED) {
+        free(thread);
+    } else {
+        rvvm_futex_wake(&thread->state, -1);
+    }
+    return ret;
+}
+
+#endif
+
+void rvvm_thread_fork_lock(void)
+{
+#if defined(POSIX_THREADS_IMPL)
+    rvvm_lock(&thread_lifecycle_lock);
+#endif
+}
+
+void rvvm_thread_fork_unlock(void)
+{
+#if defined(POSIX_THREADS_IMPL)
+    rvvm_unlock(&thread_lifecycle_lock);
+#endif
+}
+
+void rvvm_thread_fork_child(void)
+{
+#if defined(POSIX_THREADS_IMPL)
+    rvvm_lock_init(&thread_lifecycle_lock);
+#endif
+}
 
 #if defined(WIN32_THREADS_IMPL)
 #define THREAD_RET DWORD
@@ -222,7 +276,11 @@ rvvm_thread_t* rvvm_thread_create_ex(rvvm_thread_func_t func, void* arg, uint32_
         // Pass custom stack size if possible
         aptr = &attr;
     }
-    result = !pthread_create(&thread->pthread, aptr, func, arg);
+    thread->func = func;
+    thread->arg  = arg;
+    rvvm_read_lock(&thread_lifecycle_lock);
+    result = !pthread_create(&thread->pthread, aptr, thread_trampoline, thread);
+    rvvm_read_unlock(&thread_lifecycle_lock);
     if (aptr) {
         pthread_attr_destroy(aptr);
     }
@@ -260,8 +318,15 @@ void rvvm_thread_join(rvvm_thread_t* thread)
 #if defined(WIN32_THREADS_IMPL)
         result = !WaitForSingleObject(thread->handle, INFINITE) && CloseHandle(thread->handle);
 #elif defined(POSIX_THREADS_IMPL)
-        void* tmp = NULL;
-        result    = !pthread_join(thread->pthread, &tmp);
+        void*    tmp = NULL;
+        uint32_t state;
+        // Wait without the lock: only the final teardown needs exclusion
+        while (!((state = atomic_load_uint32(&thread->state)) & THREAD_STATE_RETURNED)) {
+            rvvm_futex_wait(&thread->state, state, RVVM_FUTEX_INFINITE);
+        }
+        rvvm_read_lock(&thread_lifecycle_lock);
+        result = !pthread_join(thread->pthread, &tmp);
+        rvvm_read_unlock(&thread_lifecycle_lock);
 #elif defined(C11_THREADS_IMPL)
         int tmp = 0;
         result  = thrd_join(thread->thrd, &tmp) == thrd_success;
@@ -280,9 +345,14 @@ void rvvm_thread_join(rvvm_thread_t* thread)
 bool rvvm_thread_try_join(rvvm_thread_t* thread)
 {
 #if defined(POSIX_THREADS_IMPL) && defined(__linux__)
-    if (thread && !pthread_tryjoin_np(thread->pthread, NULL)) {
-        safe_free(thread);
-        return true;
+    if (thread && (atomic_load_uint32(&thread->state) & THREAD_STATE_RETURNED)) {
+        rvvm_read_lock(&thread_lifecycle_lock);
+        bool joined = !pthread_tryjoin_np(thread->pthread, NULL);
+        rvvm_read_unlock(&thread_lifecycle_lock);
+        if (joined) {
+            safe_free(thread);
+            return true;
+        }
     }
 #else
     UNUSED(thread);
@@ -296,7 +366,13 @@ void rvvm_thread_detach(rvvm_thread_t* thread)
 #if defined(WIN32_THREADS_IMPL)
         CloseHandle(thread->handle);
 #elif defined(POSIX_THREADS_IMPL)
+        rvvm_read_lock(&thread_lifecycle_lock);
         pthread_detach(thread->pthread);
+        rvvm_read_unlock(&thread_lifecycle_lock);
+        // A running thread frees its own context once its function returns
+        if (!(atomic_or_uint32(&thread->state, THREAD_STATE_DETACHED) & THREAD_STATE_RETURNED)) {
+            return;
+        }
 #elif defined(C11_THREADS_IMPL)
         thrd_detach(thread->thrd);
 #elif defined(SDL_THREADS_IMPL) && SDL_THREADS_IMPL == 2

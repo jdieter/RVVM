@@ -811,6 +811,9 @@ static spinlock_t brk_lock = {0};
 static spinlock_t mmap_lock = {0};
 static rvvm_user_thread_t* user_reap_threads;
 static bool user_reaper_running;
+/* Joined before its replacement starts, never detached: a detached thread's
+ * exit updates libc state outside rvvm_thread_fork_lock(). */
+static rvvm_thread_t* user_reaper_thread;
 /* Publish the last guest exit status together with the live count. The
  * internal reaper must not turn a nonzero last-thread exit into success. */
 static uint64_t user_thread_lifetime = 1;
@@ -961,15 +964,16 @@ static int rvvm_sys_clone_impl(rvvm_user_thread_t* current, uint32_t flags, size
         if (separate) user_fd_lock();
         user_fd_mutex_lock(&user_reaper_lock);
         if (!user_reaper_running) {
-            rvvm_thread_t* reaper = rvvm_thread_create(user_thread_reaper, NULL);
-            if (!reaper) {
+            /* A previous reaper has stopped serving and is returning. */
+            if (user_reaper_thread) rvvm_thread_join(user_reaper_thread);
+            user_reaper_thread = rvvm_thread_create(user_thread_reaper, NULL);
+            if (!user_reaper_thread) {
                 user_fd_mutex_unlock(&user_reaper_lock);
                 if (separate) user_fd_unlock();
                 syscall(SYS_rt_sigprocmask, SIG_SETMASK, &saved_mask, NULL, 8);
                 return -EAGAIN;
             }
             user_reaper_running = true;
-            thread_detach(reaper);
             while (!atomic_load_uint32(&user_reaper_tid))
                 rvvm_futex_wait(&user_reaper_tid, 0, RVVM_FUTEX_INFINITE);
         }
@@ -1110,6 +1114,7 @@ static int rvvm_sys_clone_impl(rvvm_user_thread_t* current, uint32_t flags, size
              * not survive host fork. The survivor is now a process thread. */
             user_reap_threads = NULL;
             user_reaper_running = false;
+            user_reaper_thread = NULL;
             user_thread_lifetime = 1;
             user_reaper_tid = 0;
             child_fd_depth = user_fd_fork_select(child_table->guard);

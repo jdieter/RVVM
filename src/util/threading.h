@@ -30,6 +30,15 @@ bool           rvvm_thread_try_join(rvvm_thread_t* thread);
 void           rvvm_thread_detach(rvvm_thread_t* thread);
 
 /*
+ * Exclude libc thread creation, joins and detaches across a fork made with a
+ * raw clone of the calling thread. The child resets the lock. A detached
+ * thread's own exit is not excluded: raw forks need every thread joined
+ */
+void rvvm_thread_fork_lock(void);
+void rvvm_thread_fork_unlock(void);
+void rvvm_thread_fork_child(void);
+
+/*
  * Yielding, CPU relax hints
  */
 
