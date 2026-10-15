@@ -93,6 +93,17 @@ static long user_waitid(long a[6])
     return ret;
 }
 
+#ifdef USER_NATIVE_VFORK_POC
+/* Provision the observer before this process lowers its own NOFILE limit. */
+static void user_observer_limit(pid_t pid, long resource, void* limit)
+{
+    struct rlimit next;
+    if (resource != RLIMIT_NOFILE || !limit || (pid && pid != getpid())
+        || uapi_extra_copy(&next, limit, sizeof(next), false)) return;
+    user_observer_provision(next.rlim_cur, next.rlim_max);
+}
+#endif
+
 static bool user_kernel_dispatch(rvvm_hart_t* cpu, long nr, long a[6], long* result)
 {
     long host;
@@ -264,7 +275,11 @@ static bool user_kernel_dispatch(rvvm_hart_t* cpu, long nr, long a[6], long* res
             if (fake_root) { *result = fake_gid; return true; }
             host = nr == 176 ? SYS_getgid : SYS_getegid; break;
         case 163: *result = (long)errno_ret(USER_SYSCALL(SYS_prlimit64, 0, a[0], 0, a[1], 0, 0)); return true;
-        case 164: *result = (long)errno_ret(USER_SYSCALL(SYS_prlimit64, 0, a[0], a[1], 0, 0, 0)); return true;
+        case 164:
+#ifdef USER_NATIVE_VFORK_POC
+            user_observer_limit(0, a[0], (void*)a[1]);
+#endif
+            *result = (long)errno_ret(USER_SYSCALL(SYS_prlimit64, 0, a[0], a[1], 0, 0, 0)); return true;
         case 167: *result = uapi_extra_prctl(a[0], a[1], a[2], a[3], a[4]); return true;
         case 272: case 438: *result = -ENOSYS; return true;
         case 5: host = SYS_setxattr; break;
@@ -392,7 +407,11 @@ static bool user_kernel_dispatch(rvvm_hart_t* cpu, long nr, long a[6], long* res
         case 218: host = SYS_request_key; break;
         case 223: host = SYS_fadvise64; break;
         case 227: host = SYS_msync; break;
-        case 261: host = SYS_prlimit64; break;
+        case 261:
+#ifdef USER_NATIVE_VFORK_POC
+            user_observer_limit(a[0], a[1], (void*)a[2]);
+#endif
+            host = SYS_prlimit64; break;
         case 266: host = SYS_clock_adjtime; break;
         case 267: host = SYS_syncfs; break;
         case 276: host = SYS_renameat2; break;

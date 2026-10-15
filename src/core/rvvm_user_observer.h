@@ -526,6 +526,19 @@ static void user_observer_release(bool wait)
     user_fd_mutex_unlock(&user_observer_init_lock);
 }
 
+/* The observer copies its limits and files once, when created. A process
+ * about to lower NOFILE so far that none could be created gets one first:
+ * otherwise a later mixed-TID VFORK would fail with EMFILE, though Linux
+ * itself needs no descriptor. A shared-mm child must not touch the record:
+ * it belongs to its parent, and creation would replace it. */
+static void user_observer_provision(uint64_t soft, uint64_t hard)
+{
+    if (user_native_child_active || (soft >= 16 && hard >= 16)) return;
+    int saved = errno;
+    user_observer_get();
+    errno = saved;
+}
+
 static long user_observer_call(struct user_observer* observer, int operation)
 {
     observer->operation = operation;
