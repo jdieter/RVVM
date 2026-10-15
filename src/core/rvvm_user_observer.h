@@ -234,15 +234,58 @@ static __attribute__((no_stack_protector)) int user_observer_main(void* opaque)
     return 0;
 }
 
-static void user_observer_join(struct user_observer* observer)
+/* The observer is not the guest's child: a raw intermediate creates it and
+ * exits, so it reparents to the nearest subreaper or init. Guest __WALL and
+ * __WCLONE waits therefore neither block on it nor lose ECHILD. Until one
+ * party reaps the exiting intermediate, guest waits hide its PID. */
+static uint32_t user_observer_transient;
+
+static __attribute__((no_stack_protector)) int user_observer_spawn(void* opaque)
+{
+    struct user_observer* observer = opaque;
+    struct {
+        uint64_t flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls;
+    } args = {
+        .flags = CLONE_VM | CLONE_PARENT_SETTID | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID,
+        .parent_tid = (uintptr_t)&observer->pid,
+        .child_tid = (uintptr_t)&observer->alive,
+        .stack = (uintptr_t)observer->stack,
+        .stack_size = 1024 * 1024 - 2 * sizeof(uintptr_t),
+    };
+    long ret = user_native_clone3(&args, sizeof(args));
+    if (ret < 0) {
+        observer->result = ret;
+        atomic_store_uint32(&observer->alive, 0);
+    }
+    return 0;
+}
+
+/* Returns true when a guest wait result names the intermediate. A reaping
+ * waiter consumes the record: the kernel gives that PID to one reaper only. */
+static bool user_observer_hidden(pid_t pid, bool reaped)
+{
+    if (pid <= 0) return false;
+    uint32_t transient = atomic_load_uint32(&user_observer_transient);
+    if ((uint32_t)pid != transient) return false;
+    if (reaped) atomic_cas_uint32(&user_observer_transient, transient, 0);
+    else sched_yield();
+    return true;
+}
+
+static void user_observer_stop(struct user_observer* observer)
 {
     atomic_store_uint32(&observer->state, 3);
     rvvm_futex_wake(&observer->state, 1);
     while (atomic_load_uint32(&observer->alive))
         rvvm_futex_wait(&observer->alive, atomic_load_uint32(&observer->alive), 10000000);
-    int status;
-    syscall(SYS_wait4, observer->pid, &status, __WALL, NULL);
+    /* CHILD_CLEARTID runs after the observer's last user stack access. */
     munmap(observer->stack, 1024 * 1024);
+    observer->stack = NULL;
+}
+
+static void user_observer_join(struct user_observer* observer)
+{
+    user_observer_stop(observer);
     free(observer);
 }
 
@@ -257,6 +300,7 @@ static void user_observer_fork_child(void)
     }
     user_observer = NULL;
     user_native_requests = NULL;
+    user_observer_transient = 0;
     user_observer_init_lock = (user_fd_mutex_t){0};
 }
 
@@ -272,6 +316,12 @@ static struct user_observer* user_observer_get(void)
         user_observer = NULL;
         user_native_requests = NULL;
     }
+    if (user_observer && !atomic_load_uint32(&user_observer->alive)) {
+        /* Stopped before a failed exec, or died. A racing caller may still
+         * hold the old record; it fails with EIO instead of a dangling use. */
+        if (user_observer->stack) user_observer_stop(user_observer);
+        user_observer = NULL;
+    }
     if (!user_observer) {
         struct user_observer* observer = calloc(1, sizeof(*observer));
         if (!observer) { user_fd_mutex_unlock(&user_observer_init_lock); return NULL; }
@@ -279,26 +329,57 @@ static struct user_observer* user_observer_get(void)
         observer->children = observer->cookie = -1;
         observer->owner = owner;
         observer->marker_size = user_vma_page();
+        const size_t spawn_size = 65536;
         observer->stack = mmap(NULL, 1024 * 1024, PROT_READ | PROT_WRITE,
                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (observer->stack == MAP_FAILED) {
-            free(observer); user_fd_mutex_unlock(&user_observer_init_lock); return NULL;
+        void* spawn_stack = mmap(NULL, spawn_size, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (observer->stack == MAP_FAILED || spawn_stack == MAP_FAILED) {
+            int error = errno;
+            if (observer->stack != MAP_FAILED) munmap(observer->stack, 1024 * 1024);
+            if (spawn_stack != MAP_FAILED) munmap(spawn_stack, spawn_size);
+            free(observer); user_fd_mutex_unlock(&user_observer_init_lock); errno = error; return NULL;
         }
         uintptr_t* packet = (void*)((char*)observer->stack + 1024 * 1024 - 2 * sizeof(uintptr_t));
         packet[0] = (uintptr_t)user_observer_main;
+        packet[1] = (uintptr_t)observer;
+        packet = (void*)((char*)spawn_stack + spawn_size - 2 * sizeof(uintptr_t));
+        packet[0] = (uintptr_t)user_observer_spawn;
         packet[1] = (uintptr_t)observer;
         observer->alive = UINT32_MAX;
         struct {
             uint64_t flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls;
         } args = {
-            .flags = CLONE_VM | CLONE_PARENT_SETTID | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID,
-            .parent_tid = (uintptr_t)&observer->pid,
-            .child_tid = (uintptr_t)&observer->alive,
-            .stack = (uintptr_t)observer->stack,
-            .stack_size = 1024 * 1024 - 2 * sizeof(uintptr_t),
+            /* Shared files avoid a second table copy; the intermediate
+             * opens nothing, and the observer copies then closes them all. */
+            .flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_PARENT_SETTID,
+            .parent_tid = (uintptr_t)&user_observer_transient,
+            .stack = (uintptr_t)spawn_stack,
+            .stack_size = spawn_size - 2 * sizeof(uintptr_t),
         };
-        long ret = user_native_clone3(&args, sizeof(args));
-        if (ret < 0) {
+        /* Neither new process may run a guest or emulator signal handler on
+         * the borrowed TLS before the observer blocks every signal. */
+        uint64_t all = UINT64_MAX, saved_mask;
+        syscall(SYS_rt_sigprocmask, SIG_SETMASK, &all, &saved_mask, 8);
+        /* An init or subreaper guest would adopt the orphan as an ordinary
+         * SIGCHLD child. A direct exit_signal-0 child is visible only to its
+         * __WALL/__WCLONE waits: keep that remaining gap instead. */
+        int subreaper = 0;
+        long ret = getpid() == 1 || (!prctl(PR_GET_CHILD_SUBREAPER, &subreaper) && subreaper)
+            ? user_observer_spawn(observer) : user_native_clone3(&args, sizeof(args));
+        if (ret > 0) {
+            long reaped;
+            int status;
+            do reaped = user_native_internal(SYS_wait4, ret, (long)&status, __WALL, 0, 0, 0);
+            while (reaped == -EINTR);
+            /* A racing guest __WALL waiter may have reaped it and cleared
+             * the record already; otherwise this reaper owns that duty. */
+            if (reaped == ret) atomic_cas_uint32(&user_observer_transient, ret, 0);
+        }
+        syscall(SYS_rt_sigprocmask, SIG_SETMASK, &saved_mask, NULL, 8);
+        munmap(spawn_stack, spawn_size);
+        if (ret < 0 || (observer->result < 0 && !observer->pid)) {
+            if (ret >= 0) ret = observer->result;
             munmap(observer->stack, 1024 * 1024); free(observer);
             user_fd_mutex_unlock(&user_observer_init_lock); errno = -ret; return NULL;
         }
@@ -315,6 +396,23 @@ static struct user_observer* user_observer_get(void)
     struct user_observer* result = user_observer;
     user_fd_mutex_unlock(&user_observer_init_lock);
     return result;
+}
+
+/* Exec replaces this mm while the observer would keep the old one alive;
+ * exit should not leave it running until its next owner pidfd poll. Stop it
+ * only while idle: a worker may hold it indefinitely for a stopped child,
+ * and exec/exit must not wait for that. A busy observer still exits once the
+ * owner pidfd reports the last thread's exit. */
+static void user_observer_release(bool wait)
+{
+    user_fd_mutex_lock(&user_observer_init_lock);
+    struct user_observer* observer = user_observer;
+    if (observer && observer->owner == getpid() && atomic_cas_uint32(&observer->state, 0, 3)) {
+        rvvm_futex_wake(&observer->state, 1);
+        while (wait && atomic_load_uint32(&observer->alive))
+            rvvm_futex_wait(&observer->alive, atomic_load_uint32(&observer->alive), 10000000);
+    }
+    user_fd_mutex_unlock(&user_observer_init_lock);
 }
 
 static long user_observer_call(struct user_observer* observer, int operation)

@@ -534,6 +534,8 @@ static uint32_t user_reaper_tid;
 static user_fd_mutex_t user_reaper_lock;
 #ifdef USER_NATIVE_VFORK_POC
 static void user_observer_fork_child(void);
+static void user_observer_release(bool wait);
+static bool user_observer_hidden(pid_t pid, bool reaped);
 #endif
 #include "rvvm_user_signal.h"
 #include "rvvm_user_jit_memory.h"
@@ -1659,6 +1661,9 @@ static void* rvvm_user_thread_wrap(void* arg)
                     a0 = user_fd_unshare(a0);
                     break;
                 case 281: // execveat: the kernel handles ELF/script dispatch through binfmt
+#ifdef USER_NATIVE_VFORK_POC
+                    user_observer_release(true);
+#endif
                     a0 = user_binfmt_executable || getenv("RVVM_USER_BINFMT")
                        ? user_execveat(a0, to_str(a1), to_ptr(a2), to_ptr(a3),
                            uapi_translate_flags(a4, uapi_path_flags, STATIC_ARRAY_SIZE(uapi_path_flags), true))
@@ -1722,6 +1727,9 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 case 94: // exit_group
                     user_ptrace_exit(cpu);
+#ifdef USER_NATIVE_VFORK_POC
+                    user_observer_release(false);
+#endif
                     _Exit(a0);
                     break;
                 case 96: // set_tid_address
@@ -1785,6 +1793,9 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 case 221: { // execve
                     rvvm_info("sys_execve(%lx, %lx, %lx)", a0, a1, a2);
+#ifdef USER_NATIVE_VFORK_POC
+                    user_observer_release(true);
+#endif
                     /* With binfmt registered, the kernel handles scripts and
                      * redispatches RISC-V ELF files to this interpreter. */
                     if (user_binfmt_executable || getenv("RVVM_USER_BINFMT")) {

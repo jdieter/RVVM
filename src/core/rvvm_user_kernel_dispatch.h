@@ -37,6 +37,12 @@ static long user_wait4(long a[6])
         if (user_ptrace_wait_ready(a[0], status, a[2], (void*)a[3], &queued)) return queued;
         ret = (long)errno_ret(USER_SYSCALL(SYS_wait4, a[0], status,
             a[2] | (poll ? WNOHANG : 0), a[3], 0, 0));
+#ifdef USER_NATIVE_VFORK_POC
+        if (user_observer_hidden(ret, ret > 0 && (WIFEXITED(*status) || WIFSIGNALED(*status)))) {
+            ret = USER_PTRACE_WAIT_AGAIN;
+            continue;
+        }
+#endif
         if (ret > 0 && (WIFEXITED(*status) || WIFSIGNALED(*status))) user_wait_reaped(ret);
         if (started && ret == -EINTR) user_sig.syscall_unstarted = false;
         if (poll && !ret) {
@@ -64,6 +70,14 @@ static long user_waitid(long a[6])
         siginfo_t* native = poll ? &scratch : caller;
         ret = (long)errno_ret(USER_SYSCALL(SYS_waitid, (int)a[0], (unsigned)a[1],
             native, (int)a[3] | (poll ? WNOHANG : 0), a[4], 0));
+#ifdef USER_NATIVE_VFORK_POC
+        if (!ret && user_observer_hidden(native->si_pid, !(a[3] & WNOWAIT)
+                && (native->si_code == CLD_EXITED || native->si_code == CLD_KILLED
+                    || native->si_code == CLD_DUMPED))) {
+            ret = USER_PTRACE_WAIT_AGAIN;
+            continue;
+        }
+#endif
         if (!ret && native->si_pid && !(a[3] & WNOWAIT)
             && (native->si_code == CLD_EXITED || native->si_code == CLD_KILLED
                 || native->si_code == CLD_DUMPED)) user_wait_reaped(native->si_pid);
