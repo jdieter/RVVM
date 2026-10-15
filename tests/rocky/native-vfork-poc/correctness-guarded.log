@@ -1,0 +1,56 @@
+guarded_mode=39/0/test-sharing
+PASS kernel writes, parent concurrency, RO->RW, failed exec, SIGKILL, ordinary fork
+guarded_mode=39/0/test-process-control
+credentials uid=993 gid=135 CapEff=0
+child_cpu_us=151354 counter=9953489
+PASS actual child STOP/CONT, CPU accounting, SIGKILL allocator liveness
+guarded_mode=39/0/test-tids
+PASS real child PID/PPID, parent/child TID, clear-tid, pidfd
+guarded_mode=39/0/test-memory
+PASS partial NONE/RO/W protections, discard, private file COW/cache, SIGBUS/SIGSEGV
+guarded_mode=39/0/test-concurrent
+PASS 256 concurrent real-vfork children, TLS ownership and failed-exec writes
+guarded_mode=39/0/test-limits
+PASS finite-AS shared writes and allocation rollback (result=-1 errno=12)
+guarded_mode=39/1/test-sharing
+PASS kernel writes, parent concurrency, RO->RW, failed exec, SIGKILL, ordinary fork
+guarded_mode=39/1/test-process-control
+credentials uid=993 gid=135 CapEff=0
+child_cpu_us=151898 counter=9957089
+PASS actual child STOP/CONT, CPU accounting, SIGKILL allocator liveness
+guarded_mode=39/1/test-tids
+PASS real child PID/PPID, parent/child TID, clear-tid, pidfd
+guarded_mode=39/1/test-memory
+PASS partial NONE/RO/W protections, discard, private file COW/cache, SIGBUS/SIGSEGV
+guarded_mode=39/1/test-concurrent
+PASS 256 concurrent real-vfork children, TLS ownership and failed-exec writes
+guarded_mode=39/1/test-limits
+PASS finite-AS shared writes and allocation rollback (result=-1 errno=12)
+guarded_mode=48/0/test-sharing
+PASS kernel writes, parent concurrency, RO->RW, failed exec, SIGKILL, ordinary fork
+guarded_mode=48/0/test-process-control
+credentials uid=993 gid=135 CapEff=0
+child_cpu_us=151108 counter=9909505
+PASS actual child STOP/CONT, CPU accounting, SIGKILL allocator liveness
+guarded_mode=48/0/test-tids
+PASS real child PID/PPID, parent/child TID, clear-tid, pidfd
+guarded_mode=48/0/test-memory
+PASS partial NONE/RO/W protections, discard, private file COW/cache, SIGBUS/SIGSEGV
+guarded_mode=48/0/test-concurrent
+PASS 256 concurrent real-vfork children, TLS ownership and failed-exec writes
+guarded_mode=48/0/test-limits
+PASS finite-AS shared writes and allocation rollback (result=-1 errno=12)
+guarded_mode=48/1/test-sharing
+PASS kernel writes, parent concurrency, RO->RW, failed exec, SIGKILL, ordinary fork
+guarded_mode=48/1/test-process-control
+credentials uid=993 gid=135 CapEff=0
+child_cpu_us=151873 counter=9929989
+PASS actual child STOP/CONT, CPU accounting, SIGKILL allocator liveness
+guarded_mode=48/1/test-tids
+PASS real child PID/PPID, parent/child TID, clear-tid, pidfd
+guarded_mode=48/1/test-memory
+PASS partial NONE/RO/W protections, discard, private file COW/cache, SIGBUS/SIGSEGV
+guarded_mode=48/1/test-concurrent
+PASS 256 concurrent real-vfork children, TLS ownership and failed-exec writes
+guarded_mode=48/1/test-limits
+PASS finite-AS shared writes and allocation rollback (result=-1 errno=12)

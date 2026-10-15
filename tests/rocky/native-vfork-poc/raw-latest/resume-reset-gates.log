@@ -1,0 +1,57 @@
+CASE test-early-stop
+PASS stopped child permits parent FD/action operations; early=1
+CASE test-descriptors
+PASS descriptors mode=0 target=64
+PASS descriptors mode=1 target=64
+PASS descriptors mode=2 target=64
+CASE test-mapping-transactions
+PASS child mmap/remap/protection/discard/unmap/brk and private-file COW shared with parent
+CASE test-exec-errors
+PASS missing path status=29952 errno=2 marker=456
+PASS directory status=29952 errno=13 marker=456
+PASS nonexecutable status=29952 errno=13 marker=456
+PASS invalid executable status=29952 errno=8 marker=456
+PASS missing script interpreter status=29952 errno=2 marker=456
+PASS invalid path pointer status=29952 errno=14 marker=456
+PASS invalid argv pointer status=29952 errno=14 marker=456
+PASS invalid env pointer status=29952 errno=14 marker=456
+PASS normal executable status=0 errno=0 marker=123
+PASS NULL argv and env status=0 errno=0 marker=123
+PASS 1100 arguments status=0 errno=0 marker=123
+PASS script status=10752 errno=0 marker=123
+PASS self exec preserves argv0 and environment status=13568 errno=0 marker=123
+PASS execveat empty path status=0 errno=0 marker=123
+PASS execveat invalid fd status=29952 errno=9 marker=456
+PASS execveat invalid flags status=29952 errno=22 marker=456
+PASS CLOEXEC script descriptor status=29952 errno=2 marker=456
+PASS native-vfork exec semantics
+CASE test-child-io
+PASS child pipe/ppoll, socketpair IO and directory operations
+CASE test-process-attributes-latest
+PASS private child process group, credentials, limits, clocks, name, umask and scheduling
+CASE test-concurrent
+PASS 256 concurrent real-vfork children, TLS ownership and failed-exec writes
+CASE test-sharing
+PASS kernel writes, parent concurrency, RO->RW, failed exec, SIGKILL, ordinary fork
+CASE test-memory
+PASS partial NONE/RO/W protections, discard, private file COW/cache, SIGBUS/SIGSEGV
+CASE test-limits
+PASS finite-AS shared writes and allocation rollback (result=-1 errno=12)
+CASE test-vfork-updated
+CASE test-vfork-concurrent
+CASE test-vfork-nofile
+CASE test-pi-vfork
+PASS native shared-mm vfork retains parent's PI futex ownership and key
+CASE test-vfork-cow
+PASS private-mm VFORK, COW/protection isolation, shared mappings, peer allocation and STOP/CONT
+CASE test-fork-live-reader
+PASS ordinary fork during live vfork, 200000 executable permission changes, parent reader survives
+CASE test-signals-latest guest-publish
+PASS caught signal restart=0 status=0 inherited=1 handled=1 alt=1 read=-1 errno=4
+PASS caught signal restart=1 status=0 inherited=1 handled=1 alt=1 read=1 errno=0
+CASE test-process-control-latest guest-publish
+credentials uid=993 gid=135 CapEff=0
+child_cpu_us=149951 counter=9775629
+PASS actual child STOP/CONT, CPU accounting, SIGKILL allocator/mapping liveness
+CASE executable-churn
+PASS child executable mmap/mprotect/remap and live parent execute grants/revocations

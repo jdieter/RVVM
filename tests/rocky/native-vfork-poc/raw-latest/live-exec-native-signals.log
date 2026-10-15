@@ -1,0 +1,12 @@
+MODE=39/0
+PASS caught signal restart=0 status=0 inherited=1 handled=1 alt=1 read=-1 errno=4
+PASS caught signal restart=1 status=0 inherited=1 handled=1 alt=1 read=1 errno=0
+MODE=39/1
+PASS caught signal restart=0 status=0 inherited=1 handled=1 alt=1 read=-1 errno=4
+PASS caught signal restart=1 status=0 inherited=1 handled=1 alt=1 read=1 errno=0
+MODE=48/0
+PASS caught signal restart=0 status=0 inherited=1 handled=1 alt=1 read=-1 errno=4
+PASS caught signal restart=1 status=0 inherited=1 handled=1 alt=1 read=1 errno=0
+MODE=48/1
+PASS caught signal restart=0 status=0 inherited=1 handled=1 alt=1 read=-1 errno=4
+PASS caught signal restart=1 status=0 inherited=1 handled=1 alt=1 read=1 errno=0

@@ -1,0 +1,144 @@
+MODE=39/0
+GATE=test-early-stop
+PASS stopped child permits parent FD/action operations; early=1
+GATE=test-descriptors
+PASS descriptors mode=0 target=64
+PASS descriptors mode=1 target=64
+PASS descriptors mode=2 target=64
+GATE=test-mapping-transactions
+PASS child mmap/remap/protection/discard/unmap/brk and private-file COW shared with parent
+GATE=test-exec-errors
+PASS missing path status=29952 errno=2 marker=456
+PASS directory status=29952 errno=13 marker=456
+PASS nonexecutable status=29952 errno=13 marker=456
+PASS invalid executable status=29952 errno=8 marker=456
+PASS missing script interpreter status=29952 errno=2 marker=456
+PASS invalid path pointer status=29952 errno=14 marker=456
+PASS invalid argv pointer status=29952 errno=14 marker=456
+PASS invalid env pointer status=29952 errno=14 marker=456
+PASS normal executable status=0 errno=0 marker=123
+PASS NULL argv and env status=0 errno=0 marker=123
+PASS 1100 arguments status=0 errno=0 marker=123
+PASS script status=10752 errno=0 marker=123
+PASS self exec preserves argv0 and environment status=13568 errno=0 marker=123
+PASS execveat empty path status=0 errno=0 marker=123
+PASS execveat invalid fd status=29952 errno=9 marker=456
+PASS execveat invalid flags status=29952 errno=22 marker=456
+PASS CLOEXEC script descriptor status=29952 errno=2 marker=456
+PASS native-vfork exec semantics
+GATE=test-signals
+PASS caught signal restart=0 status=0 inherited=1 handled=1 alt=1 read=-1 errno=4
+PASS caught signal restart=1 status=0 inherited=1 handled=1 alt=1 read=1 errno=0
+GATE=test-executable-mappings
+PASS child executable mmap/mprotect/remap and live parent execute grants/revocations
+credentials uid=993 gid=135 CapEff=0
+child_cpu_us=150984 counter=9946802
+PASS actual child STOP/CONT, CPU accounting, SIGKILL allocator/mapping liveness
+MODE=39/1
+GATE=test-early-stop
+PASS stopped child permits parent FD/action operations; early=1
+GATE=test-descriptors
+PASS descriptors mode=0 target=64
+PASS descriptors mode=1 target=64
+PASS descriptors mode=2 target=64
+GATE=test-mapping-transactions
+PASS child mmap/remap/protection/discard/unmap/brk and private-file COW shared with parent
+GATE=test-exec-errors
+PASS missing path status=29952 errno=2 marker=456
+PASS directory status=29952 errno=13 marker=456
+PASS nonexecutable status=29952 errno=13 marker=456
+PASS invalid executable status=29952 errno=8 marker=456
+PASS missing script interpreter status=29952 errno=2 marker=456
+PASS invalid path pointer status=29952 errno=14 marker=456
+PASS invalid argv pointer status=29952 errno=14 marker=456
+PASS invalid env pointer status=29952 errno=14 marker=456
+PASS normal executable status=0 errno=0 marker=123
+PASS NULL argv and env status=0 errno=0 marker=123
+PASS 1100 arguments status=0 errno=0 marker=123
+PASS script status=10752 errno=0 marker=123
+PASS self exec preserves argv0 and environment status=13568 errno=0 marker=123
+PASS execveat empty path status=0 errno=0 marker=123
+PASS execveat invalid fd status=29952 errno=9 marker=456
+PASS execveat invalid flags status=29952 errno=22 marker=456
+PASS CLOEXEC script descriptor status=29952 errno=2 marker=456
+PASS native-vfork exec semantics
+GATE=test-signals
+PASS caught signal restart=0 status=0 inherited=1 handled=1 alt=1 read=-1 errno=4
+PASS caught signal restart=1 status=0 inherited=1 handled=1 alt=1 read=1 errno=0
+GATE=test-executable-mappings
+PASS child executable mmap/mprotect/remap and live parent execute grants/revocations
+credentials uid=993 gid=135 CapEff=0
+child_cpu_us=150105 counter=9863354
+PASS actual child STOP/CONT, CPU accounting, SIGKILL allocator/mapping liveness
+MODE=48/0
+GATE=test-early-stop
+PASS stopped child permits parent FD/action operations; early=1
+GATE=test-descriptors
+PASS descriptors mode=0 target=64
+PASS descriptors mode=1 target=64
+PASS descriptors mode=2 target=64
+GATE=test-mapping-transactions
+PASS child mmap/remap/protection/discard/unmap/brk and private-file COW shared with parent
+GATE=test-exec-errors
+PASS missing path status=29952 errno=2 marker=456
+PASS directory status=29952 errno=13 marker=456
+PASS nonexecutable status=29952 errno=13 marker=456
+PASS invalid executable status=29952 errno=8 marker=456
+PASS missing script interpreter status=29952 errno=2 marker=456
+PASS invalid path pointer status=29952 errno=14 marker=456
+PASS invalid argv pointer status=29952 errno=14 marker=456
+PASS invalid env pointer status=29952 errno=14 marker=456
+PASS normal executable status=0 errno=0 marker=123
+PASS NULL argv and env status=0 errno=0 marker=123
+PASS 1100 arguments status=0 errno=0 marker=123
+PASS script status=10752 errno=0 marker=123
+PASS self exec preserves argv0 and environment status=13568 errno=0 marker=123
+PASS execveat empty path status=0 errno=0 marker=123
+PASS execveat invalid fd status=29952 errno=9 marker=456
+PASS execveat invalid flags status=29952 errno=22 marker=456
+PASS CLOEXEC script descriptor status=29952 errno=2 marker=456
+PASS native-vfork exec semantics
+GATE=test-signals
+PASS caught signal restart=0 status=0 inherited=1 handled=1 alt=1 read=-1 errno=4
+PASS caught signal restart=1 status=0 inherited=1 handled=1 alt=1 read=1 errno=0
+GATE=test-executable-mappings
+PASS child executable mmap/mprotect/remap and live parent execute grants/revocations
+credentials uid=993 gid=135 CapEff=0
+child_cpu_us=149943 counter=9884454
+PASS actual child STOP/CONT, CPU accounting, SIGKILL allocator/mapping liveness
+MODE=48/1
+GATE=test-early-stop
+PASS stopped child permits parent FD/action operations; early=1
+GATE=test-descriptors
+PASS descriptors mode=0 target=64
+PASS descriptors mode=1 target=64
+PASS descriptors mode=2 target=64
+GATE=test-mapping-transactions
+PASS child mmap/remap/protection/discard/unmap/brk and private-file COW shared with parent
+GATE=test-exec-errors
+PASS missing path status=29952 errno=2 marker=456
+PASS directory status=29952 errno=13 marker=456
+PASS nonexecutable status=29952 errno=13 marker=456
+PASS invalid executable status=29952 errno=8 marker=456
+PASS missing script interpreter status=29952 errno=2 marker=456
+PASS invalid path pointer status=29952 errno=14 marker=456
+PASS invalid argv pointer status=29952 errno=14 marker=456
+PASS invalid env pointer status=29952 errno=14 marker=456
+PASS normal executable status=0 errno=0 marker=123
+PASS NULL argv and env status=0 errno=0 marker=123
+PASS 1100 arguments status=0 errno=0 marker=123
+PASS script status=10752 errno=0 marker=123
+PASS self exec preserves argv0 and environment status=13568 errno=0 marker=123
+PASS execveat empty path status=0 errno=0 marker=123
+PASS execveat invalid fd status=29952 errno=9 marker=456
+PASS execveat invalid flags status=29952 errno=22 marker=456
+PASS CLOEXEC script descriptor status=29952 errno=2 marker=456
+PASS native-vfork exec semantics
+GATE=test-signals
+PASS caught signal restart=0 status=0 inherited=1 handled=1 alt=1 read=-1 errno=4
+PASS caught signal restart=1 status=0 inherited=1 handled=1 alt=1 read=1 errno=0
+GATE=test-executable-mappings
+PASS child executable mmap/mprotect/remap and live parent execute grants/revocations
+credentials uid=993 gid=135 CapEff=0
+child_cpu_us=149963 counter=9836223
+PASS actual child STOP/CONT, CPU accounting, SIGKILL allocator/mapping liveness

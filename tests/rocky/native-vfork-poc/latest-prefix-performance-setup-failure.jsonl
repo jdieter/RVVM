@@ -1,0 +1,1 @@
+{"variant": "installed-latest", "resident_mib": 1024, "peers": 8, "sample": "module.xz", "returncode": 5, "rows": [], "hashes": [], "interpreters": [{"pid": 3156047, "path": "/var/lib/mock/rocky-10-riscv64-rvvm/root/tmp/rvvm-vfork-poc/installed-latest", "sha256": "0af5216c270dd2255f717dee79ff1055673d1574871ddbe4a1b60bfe09fb1adf"}], "stdout": "", "stderr": ""}
