@@ -4,26 +4,48 @@
 #define RVVM_USER_NATIVE_VFORK_H
 #include "cpu/softfloat/softfloat.h"
 
-#ifndef SYS_clone3
-#define SYS_clone3 435
-#endif
+/* Raw clones whose child pops its entry and argument from the top of its
+ * stack, calls the entry and exits with its result. user_native_clone2 is
+ * clone(2) with (flags, stack top, parent_tid, child_tid), for hosts that
+ * refuse clone3. A CLONE_VFORK child shares the caller's CET shadow stack
+ * either way; it only pushes below the caller's suspended entries. */
 extern long user_native_clone3(const void*, size_t);
+extern long user_native_clone2(unsigned long, void*, void*, void*);
 #if defined(__aarch64__)
 __asm__(".text\n.balign 4\n.global user_native_clone3\n.hidden user_native_clone3\n"
         "user_native_clone3:\n bti c\n mov x8,435\n svc #0\n cbnz x0,1f\n"
+        " ldp x9,x0,[sp],16\n blr x9\n mov x8,93\n svc #0\n brk 0\n1: ret\n"
+        ".balign 4\n.global user_native_clone2\n.hidden user_native_clone2\n"
+        "user_native_clone2:\n bti c\n mov x4,x3\n mov x3,xzr\n mov x8,220\n svc #0\n cbnz x0,1f\n"
         " ldp x9,x0,[sp],16\n blr x9\n mov x8,93\n svc #0\n brk 0\n1: ret\n");
 #elif defined(__x86_64__)
 __asm__(".text\n.global user_native_clone3\n.hidden user_native_clone3\n"
         "user_native_clone3:\n endbr64\n mov $435,%eax\n syscall\n test %rax,%rax\n jnz 1f\n"
+        " pop %rax\n pop %rdi\n call *%rax\n mov %eax,%edi\n mov $60,%eax\n syscall\n ud2\n1: ret\n"
+        ".global user_native_clone2\n.hidden user_native_clone2\n"
+        "user_native_clone2:\n endbr64\n mov %rcx,%r10\n xor %r8d,%r8d\n mov $56,%eax\n syscall\n"
+        " test %rax,%rax\n jnz 1f\n"
         " pop %rax\n pop %rdi\n call *%rax\n mov %eax,%edi\n mov $60,%eax\n syscall\n ud2\n1: ret\n");
 #endif
+
+/* Issue clone3 arguments through clone3, or through clone(2) where the host
+ * refuses clone3 (user_host_clone3_refused). clone(2) takes the stack top,
+ * and has one parent word for CLONE_PIDFD or CLONE_PARENT_SETTID: callers
+ * never combine them there. Raw syscalls only. */
+static __attribute__((no_stack_protector)) long user_native_clone(const struct user_clone_args* args, bool clone2)
+{
+    if (!clone2) return user_native_clone3(args, sizeof(*args));
+    if ((args->flags & CLONE_PIDFD) && (args->flags & CLONE_PARENT_SETTID)) return -EINVAL;
+    uintptr_t parent = args->flags & CLONE_PIDFD ? args->pidfd : args->parent_tid;
+    return user_native_clone2(args->flags | args->exit_signal, (void*)(uintptr_t)(args->stack + args->stack_size),
+                              (void*)parent, (void*)(uintptr_t)args->child_tid);
+}
 
 /* 0: unsupported, 1: supported, 2: supported with the child entering a new
  * PID namespace, as its init. */
 static int user_native_vfork_preflight(uint32_t flags)
 {
     if (!(flags & UAPI_CLONE_VM) && !user_host_fork_ready()) return 0;
-    if (syscall(SYS_clone3, NULL, 0) != -1 || errno != EINVAL) return 0;
     struct stat active_pid, child_pid;
     /* In a new PID namespace the child's own TIDs, and those of any helper
      * it creates, mean nothing to the parent: prepare identifies it through
@@ -102,6 +124,13 @@ struct user_native_vfork {
     uint32_t flags;
     uint32_t* parent_tid;
     uint32_t* child_tid;
+    /* The host refuses clone3: issue clone(2) (user_native_clone). */
+    bool clone2;
+    /* The kernel stores the child's TID at clone_marker through
+     * CLONE_CHILD_SETTID, in the child, instead of CLONE_PARENT_SETTID: the
+     * guest's own parent word holds its PARENT_SETTID or, with clone(2),
+     * its pidfd. The marker then lives in a shared page. */
+    bool child_marker;
     rvvm_thread_t* worker;
     void* native_stack;
     void* marker_page;
@@ -1091,8 +1120,13 @@ static long user_native_vfork_prepare(const struct user_native_source* source, u
     request->child_tid = child_tid;
     request->caller = source->caller;
     request->pidns = source->pidns;
-    if (((flags & UAPI_CLONE_PARENT_SETTID)
-         && (flags & (UAPI_CLONE_CHILD_SETTID | UAPI_CLONE_CHILD_CLEARTID)))
+    request->clone2 = user_host_clone3_refused();
+    /* PARENT_SETTID and, with clone(2), PIDFD take the parent word: the
+     * marker moves to child_tid, unless the guest needs that too. Then the
+     * observer finds the child instead. */
+    request->child_marker = (flags & UAPI_CLONE_PARENT_SETTID)
+        || (request->clone2 && (flags & UAPI_CLONE_PIDFD));
+    if ((request->child_marker && (flags & (UAPI_CLONE_CHILD_SETTID | UAPI_CLONE_CHILD_CLEARTID)))
         || (source->pidns && (flags & UAPI_CLONE_VM))) {
         request->observer = user_observer_get();
         if (!request->observer) { int error = errno; free(request); return -error; }
@@ -1129,7 +1163,7 @@ static long user_native_vfork_prepare(const struct user_native_source* source, u
     request->native_stack = mmap(NULL, USER_NATIVE_STACK_SIZE, PROT_READ | PROT_WRITE,
                                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     request->marker_size = user_vma_page();
-    if (flags & UAPI_CLONE_PARENT_SETTID)
+    if (request->child_marker)
         request->marker_page = mmap(NULL, request->marker_size, PROT_READ | PROT_WRITE,
                                     MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     if (request->native_stack == MAP_FAILED || request->marker_page == MAP_FAILED
@@ -1167,6 +1201,7 @@ static long user_native_vfork_issue(struct user_native_vfork* request)
     if (!request->child_table || request->clone_error)
         return request->clone_error ? request->clone_error : -ENOMEM;
     uint32_t flags = request->flags;
+    bool child_marker = request->child_marker;
     struct user_ptrace_context saved_ptrace;
     user_ptrace_context_save(&saved_ptrace);
     __typeof__(user_ptrace_restart) saved_restart = user_ptrace_restart;
@@ -1198,16 +1233,14 @@ static long user_native_vfork_issue(struct user_native_vfork* request)
     uintptr_t* packet = (void*)((char*)request->native_stack + USER_NATIVE_STACK_SIZE - 2 * sizeof(uintptr_t));
     packet[0] = (uintptr_t)(request->private_thread ? user_native_cow_child : user_native_child);
     packet[1] = (uintptr_t)request;
-    struct {
-        uint64_t flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls;
-    } args = {
-        .flags = (flags & ~(UINT64_C(0xff) | UAPI_CLONE_SETTLS)) | UAPI_CLONE_PARENT_SETTID
-            | (flags & UAPI_CLONE_PARENT_SETTID ? UAPI_CLONE_CHILD_SETTID : 0),
+    struct user_clone_args args = {
+        .flags = (flags & ~(UINT64_C(0xff) | UAPI_CLONE_SETTLS))
+            | (child_marker ? UAPI_CLONE_CHILD_SETTID : UAPI_CLONE_PARENT_SETTID),
         .pidfd = flags & UAPI_CLONE_PIDFD ? (uintptr_t)request->parent_tid : 0,
         /* schedule_tail stores the marker before pending STOP. The
          * shared VMA keeps it visible even without CLONE_VM. */
-        .child_tid = (uintptr_t)(flags & UAPI_CLONE_PARENT_SETTID ? request->clone_marker : request->child_tid),
-        .parent_tid = (uintptr_t)(flags & UAPI_CLONE_PARENT_SETTID ? request->parent_tid : request->clone_marker),
+        .child_tid = (uintptr_t)(child_marker ? request->clone_marker : request->child_tid),
+        .parent_tid = (uintptr_t)(child_marker ? request->parent_tid : request->clone_marker),
         .exit_signal = flags & 0xff,
         .stack = (uintptr_t)request->native_stack,
         .stack_size = USER_NATIVE_STACK_SIZE - 2 * sizeof(uintptr_t),
@@ -1217,7 +1250,7 @@ static long user_native_vfork_issue(struct user_native_vfork* request)
         args.child_tid = (uintptr_t)request->child_tid;
         args.parent_tid = (uintptr_t)request->parent_tid;
     }
-    long result = user_native_clone3(&args, sizeof(args));
+    long result = user_native_clone(&args, request->clone2);
     user_sig = saved_signal;
     user_signal_process = saved_process;
     current_user_hart = saved_cpu;
@@ -1297,7 +1330,7 @@ static int user_native_vfork(rvvm_user_thread_t* current, uint32_t flags, size_t
 
 /* clone from a shared-mm child before exec. Fork-like and VFORK children
  * reuse the native backend: the child's worker prepares and finishes the
- * request, and the child issues clone3 itself. A thread would need TLS of
+ * request, and the child issues the clone itself. A thread would need TLS of
  * its own while this child borrows its caller's: report the thread limit. */
 static long user_native_nested_clone(struct user_native_vfork* request, uint32_t flags, size_t stack,
                                      uint32_t* parent_tid, size_t tls, uint32_t* child_tid)

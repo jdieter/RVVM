@@ -2,6 +2,7 @@
 #ifndef RVVM_USER_FORK_H
 #define RVVM_USER_FORK_H
 #include <linux/futex.h>
+#include "atomics.h"
 #ifndef SYS_clone3
 #define SYS_clone3 435
 #endif
@@ -42,6 +43,28 @@ static __thread bool user_fork_native_saved;
 struct user_clone_args {
     uint64_t flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls;
 };
+
+/* Whether the host refuses clone3: Docker's and Podman's default seccomp
+ * profiles answer ENOSYS, other sandboxes EPERM, and Linux before 5.3 has no
+ * clone3. Where it exists, a size below its first version fails with EINVAL.
+ * Seccomp filters are inherited and never removed, and a guest cannot add
+ * one (seccomp returns ENOSYS), so one probe holds until exec; a program
+ * embedding this that adds a filter later still gets clone(2) from
+ * user_host_fork. The first caller is a trusted thread; raw-syscall
+ * contexts only read the result. */
+static uint32_t user_host_clone3_state;
+
+static bool user_host_clone3_refused(void)
+{
+    uint32_t state = atomic_load_uint32(&user_host_clone3_state);
+    if (!state) {
+        int saved = errno;
+        state = syscall(SYS_clone3, NULL, 0) == -1 && errno == EINVAL ? 1 : 2;
+        errno = saved;
+        atomic_store_uint32(&user_host_clone3_state, state);
+    }
+    return state == 2;
+}
 
 /* Guest set_tid_address/set_robust_list replace the kernel registrations.
  * Find this thread's libc TID and robust-list head once, before any guest
@@ -126,10 +149,17 @@ static pid_t user_host_fork(unsigned signal, uint64_t extra)
         .child_tid = (uintptr_t)tid,
         .exit_signal = signal,
     };
+    bool clone2 = user_host_clone3_refused();
     user_host_fork_lock();
-    pid_t pid = syscall(SYS_clone3, &args, sizeof(args));
-    if (pid < 0 && errno == ENOSYS) {
-        /* Seccomp policies may still refuse clone3. */
+    pid_t pid = -1;
+    if (!clone2) {
+        pid = syscall(SYS_clone3, &args, sizeof(args));
+        if (pid < 0 && errno == ENOSYS) {
+            clone2 = true;
+            atomic_store_uint32(&user_host_clone3_state, 2);
+        }
+    }
+    if (clone2) {
         unsigned long flags = args.flags | signal;
 #ifdef __aarch64__
         pid = syscall(SYS_clone, flags, NULL, NULL, NULL, tid);

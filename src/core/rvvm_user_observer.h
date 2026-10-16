@@ -24,6 +24,8 @@ struct user_observer {
     unsigned ns_index;
     /* Init or subreaper owners keep the observer as a direct child. */
     bool direct;
+    /* The host refuses clone3: the intermediate cannot probe it itself. */
+    bool clone2;
     struct stat identity;
     char input[4096], line[256];
 };
@@ -446,16 +448,14 @@ static bool user_internal_task(long pid)
 static __attribute__((no_stack_protector)) int user_observer_spawn(void* opaque)
 {
     struct user_observer* observer = opaque;
-    struct {
-        uint64_t flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls;
-    } args = {
+    struct user_clone_args args = {
         .flags = CLONE_VM | CLONE_PARENT_SETTID | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID,
         .parent_tid = (uintptr_t)&observer->pid,
         .child_tid = (uintptr_t)&observer->alive,
         .stack = (uintptr_t)observer->stack,
         .stack_size = 1024 * 1024 - 2 * sizeof(uintptr_t),
     };
-    long ret = user_native_clone3(&args, sizeof(args));
+    long ret = user_native_clone(&args, observer->clone2);
     if (ret < 0) {
         observer->result = ret;
         atomic_store_uint32(&observer->alive, 0);
@@ -549,6 +549,7 @@ static struct user_observer* user_observer_get(void)
         observer->children = observer->cookie = -1;
         observer->owner = owner;
         observer->marker_size = user_vma_page();
+        observer->clone2 = user_host_clone3_refused();
         const size_t spawn_size = 65536;
         observer->stack = mmap(NULL, 1024 * 1024, PROT_READ | PROT_WRITE,
                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -567,9 +568,7 @@ static struct user_observer* user_observer_get(void)
         packet[0] = (uintptr_t)user_observer_spawn;
         packet[1] = (uintptr_t)observer;
         observer->alive = UINT32_MAX;
-        struct {
-            uint64_t flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls;
-        } args = {
+        struct user_clone_args args = {
             /* Shared files avoid a second table copy; the intermediate
              * opens nothing, and the observer copies then closes them all. */
             .flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_PARENT_SETTID,
@@ -586,7 +585,8 @@ static struct user_observer* user_observer_get(void)
          * __WALL/__WCLONE waits: keep that remaining gap instead. */
         int subreaper = 0;
         observer->direct = getpid() == 1 || (!prctl(PR_GET_CHILD_SUBREAPER, &subreaper) && subreaper);
-        long ret = observer->direct ? user_observer_spawn(observer) : user_native_clone3(&args, sizeof(args));
+        long ret = observer->direct ? user_observer_spawn(observer)
+                                    : user_native_clone(&args, observer->clone2);
         if (observer->direct && observer->pid) atomic_store_uint32(&user_observer_direct_pid, observer->pid);
         if (ret > 0) {
             long reaped;

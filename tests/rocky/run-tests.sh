@@ -43,6 +43,7 @@ for link in -pie -static-pie; do
     timeout 60 "$build/test-host-fork"
 done
 if (($#)); then
+    "$cc" -O2 "$root/tests/rocky/noclone3.c" -o "$build/noclone3"
     for guest in test-clone-flags test-clone-files test-fork-cache test-clone-thread test-clone-thread-private test-thread-exit test-vfork test-vfork-nofile test-vfork-concurrent test-openat2 test-seccomp test-pidfd-getfd test-kcmp test-jit-limits test-fpu-tininess test-mmap-huge test-mprotect-errors test-proc-exe; do
         "${RISCV_CC:-clang}" --target=riscv64-linux-gnu -march=rv64gc -mabi=lp64d \
             -fuse-ld="${RISCV_LD:-lld}" -nostdlib -static -Wl,--build-id=none \
@@ -67,6 +68,15 @@ if (($#)); then
                     fi
                 done
             done
+            # Hosts that refuse clone3 (container seccomp profiles) get
+            # VFORK children through clone(2).
+            if [[ $guest == test-vfork* || $guest == test-clone-thread* ]]; then
+                for nojit in 0 1; do
+                    (if [[ $nojit = 0 ]]; then unset RVVM_NOJIT; else export RVVM_NOJIT=1; fi
+                     timeout 20 "$build/noclone3" "$emulator" "$build/$guest") >"$build/stdout" 2>"$build/stderr"
+                    [[ ! -s $build/stdout && ! -s $build/stderr ]]
+                done
+            fi
             echo "PASS $guest: $emulator"
         done
     done

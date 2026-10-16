@@ -214,6 +214,25 @@ Sv39/Sv48 with JIT enabled and disabled:
 bash tests/rocky/run-tests.sh release.linux.arm64/rvvm_user_arm64
 ```
 
+The runner also runs the vfork and clone-thread guests under `noclone3`, a
+host wrapper whose seccomp filter refuses clone3 with ENOSYS, as Docker's and
+Podman's default profiles do. RVVM then makes VFORK children, its observer
+and special forks with clone(2). Run any guest that way by hand:
+
+```sh
+cc -O2 -o noclone3 tests/rocky/noclone3.c
+./noclone3 release.linux.x86_64/rvvm_user_x86_64 ./guest
+./noclone3 --eperm release.linux.x86_64/rvvm_user_x86_64 ./guest
+```
+
+The filter is inherited across exec, so it may also wrap a guest started
+through binfmt_misc. With `--eperm`, glibc's own pthread_create fails, since
+glibc falls back to clone only on ENOSYS: RVVM cannot start the threads a
+VFORK needs, and the guest gets ENOMEM. `native-vfork-poc/test-no-clone3.c`
+covers vfork, posix_spawn, private VFORK, the CLONE_PIDFD and TID flag
+combinations and nested VFORK children; build it like the other fixtures
+there and run it under `noclone3`.
+
 Coverage includes private/native isolation, sparse backing, file COW and EOF,
 SysV detach ownership, exec completion and failed-exec visibility, child VMA
 changes, private descriptor relocation, robust cleanup before guest TID
