@@ -1151,6 +1151,16 @@ static int rvvm_sys_clone_impl(rvvm_user_thread_t* current, uint32_t flags, size
                 if ((flags & UAPI_CLONE_PIDFD) && received != 1) _exit(127);
             }
             user_fd_unlock();
+            /* The surviving thread is the new process's only one. Its TID
+             * is the child's own, which CLONE_CHILD_SETTID stores below. */
+            current->tid = gettid();
+            atomic_store_uint32_relax(&user_signal_process_current()->refs, 1);
+            current->refs = 1;
+            current->process_thread = true;
+            current->parent_settid = NULL;
+            current->child_settid = NULL;
+            current->child_cleartid = (flags & UAPI_CLONE_CHILD_CLEARTID) ? child_tid : NULL;
+            syscall(SYS_set_tid_address, current->child_cleartid);
             if (flags & UAPI_CLONE_CHILD_SETTID)
                 (void)uapi_extra_copy(&current->tid, child_tid, sizeof(current->tid), true);
             if (flags & UAPI_CLONE_SETTLS) rvvm_write_cpu_reg(cpu, RVVM_REGID_X0 + 4, tls);
