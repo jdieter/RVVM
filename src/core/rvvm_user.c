@@ -1371,8 +1371,9 @@ static inline int rvvm_sys_prot(int prot)
     int ret = PROT_NONE;
     if (prot & UAPI_PROT_READ)  ret |= PROT_READ;
     if (prot & UAPI_PROT_WRITE) ret |= PROT_WRITE;
-    /* The decoder needs readable code; retain X so kernel maps can recover
-     * guest execution permissions after an interrupted mapping transaction. */
+    /* The decoder needs readable code. Ask for host X as well, so kernel
+     * maps show guest execute intent; the host never runs guest code, so
+     * user_vma_kernel_map and user_vma_kernel_protect drop it where refused. */
     if (prot & UAPI_PROT_EXEC) {
         ret |= PROT_READ;
         ret |= PROT_EXEC;
@@ -1861,10 +1862,8 @@ static void* rvvm_user_thread_wrap(void* arg)
                         if (a2 & ~UAPI_PROT_VALID) ret = -EINVAL;
                         else if (user_vma_protect_span(&start, &size, a2)) ret = last_errno();
                         else {
-                            ret = errno_ret(mprotect(to_ptr(a0), a1, rvvm_sys_prot(a2)));
-                            if (!ret) user_exec_update(start, size, a2 & UAPI_PROT_EXEC);
-                            else if (ret != (rvvm_addr_t)-EINVAL)
-                                user_exec_partial(start, size, rvvm_sys_prot(a2), a2 & UAPI_PROT_EXEC);
+                            ret = user_exec_mprotect(a0, a1, start, size, rvvm_sys_prot(a2),
+                                                     a2 & UAPI_PROT_EXEC);
                         }
                         a0 = ret;
                     }

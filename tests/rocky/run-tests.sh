@@ -80,4 +80,30 @@ if (($#)); then
             echo "PASS $guest: $emulator"
         done
     done
+    # Hosts may refuse EXEC, which guest code never needs: under MDWE, and for
+    # a file on a noexec tmpfs (in a user and mount namespace, where allowed).
+    "${RISCV_CC:-clang}" --target=riscv64-linux-gnu -march=rv64gc -mabi=lp64d \
+        -fuse-ld="${RISCV_LD:-lld}" -nostdlib -static -Wl,--build-id=none \
+        "$root/tests/rocky/test-exec-refused.S" -o "$build/test-exec-refused"
+    "$cc" -O2 "$root/tests/rocky/mdwe-exec.c" -o "$build/mdwe-exec"
+    printf '\x13\x05\xa0\x02\x67\x80\x00\x00' >"$build/code"
+    mdwe=1 noexec=1
+    "$build/mdwe-exec" true || { echo "SKIP test-exec-refused under MDWE: unsupported"; mdwe=0; }
+    mkdir "$build/noexec"
+    unshare -rm true 2>/dev/null || { echo "SKIP test-exec-refused on noexec: no user namespace"; noexec=0; }
+    for emulator in "$@"; do
+        for nojit in "" 1; do
+            env ${nojit:+RVVM_NOJIT=1} timeout 20 "$emulator" "$build/test-exec-refused" "$build/code"
+            if ((mdwe)); then
+                env ${nojit:+RVVM_NOJIT=1} timeout 20 "$build/mdwe-exec" "$emulator" \
+                    "$build/test-exec-refused" "$build/code"
+            fi
+            if ((noexec)); then
+                env ${nojit:+RVVM_NOJIT=1} unshare -rm sh -c \
+                    'mount -t tmpfs -o noexec tmpfs "$1" && cp "$2" "$1/code" && exec timeout 20 "$3" "$4" "$1/code"' \
+                    sh "$build/noexec" "$build/code" "$emulator" "$build/test-exec-refused"
+            fi
+        done
+        echo "PASS test-exec-refused: $emulator"
+    done
 fi

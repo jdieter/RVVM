@@ -190,8 +190,12 @@ static void user_exec_update(uintptr_t start, size_t size, bool executable)
 /* A failed mprotect may still have changed a prefix of the range: Linux
  * applies VMAs in address order and stops at the first hole or failing VMA.
  * Each changed VMA now has exactly the requested host protection; the one
- * that failed does not. Without readable maps, fail closed: drop execute
- * permission across a request that removed it, and never add it. */
+ * that failed does not. host_prot is the protection last requested, without
+ * EXEC where the host refused it. The failing VMA still differs: Linux
+ * refuses a VMA mprotect leaves unchanged only over EXEC, barring an LSM
+ * policy change since it was mapped. Without readable maps, fail
+ * closed: drop execute permission across a request that removed it, and
+ * never add it. */
 static void user_exec_partial(uintptr_t start, size_t size, int host_prot, bool executable)
 {
     size_t page = user_vma_page();
@@ -243,13 +247,30 @@ static void user_exec_partial(uintptr_t start, size_t size, int host_prot, bool 
     if (changed > start) user_exec_update(start, changed - start, executable);
 }
 
-/* Guest-executable memory keeps host EXEC too (see rvvm_sys_prot), so the
- * kernel maps record execute intent for mapping recovery. A noexec mount or
- * security policy may refuse it; guest execution needs only READ. */
+/* Callers hold the fd guard and mmap_lock, with registry space reserved.
+ * addr/size go to the kernel; [start, start + span) is the range they cover,
+ * wider for GROWSDOWN/GROWSUP. Returns 0 or -errno. Kernel maps are compared
+ * with the protection actually requested last, which lacks EXEC where the
+ * host refused it (see user_vma_kernel_protect). */
+static long user_exec_mprotect(uintptr_t addr, size_t size, uintptr_t start, size_t span,
+                               int host_prot, bool executable)
+{
+    if (!user_vma_kernel_protect((void*)addr, size, &host_prot)) {
+        user_exec_update(start, span, executable);
+        return 0;
+    }
+    long ret = -errno;
+    if (ret != -EINVAL) user_exec_partial(start, span, host_prot, executable);
+    return ret;
+}
+
+/* Guest-executable ELF segments, stack and signal trampoline ask for host
+ * EXEC too, so kernel maps show guest execute intent as for mmap, and do
+ * without it where refused. */
 static int user_exec_protect(void* addr, size_t size, int prot, bool executable)
 {
-    if (executable && !mprotect(addr, size, prot | PROT_READ | PROT_EXEC)) return 0;
-    return mprotect(addr, size, executable ? prot | PROT_READ : prot);
+    if (executable) prot |= PROT_READ | PROT_EXEC;
+    return user_vma_kernel_protect(addr, size, &prot);
 }
 
 static void user_exec_elf(const elf_desc_t* elf)

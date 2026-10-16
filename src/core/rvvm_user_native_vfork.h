@@ -343,8 +343,11 @@ static long user_native_mapping_outcome(long nr, const long* a)
             size_t span = ((size_t)a[1] + map_page - 1) & ~(map_page - 1);
             /* NOREPLACE found the range free, so any mapping there is ours.
              * A replaced range is ours only with exactly the requested
-             * protection; an identical pre-existing one gets the same
-             * metadata either way, since host EXEC mirrors guest EXEC. */
+             * protection. A pre-existing one with that protection is
+             * indistinguishable, and completion is consistent with the
+             * kernel either way. Host EXEC normally mirrors guest EXEC; where
+             * the host refused it, the guest's execute permission there takes
+             * the requested value, as a completed call would set it. */
             if ((a[3] & MAP_FIXED_NOREPLACE) && user_native_range_mapped(addr, span)) return addr;
             if ((a[3] & MAP_FIXED) && user_vma_kernel_prot(addr, addr + span, a[2]) == 1) return addr;
             /* An unknown kernel-chosen address may remain mapped, as after a
@@ -453,11 +456,8 @@ static void user_native_mapping_service(struct user_native_vfork* request)
             else if (a[2] & ~UAPI_PROT_VALID) request->mapping_result = -EINVAL;
             else if (user_vma_protect_span(&start, &size, a[2])) request->mapping_result = -errno;
             else {
-                request->mapping_result = user_native_mapping_kernel(SYS_mprotect, a[0], a[1],
-                                                                     rvvm_sys_prot(a[2]), 0, 0, 0);
-                if (!request->mapping_result) user_exec_update(start, size, a[2] & PROT_EXEC);
-                else if (request->mapping_result != -EINVAL)
-                    user_exec_partial(start, size, rvvm_sys_prot(a[2]), a[2] & PROT_EXEC);
+                request->mapping_result = user_exec_mprotect(a[0], a[1], start, size,
+                                                             rvvm_sys_prot(a[2]), a[2] & PROT_EXEC);
             }
             spin_unlock(&mmap_lock);
             user_fd_unlock();

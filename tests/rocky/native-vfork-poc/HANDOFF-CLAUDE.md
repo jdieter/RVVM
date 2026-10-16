@@ -119,7 +119,10 @@ To make execute intent recoverable, the native backend now retains host
 PROT_EXEC while also allowing READ for instruction decoding. Previously guest
 EXEC became only host READ, making execution intent invisible in proc maps.
 This representation has passed focused ARM checks; complete recovery has
-not been implemented or proven. Audit noexec/LSM and execute-only behavior.
+not been implemented or proven. Where the host refuses EXEC (MDWE, SELinux
+execmem, noexec mounts), guest mappings now fall back to host READ, as before,
+and the execute registry stays authoritative (TODO.txt, "Hosts that refuse
+EXEC"). Execute-only behavior is still unaudited.
 
 ## Latest verified observer checkpoint
 

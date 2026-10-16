@@ -184,6 +184,36 @@ allowing kcmp: native passed, but RVVM compared a hidden child descriptor.
 These are future conformance probes, not guest acceptance while kcmp is
 unsupported. TODO.txt records the rationale and re-enablement requirements.
 
+### Hosts that refuse EXEC
+
+Guest code is decoded and translated, never run by the host, so guest
+execute permission never needs host EXEC. RVVM asks for it, so kernel maps
+show guest execute intent, and maps or protects without it where the host
+refuses: prctl MDWE (systemd `MemoryDenyWriteExecute=` on Linux 6.3+) and
+SELinux execmem with EACCES, systemd's seccomp variant and noexec mounts with
+EPERM. The execute registry stays authoritative. RVVM deliberately accepts
+exec mappings of noexec files, as before host EXEC was requested, so sysroots
+on /tmp or /dev/shm keep working; a RISC-V kernel would refuse them.
+
+`mdwe-exec.c` runs a program under MDWE (exit status 77 without kernel
+support). `run-tests.sh` builds it and runs `test-exec-refused.S` with each
+emulator: plainly, under MDWE, and with a code file on a noexec tmpfs in a
+user and mount namespace. Unavailable MDWE or namespaces are reported as SKIP.
+To run the shared-mm VFORK fixture by hand:
+
+```sh
+cc -O2 tests/rocky/mdwe-exec.c -o /tmp/mdwe-exec
+# test-exec-refused built for RISC-V from native-vfork-poc/test-exec-refused.c
+RVVM_NOJIT=1 /tmp/mdwe-exec rvvm_user_arm64 ./test-exec-refused
+unshare -rm sh -c 'mount -t tmpfs -o noexec tmpfs /mnt &&
+    exec rvvm_user_arm64 ./test-exec-refused /mnt'
+```
+
+The fixture forks, and under MDWE the JIT's code cache is a shared memfd
+mapping that fork children share with their parent (see TODO.txt), so use
+`RVVM_NOJIT=1` there. test-helper-death judges execute permission from the
+guest's /proc/self/maps, so it needs a host that grants EXEC.
+
 ### Existing implementation regressions
 
 JIT metadata starts with a bounded reserve and grows fallibly. Under finite

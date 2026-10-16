@@ -285,10 +285,27 @@ Partial mprotect effects (fixed in the native-vfork worktree, 2026-10-15).
 Linux applies VMAs in order and stops at the first hole or failing VMA, so
 a failed call may already have changed a prefix. user_exec_partial now
 updates the executable registry for the contiguous prefix whose kernel
-protection equals the requested host protection; without readable maps it
-only removes execute permission. test-mprotect-partial-exec.c covers the
+protection equals the host protection last requested; without readable maps
+it only removes execute permission. test-mprotect-partial-exec.c covers the
 ENOMEM hole and a mid-range EACCES in ordinary, shared and private VFORK
 children. The installed baseline fails it; the fixed candidate passes.
+
+Hosts that refuse EXEC (fixed 2026-10-16). Guest EXEC asks for host
+READ|EXEC, so kernel maps show it, but MDWE, SELinux execmem and noexec
+mounts refuse that, and guest mmap/mprotect failed with EACCES or EPERM.
+Mappings and protections now retry without host EXEC; the execute registry
+stays authoritative and recovery compares maps with the protection last
+requested. Exec mappings of noexec files are accepted on purpose, as rocky
+did. test-exec-refused.S (run-tests.sh, with mdwe-exec.c) and
+native-vfork-poc/test-exec-refused.c cover it.
+
+Open: under MDWE, forking fixtures (test-thread-kill-main,
+test-raw-fork-churn, test-snapshot-witness and others) crash with host faults
+in JIT code, on rocky as well; RVVM_NOJIT=1 avoids it. Likely cause: where
+host RWX is refused, rvjit's code cache is a MAP_SHARED memfd mapped twice
+(vma_multi_mmap), and nothing replaces it after fork, so parent and child
+share one cache and overwrite each other's translations. Give fork children
+a private cache, or copy the cache and remap both views in the child.
 
 Regression coverage: mapping type and alias visibility; locked-memory limits;
 fault-driven stack growth; populate behavior; huge pages; unknown flag bits;

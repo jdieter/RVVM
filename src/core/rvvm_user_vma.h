@@ -25,7 +25,41 @@ static long user_vma_execute(long nr, long a, long b, long c, long d, long e, lo
     if ((unsigned long)ret >= (unsigned long)-4095) { errno = -ret; return -1; }
     return ret;
 }
-#define user_vma_kernel_map(a,b,c,d,e,f) ((void*)user_vma_execute(SYS_mmap,(long)(a),b,c,d,e,f))
+
+/* Guest execute permission asks the host for EXEC too (see rvvm_sys_prot),
+ * so kernel maps, including the guest's /proc/self/maps, show it. Guest code
+ * is only decoded and translated, never run by the host, so EXEC is never
+ * required. Where it is refused, map or protect without it: prctl MDWE
+ * (systemd MemoryDenyWriteExecute on Linux 6.3+) and SELinux execmem deny
+ * with EACCES; systemd's older seccomp filter and noexec mounts with EPERM.
+ * Unrelated errors recur without EXEC. The execute registry stays
+ * authoritative. Accepting noexec files matches earlier rvvm_user, which
+ * never asked for EXEC, so sysroots on /tmp or /dev/shm keep working; a
+ * RISC-V kernel would refuse them. */
+static bool user_vma_exec_refused(int prot)
+{
+    return (prot & PROT_EXEC) && (errno == EACCES || errno == EPERM);
+}
+
+static void* user_vma_kernel_map(void* addr, size_t size, int prot, int flags, int fd, off_t offset)
+{
+    void* ret = (void*)user_vma_execute(SYS_mmap, (long)addr, size, prot, flags, fd, offset);
+    if (ret == MAP_FAILED && user_vma_exec_refused(prot))
+        ret = (void*)user_vma_execute(SYS_mmap, (long)addr, size, prot & ~PROT_EXEC, flags, fd, offset);
+    return ret;
+}
+
+/* As user_vma_kernel_map. Sets *prot to the protection last requested. */
+static int user_vma_kernel_protect(void* addr, size_t size, int* prot)
+{
+    int ret = (int)user_vma_execute(SYS_mprotect, (long)addr, size, *prot, 0, 0, 0);
+    if (ret && user_vma_exec_refused(*prot)) {
+        *prot &= ~PROT_EXEC;
+        ret = (int)user_vma_execute(SYS_mprotect, (long)addr, size, *prot, 0, 0, 0);
+    }
+    return ret;
+}
+
 #define user_vma_kernel_unmap(a,b) ((int)user_vma_execute(SYS_munmap,(long)(a),b,0,0,0,0))
 #define user_vma_kernel_remap(a,b,c,d,e) ((void*)user_vma_execute(SYS_mremap,(long)(a),b,c,d,(long)(e),0))
 #define user_vma_kernel_valid(fd) user_vma_execute(SYS_fcntl,fd,F_GETFD,0,0,0,0)
