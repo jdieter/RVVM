@@ -131,6 +131,16 @@ static size_t user_vma_map_page(int flags)
 
 static uintptr_t user_vma_cursor;
 
+/* The guest's main stack grows down into [low, high) on demand, as Linux's
+ * does into the gap it leaves above mmap_base. Placement never chooses this
+ * range, so it stays free; only fixed or hinted guest mappings enter it. */
+static uintptr_t user_vma_stack_low, user_vma_stack_high;
+
+static inline bool user_vma_stack_overlaps(uintptr_t start, size_t span)
+{
+    return start < user_vma_stack_high && start + span > user_vma_stack_low;
+}
+
 /* Ownership, rather than an address heuristic, distinguishes guest mappings
  * from the interpreter's heap, stacks and JIT. Callers serialize mutations
  * with the fd guard and mapping/heap locks. Adjacent ranges may coalesce;
@@ -293,6 +303,9 @@ static int user_vma_protect_span(uintptr_t* addr, size_t* size, int prot)
             if (*delimiter != '-') continue;
             uintptr_t end = strtoull(delimiter + 1, NULL, 16);
             if (*addr < start || *addr >= end) continue;
+            /* The main stack takes this protection as it grows, too. */
+            if ((prot & PROT_GROWSDOWN) && end == user_vma_stack_high && start >= user_vma_stack_low)
+                start = user_vma_stack_low;
             if (prot & PROT_GROWSDOWN) { *size += *addr - start; *addr = start; }
             if (prot & PROT_GROWSUP) *size = end - *addr;
             close(fd);
@@ -349,6 +362,19 @@ static int user_vma_kernel_prot(uintptr_t start, uintptr_t end, int prot)
     return result == 0 && covered >= end;
 }
 
+/* Accounts for the mapped range [first, last) in an address-ordered scan.
+ * Returns true once the scan has passed high. */
+static bool user_vma_gap_take(uintptr_t first, uintptr_t last, size_t span, uintptr_t low,
+                              uintptr_t high, uintptr_t* previous, uintptr_t* best)
+{
+    if (last <= low) return false;
+    uintptr_t limit = first < high ? first : high;
+    if (*previous <= limit && span <= limit - *previous) *best = limit - span;
+    if (last >= high) { *previous = high; return true; }
+    if (last > *previous) *previous = last;
+    return false;
+}
+
 /* Callers hold the fd guard before their mapping/brk locks. The slow path
  * inspects host VMAs too: never use MAP_FIXED to claim an unowned hole. */
 static uintptr_t user_vma_gap(size_t span, uintptr_t low, uintptr_t high)
@@ -360,6 +386,8 @@ static uintptr_t user_vma_gap(size_t span, uintptr_t low, uintptr_t high)
     char buffer[4096], line[128];
     size_t used = 0;
     uintptr_t previous = low, best = 0;
+    /* The stack's growth range counts as mapped, in address order. */
+    bool stack_pending = user_vma_stack_high > user_vma_stack_low;
     ssize_t count;
     while ((count = read(maps, buffer, sizeof(buffer))) != 0) {
         if (count < 0) {
@@ -378,13 +406,16 @@ static uintptr_t user_vma_gap(size_t span, uintptr_t low, uintptr_t high)
             uintptr_t start = strtoull(line, &delimiter, 16);
             if (*delimiter != '-') continue;
             uintptr_t end = strtoull(delimiter + 1, NULL, 16);
-            if (end <= low) continue;
-            uintptr_t limit = start < high ? start : high;
-            if (previous <= limit && span <= limit - previous) best = limit - span;
-            if (end >= high) { previous = high; goto done; }
-            if (end > previous) previous = end;
+            if (stack_pending && user_vma_stack_low <= start) {
+                stack_pending = false;
+                if (user_vma_gap_take(user_vma_stack_low, user_vma_stack_high, span, low, high,
+                                      &previous, &best)) goto done;
+            }
+            if (user_vma_gap_take(start, end, span, low, high, &previous, &best)) goto done;
         }
     }
+    if (stack_pending)
+        user_vma_gap_take(user_vma_stack_low, user_vma_stack_high, span, low, high, &previous, &best);
 done:
     if (previous < high && span <= high - previous) best = high - span;
     close(maps);
@@ -447,9 +478,13 @@ static void* user_vma_map_raw(void* addr, size_t size, int prot, int flags, int 
         uintptr_t next;
         do {
             next = (top >= floor + span ? top - span : user_vma_layout.top - span) & ~(page - 1);
+            if (user_vma_stack_overlaps(next, span) && user_vma_stack_low >= floor + span)
+                next = (user_vma_stack_low - span) & ~(page - 1);
         } while (!__atomic_compare_exchange_n(&user_vma_cursor, &top, next, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
-        void* ret = user_vma_kernel_map((void*)next, size, prot, flags | MAP_FIXED_NOREPLACE, fd, offset);
-        if (ret != MAP_FAILED || errno != EEXIST) return ret;
+        if (!user_vma_stack_overlaps(next, span)) {
+            void* ret = user_vma_kernel_map((void*)next, size, prot, flags | MAP_FIXED_NOREPLACE, fd, offset);
+            if (ret != MAP_FAILED || errno != EEXIST) return ret;
+        }
     }
     for (unsigned retry = 0; retry < 128; ++retry) {
         uintptr_t next = user_vma_gap(span + page - user_vma_page(),

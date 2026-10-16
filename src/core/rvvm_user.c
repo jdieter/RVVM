@@ -2122,6 +2122,8 @@ typedef struct {
  * Guest process stack setup routines
  */
 
+#include "rvvm_user_stack.h"
+
 static void* stack_put_mem(uint8_t* stack, const void* mem, size_t len)
 {
     stack -= len;
@@ -2162,6 +2164,16 @@ static void* stack_put_str(void* stack, const char* str)
 #define UAPI_AT_RANDOM        25
 #define UAPI_AT_EXECFN        31
 #define UAPI_AT_SYSINFO_EHDR  33 // vDSO location; RISC-V specific!
+
+// An upper bound on the bytes rvvm_user_init_stack writes
+static size_t rvvm_user_stack_size(const exec_desc_t* desc)
+{
+    size_t size = rvvm_strlen(desc->executable) + 1 + 64 * sizeof(uapi_size_t) + 64;
+    size_t pointers = desc->argc + 2;
+    for (size_t i = 0; i < desc->argc; i++) size += rvvm_strlen(desc->argv[i]) + 1;
+    for (size_t i = 0; desc->envp[i]; i++, pointers++) size += rvvm_strlen(desc->envp[i]) + 1;
+    return size + pointers * sizeof(uapi_size_t);
+}
 
 static char* rvvm_user_init_stack(void* stack, exec_desc_t* desc)
 {
@@ -2246,8 +2258,6 @@ static char* rvvm_user_init_stack(void* stack, exec_desc_t* desc)
 
     return stack;
 }
-
-#define STACK_SIZE 0x4000000
 
 extern char** environ;
 
@@ -2375,24 +2385,15 @@ RVVM_PUBLIC int rvvm_user_linux(int argc, char** argv, char** envp)
         .phnum = elf.phnum,
     };
 
-    // A plain anonymous stack can abut writable emulator mappings. Recursion
-    // must fault before overwriting those mappings (including signal state).
-    size_t stack_guard = 1024 * 1024;
-    user_fd_lock();
-    uint8_t* stack_mapping = user_vma_map(NULL, STACK_SIZE + 2 * stack_guard, PROT_NONE,
-                                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_GROWSDOWN, -1, 0);
-    user_fd_unlock();
-    if (stack_mapping == MAP_FAILED) return -1;
-    uint8_t* stack_buffer = stack_mapping + stack_guard;
-    if (mprotect(stack_buffer, STACK_SIZE, PROT_READ | PROT_WRITE)) {
-        munmap(stack_mapping, STACK_SIZE + 2 * stack_guard);
+    uint8_t* stack_end = user_stack_map(rvvm_user_stack_size(&desc), user_exec_stack(&elf));
+    if (!stack_end) {
+        rvvm_error("Failed to map the guest stack (errno %d)", errno);
         return -1;
     }
-    if (user_exec_stack(&elf)) user_exec_protect(stack_buffer, STACK_SIZE, PROT_READ | PROT_WRITE, true);
-    user_exec_update((uintptr_t)stack_buffer, STACK_SIZE, user_exec_stack(&elf));
     free(elf.phdr_data);
     free(interp.phdr_data);
-    void* stack_top = rvvm_user_init_stack(stack_buffer + STACK_SIZE, &desc);
+    void* stack_top = rvvm_user_init_stack(stack_end, &desc);
+    user_stack_label((uintptr_t)stack_top);
 
     rvvm_info("Stack top at %p", stack_top);
 
@@ -2402,7 +2403,6 @@ RVVM_PUBLIC int rvvm_user_linux(int argc, char** argv, char** envp)
         jump_start((void*)elf.entry, stack_top);
     }
 
-    munmap(stack_mapping, STACK_SIZE + 2 * stack_guard);
     return 0;
 }
 
