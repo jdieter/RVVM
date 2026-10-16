@@ -5,7 +5,9 @@
  * other guest threads are being created and joined (host pthread_create,
  * joins and RVVM allocation in flight), and require each child to create
  * and reap a thread of its own: a child that inherited a held host libc or
- * allocator lock hangs, and the alarm fails the test. */
+ * allocator lock hangs, and the alarm fails the test. Two more threads keep
+ * the mapping paths (mmap, mremap, mprotect, munmap) and the JIT (new code
+ * made executable, flushed and run) busy, so their locks are in flight too. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <pthread.h>
@@ -16,6 +18,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <linux/futex.h>
@@ -47,6 +51,43 @@ static void* churn(void* unused)
         for (int i = 0; i < 4; ++i) pthread_join(threads[i], NULL);
         free(malloc(1 + rand() % 100000));
     }
+    return NULL;
+}
+
+static void* map_churn(void* unused)
+{
+    (void)unused;
+    size_t page = sysconf(_SC_PAGESIZE);
+    while (!atomic_load(&stop)) {
+        char* p = mmap(NULL, 4 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) return (void*)1;
+        memset(p, 1, 4 * page);
+        char* q = mremap(p, 4 * page, 16 * page, MREMAP_MAYMOVE);
+        if (q == MAP_FAILED) { munmap(p, 4 * page); return (void*)2; }
+        if (mprotect(q + page, page, PROT_READ)) return (void*)3;
+        munmap(q, 16 * page);
+    }
+    return NULL;
+}
+
+/* "addi a0, a0, imm; ret", rewritten with a new immediate each time. */
+static void* jit_churn(void* unused)
+{
+    (void)unused;
+    size_t page = sysconf(_SC_PAGESIZE);
+    uint32_t* code = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (code == MAP_FAILED) return (void*)1;
+    for (uint32_t i = 0; !atomic_load(&stop); ++i) {
+        uint32_t imm = i & 0x7ff;
+        if (mprotect(code, page, PROT_READ | PROT_WRITE)) return (void*)2;
+        code[0] = (imm << 20) | (10 << 15) | (10 << 7) | 0x13;
+        code[1] = 0x00008067;
+        if (mprotect(code, page, PROT_READ | PROT_EXEC)) return (void*)3;
+        __builtin___clear_cache((char*)code, (char*)(code + 2));
+        long (*fn)(long) = (long (*)(long))(void*)code;
+        if (fn(1000) != 1000 + (long)imm) return (void*)4;
+    }
+    munmap(code, page);
     return NULL;
 }
 
@@ -114,10 +155,11 @@ int main(int argc, char** argv)
     struct sigaction action = {.sa_handler = exit_signal, .sa_flags = SA_RESTART};
     sigemptyset(&action.sa_mask);
     sigaction(SIGUSR2, &action, NULL);
-    pthread_t churners[3];
-    int churning = mask & 0x80 ? 0 : 3;
+    void* (*const churn_fns[])(void*) = {churn, churn, churn, map_churn, jit_churn};
+    pthread_t churners[sizeof(churn_fns) / sizeof(*churn_fns)];
+    int churning = mask & 0x80 ? 0 : (int)(sizeof(churn_fns) / sizeof(*churn_fns));
     for (int i = 0; i < churning; ++i)
-        if (pthread_create(&churners[i], NULL, churn, NULL)) { puts("FAIL churn thread"); return 1; }
+        if (pthread_create(&churners[i], NULL, churn_fns[i], NULL)) { puts("FAIL churn thread"); return 1; }
     for (int round = 0; round < ROUNDS; ++round) {
         struct { const char* name; unsigned flags; int expect, options; } cases[] = {
             {"CLONE_FILES|SIGCHLD", CLONE_FILES | SIGCHLD, 11, 0},
@@ -146,7 +188,7 @@ int main(int argc, char** argv)
     for (int i = 0; i < churning; ++i) {
         void* result;
         pthread_join(churners[i], &result);
-        if (result) { puts("FAIL churn thread"); return 1; }
+        if (result) { printf("FAIL churn thread %d: %ld\n", i, (long)(intptr_t)result); return 1; }
     }
     printf("PASS %d rounds of raw-clone children during thread churn\n", ROUNDS);
     return 0;
