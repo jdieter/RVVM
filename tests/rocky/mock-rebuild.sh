@@ -16,9 +16,11 @@
 # SIGQUIT as ignored, and every test of KeyboardInterrupt or SIGINT handling
 # then fails. This script resets HUP, INT, QUIT and PIPE to their defaults
 # itself. To keep a long build independent of the login session, start it
-# with systemd-run, as kojid's builds start from a service:
-#   sudo systemd-run --unit=rebuild-foo -E SUDO_UID=$(id -u) -E SUDO_GID=$(id -g) \
-#       -E SUDO_USER=$(id -un) /bin/bash tests/rocky/mock-rebuild.sh ./rvvm_user foo.src.rpm
+# with systemd-run in the login session's SELinux domain: in the default
+# service domain, mock's userdel/groupadd --root fail on the root (status 3).
+#   sudo systemd-run --unit=rebuild-foo -p SELinuxContext=unconfined_u:unconfined_r:unconfined_t:s0 \
+#       -E SUDO_UID=$(id -u) -E SUDO_GID=$(id -g) -E SUDO_USER=$(id -un) \
+#       /bin/bash tests/rocky/mock-rebuild.sh ./rvvm_user foo.src.rpm
 #
 # Exit status is mock's. The result directory holds mock's logs and RPMs;
 # "interpreter.sha256" records the candidate used.
@@ -26,7 +28,7 @@ set -euo pipefail
 
 if [[ ${1:-} != --inner ]]; then
     if (($# < 2)); then
-        sed -n '3,24s/^# \{0,1\}//p' "$0" >&2
+        sed -n '3,26s/^# \{0,1\}//p' "$0" >&2
         exit 2
     fi
     [[ $(id -u) == 0 && -n ${SUDO_UID:-} ]] || { echo "mock-rebuild.sh: run with sudo" >&2; exit 2; }
