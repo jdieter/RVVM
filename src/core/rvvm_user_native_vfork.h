@@ -1106,6 +1106,17 @@ static void user_native_vfork_free(struct user_native_vfork* request)
     free(request);
 }
 
+/* pthread_create reports both a task limit and a failed stack mapping as
+ * EAGAIN. Linux reports only the task limit so; exhausted memory, as under a
+ * small RLIMIT_AS, is ENOMEM. Tell them apart with a small mapping. */
+static long user_native_task_error(void)
+{
+    void* probe = mmap(NULL, 65536, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (probe == MAP_FAILED) return -ENOMEM;
+    munmap(probe, 65536);
+    return -EAGAIN;
+}
+
 /* Allocate the request and start its worker. Runs on a trusted thread that
  * may use libc, with all signals blocked and the source's tracing context
  * loaded. A zero return can still carry a clone_error for issue to report. */
@@ -1134,8 +1145,7 @@ static long user_native_vfork_prepare(const struct user_native_source* source, u
     request->clone_marker = &request->clone_pid;
     request->credentials = source->credentials;
     request->cpu = user_clone_cpu_mode(source->cpu, true);
-    /* As Linux reports reaching a task limit, and rocky's VFORK did. */
-    if (!request->cpu) { free(request); return -EAGAIN; }
+    if (!request->cpu) { free(request); return -ENOMEM; }
     request->ptrace_context.bridge = user_ptrace_prepare(request->cpu, user_cpu_auxv,
         user_cpu_auxv_size, source->mask);
     if (!request->ptrace_context.bridge) { user_native_vfork_free(request); return -ENOMEM; }
@@ -1184,7 +1194,7 @@ static long user_native_vfork_prepare(const struct user_native_source* source, u
     if (!request->worker && !request->spare) {
         user_fd_table_release(request->source_table);
         user_native_vfork_free(request);
-        return -EAGAIN;
+        return user_native_task_error();
     }
     while (!atomic_load_uint32(&request->clone_ready))
         rvvm_futex_wait(&request->clone_ready, 0, RVVM_FUTEX_INFINITE);
