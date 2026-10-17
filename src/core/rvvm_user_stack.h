@@ -40,6 +40,35 @@ static size_t user_stack_gap(const struct rlimit* limit)
     return (gap + page - 1) & ~(page - 1);
 }
 
+/* The host kernel places mappings it chooses itself, such as RVVM's heap,
+ * thread stacks and JIT caches, top-down from its mmap_base, filling the
+ * highest free hole that fits. The stack's growth range is such a hole. On
+ * x86-64, mmap_base lies a random distance, up to a TiB or more, below the
+ * host stack, inside the 48-bit guest window, so host mappings could take
+ * the range and stop the stack short of RLIMIT_STACK. Find where host
+ * mappings start with a kernel-placed probe, and keep the range at least
+ * USER_STACK_HOST_ROOM below it: the host would need that much of its own
+ * mappings to reach it. Where host mappings start above the window (arm64)
+ * or grow bottom-up from far below it (the legacy layout), the window's
+ * top is kept. */
+#define USER_STACK_HOST_ROOM (UINT64_C(256) << 30)
+
+static uintptr_t user_stack_ceiling(size_t gap)
+{
+    size_t page = user_vma_page();
+    uintptr_t top = user_vma_layout.top;
+    void* probe = mmap(NULL, page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (probe == MAP_FAILED) return top;
+    munmap(probe, page);
+    uintptr_t host = (uintptr_t)probe;
+    if (host < USER_STACK_HOST_ROOM) return top;
+    uintptr_t ceiling = (host - USER_STACK_HOST_ROOM) & ~(uintptr_t)(page - 1);
+    /* Leave guest placement's heap arena and the window's floor alone. */
+    uintptr_t floor = user_vma_layout.low + user_vma_layout.brk_window * 2;
+    if (ceiling >= top || ceiling < floor + gap) return top;
+    return ceiling;
+}
+
 /* Labels the guest stack [stack] in /proc/self/maps, and reports it as the
  * start of the stack in /proc/self/stat, by moving mm->start_stack there.
  * Unprivileged PR_SET_MM_MAP replaces all of the mm's layout fields, so it
@@ -109,8 +138,14 @@ static uint8_t* user_stack_map(size_t used, bool executable)
     user_fd_lock();
     size_t least = initial + USER_STACK_GUARD_GAP;
     uint8_t* low;
+    uintptr_t ceiling = user_stack_ceiling(gap);
     for (;;) {
-        low = user_vma_map(NULL, gap, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        low = MAP_FAILED;
+        if (ceiling < user_vma_layout.top)
+            low = user_vma_map((void*)(ceiling - gap), gap, PROT_NONE,
+                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+        if (low == MAP_FAILED && (ceiling >= user_vma_layout.top || errno == EEXIST))
+            low = user_vma_map(NULL, gap, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         if (low != MAP_FAILED || errno != ENOMEM || gap <= least) break;
         size_t half = (gap / 2) & ~(page - 1);
         gap = half > least ? half : least;
