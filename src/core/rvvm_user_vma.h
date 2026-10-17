@@ -282,6 +282,7 @@ static int user_vma_protect_span(uintptr_t* addr, size_t* size, int prot)
     if (fd < 0) return -1;
     char buffer[4096], line[128];
     size_t used = 0;
+    uintptr_t below = 0;
     ssize_t count;
     while ((count = read(fd, buffer, sizeof(buffer))) != 0) {
         if (count < 0) {
@@ -302,10 +303,11 @@ static int user_vma_protect_span(uintptr_t* addr, size_t* size, int prot)
             uintptr_t start = strtoull(line, &delimiter, 16);
             if (*delimiter != '-') continue;
             uintptr_t end = strtoull(delimiter + 1, NULL, 16);
-            if (*addr < start || *addr >= end) continue;
-            /* The main stack takes this protection as it grows, too. */
+            if (*addr < start || *addr >= end) { below = end; continue; }
+            /* The main stack takes this protection as it grows, down to the
+             * mapping below it: a fixed guest mapping may lie in its range. */
             if ((prot & PROT_GROWSDOWN) && end == user_vma_stack_high && start >= user_vma_stack_low)
-                start = user_vma_stack_low;
+                start = below > user_vma_stack_low ? below : user_vma_stack_low;
             if (prot & PROT_GROWSDOWN) { *size += *addr - start; *addr = start; }
             if (prot & PROT_GROWSUP) *size = end - *addr;
             close(fd);
