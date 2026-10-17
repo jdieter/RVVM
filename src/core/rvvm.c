@@ -1360,6 +1360,19 @@ void rvvm_user_fork_child(rvvm_hart_t* thread)
     // their copied resources may contain locked state and must not be destroyed.
     vector_clear(thread->machine->harts);
     vector_push_back(thread->machine->harts, thread);
+#if defined(RVVM_USER_TEST) && defined(USE_JIT)
+    /* Where the host refuses writable-executable memory, the code cache is
+     * one memfd mapped twice, writable and executable. Those mappings are
+     * shared: this child would compile into its parent's pages, and each
+     * would run code the other wrote. Before this hart next runs guest code,
+     * rvvm_user_jit_reclaim() unmaps them and maps a cache of the child's
+     * own. Generated code has returned (this is a syscall), and nothing runs
+     * it before then. An RWX cache is a private mapping, copied on write, and
+     * keeps its code. The vanished threads' caches are never used here. */
+    if (thread->jit_enabled && thread->jit.heap.code != thread->jit.heap.data) {
+        atomic_or_uint32(&thread->user_cache_flush, 8);
+    }
+#endif
 }
 
 #if defined(RVVM_USER_TEST) && defined(__linux__) && defined(USE_JIT)

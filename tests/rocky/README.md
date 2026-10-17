@@ -204,15 +204,24 @@ To run the shared-mm VFORK fixture by hand:
 ```sh
 cc -O2 tests/rocky/mdwe-exec.c -o /tmp/mdwe-exec
 # test-exec-refused built for RISC-V from native-vfork-poc/test-exec-refused.c
-RVVM_NOJIT=1 /tmp/mdwe-exec rvvm_user_arm64 ./test-exec-refused
+/tmp/mdwe-exec rvvm_user_arm64 ./test-exec-refused
 unshare -rm sh -c 'mount -t tmpfs -o noexec tmpfs /mnt &&
     exec rvvm_user_arm64 ./test-exec-refused /mnt'
 ```
 
-The fixture forks, and under MDWE the JIT's code cache is a shared memfd
-mapping that fork children share with their parent (see TODO.txt), so use
-`RVVM_NOJIT=1` there. test-helper-death judges execute permission from the
-guest's /proc/self/maps, so it needs a host that grants EXEC.
+test-helper-death judges execute permission from the guest's
+/proc/self/maps, so it needs a host that grants EXEC.
+
+Where the host refuses writable-executable memory, the JIT code cache is
+one memfd mapped twice, writable and executable. Those mappings are shared,
+so a fork child that kept its parent's cache would compile into the same
+pages, and each process would run the other's code. A fork child therefore
+maps a cache of its own before it next runs guest code; an RWX cache is a
+private mapping and is kept. VFORK children are interpreted and never
+compile. `native-vfork-poc/test-jit-fork.c` has a parent and its fork,
+CLONE_FILES fork, private VFORK and shared-mm VFORK children compile at the
+same time and checks every result; run it under `mdwe-exec` with the JIT
+enabled.
 
 ### Existing implementation regressions
 

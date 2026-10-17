@@ -10,8 +10,7 @@
  * parent runs the child's mappings too.
  *
  * Usage: test-exec-refused [noexec directory]
- * Run the emulator under tests/rocky/mdwe-exec to refuse EXEC gains, with
- * RVVM_NOJIT=1 until fork children stop sharing the JIT cache there (see
+ * Run the emulator under tests/rocky/mdwe-exec to refuse EXEC gains (see
  * tests/rocky/README.md). RVVM deliberately accepts noexec files, as before
  * host EXEC was requested; natively, and on a RISC-V kernel, they fail with
  * EPERM and EACCES. */

@@ -100,7 +100,7 @@ rvvm_addr_t riscv_hart_run_userland(rvvm_hart_t* vm)
     if (flush) {
         riscv_jit_flush_cache(vm);
         riscv_tlb_flush(vm);
-        if (flush & 6) {
+        if (flush & 14) {
             if (!vm->user_native_interpreter)
                 rvvm_user_jit_reclaim(vm);
         }

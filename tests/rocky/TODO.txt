@@ -299,13 +299,16 @@ requested. Exec mappings of noexec files are accepted on purpose, as rocky
 did. test-exec-refused.S (run-tests.sh, with mdwe-exec.c) and
 native-vfork-poc/test-exec-refused.c cover it.
 
-Open: under MDWE, forking fixtures (test-thread-kill-main,
-test-raw-fork-churn, test-snapshot-witness and others) crash with host faults
-in JIT code, on rocky as well; RVVM_NOJIT=1 avoids it. Likely cause: where
-host RWX is refused, rvjit's code cache is a MAP_SHARED memfd mapped twice
-(vma_multi_mmap), and nothing replaces it after fork, so parent and child
-share one cache and overwrite each other's translations. Give fork children
-a private cache, or copy the cache and remap both views in the child.
+Fork children sharing a W^X JIT cache (fixed 2026-10-17). Under MDWE,
+forking fixtures (test-thread-kill-main, test-raw-fork-churn,
+test-snapshot-witness and others) crashed with host faults or SIGILL in JIT
+code, on rocky as well; RVVM_NOJIT=1 avoided it. Where host RWX is refused,
+rvjit's code cache is a MAP_SHARED memfd mapped twice (vma_multi_mmap), and
+nothing replaced it after fork, so parent and child shared one cache and
+overwrote each other's translations. A fork child now frees that cache and
+maps its own before it next runs guest code (user_cache_flush 8). Caches are
+mapped with the descriptor guard taken before global_lock, as the fork path
+takes them. native-vfork-poc/test-jit-fork.c covers it.
 
 Regression coverage: mapping type and alias visibility; locked-memory limits;
 fault-driven stack growth; populate behavior; huge pages; unknown flag bits;
