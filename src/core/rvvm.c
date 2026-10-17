@@ -26,6 +26,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include <util/spinlock.h>
 #include <util/stacktrace.h>
 #include <util/threading.h>
+#include <util/user_fd_guard.h>
 #include <util/utils.h>
 #include <util/vector.h>
 
@@ -1494,6 +1495,10 @@ void rvvm_user_jit_reclaim(rvvm_hart_t* hart)
     uint64_t old;
     if (hart->machine->user_jit_enter) hart->machine->user_jit_enter();
     user_jit_block_signals(&old);
+    /* Where the host refuses RWX memory, the cache is a memfd mapped twice,
+     * made under the descriptor guard. Descriptor operations, the fork path
+     * among them, take that guard before global_lock: take it first here. */
+    user_fd_lock();
     spin_lock(&global_lock);
     /* Only the owning thread calls this, after generated code has returned. */
     riscv_jit_flush_cache(hart);
@@ -1501,6 +1506,7 @@ void rvvm_user_jit_reclaim(rvvm_hart_t* hart)
     hart->jit_enabled = false;
     if (!hart->machine->user_jit_pressure) user_jit_prepare(hart);
     spin_unlock(&global_lock);
+    user_fd_unlock();
     syscall(SYS_rt_sigprocmask, SIG_SETMASK, &old, NULL, 8);
     if (hart->machine->user_jit_leave) hart->machine->user_jit_leave();
 #else
@@ -1558,7 +1564,11 @@ static rvvm_hart_t* user_thread_create(rvvm_machine_t* machine, bool interpreter
 #endif
             if (prepare) {
 #if defined(RVVM_USER_TEST) && defined(__linux__) && defined(USE_JIT)
-                user_jit_prepare(thread);
+                /* Map the code cache when the thread first runs. A W^X cache
+                 * takes the descriptor guard, which this lock must not hold
+                 * (see rvvm_user_jit_reclaim), nor may the reaper lock that
+                 * rvvm_sys_clone holds here. */
+                if (rvvm_get_opt(machine, RVVM_OPT_JIT)) atomic_or_uint32(&thread->user_cache_flush, 4);
 #else
                 riscv_hart_prepare(thread);
 #endif

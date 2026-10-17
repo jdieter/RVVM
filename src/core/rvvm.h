@@ -307,6 +307,9 @@ struct align_cacheline rvvm_hart_t {
 #ifdef RVVM_USER_TEST
     uint64_t user_fault_pc;
     volatile uint32_t user_fault_interpreted;
+    /* Requests for the hart's next run. 1 flushes its JIT and TLB. 2 and 4
+     * (memory pressure; pressure lifted or a new thread) also free its JIT
+     * cache, then map a new one unless memory is under pressure. */
     uint32_t user_cache_flush;
 #endif
 #ifdef RVVM_USER_TEST
