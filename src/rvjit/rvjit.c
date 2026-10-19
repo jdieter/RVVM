@@ -177,7 +177,13 @@ bool rvjit_ctx_init(rvjit_block_t* block, size_t size)
         void* rw   = NULL;
         void* exec = NULL;
         if (!vma_multi_mmap(&rw, &exec, size)) {
+#ifdef RVVM_USER_TEST
+            // The guest's own stderr: a guest that caps its address space
+            // (RLIMIT_AS) hits this routinely and runs interpreted
+            rvvm_info("Failed to allocate W^X RVJIT heap, interpreting");
+#else
             rvvm_warn("Failed to allocate W^X RVJIT heap!");
+#endif
             return false;
         }
         block->heap.data = rw;
