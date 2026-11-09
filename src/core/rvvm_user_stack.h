@@ -69,13 +69,19 @@ static uintptr_t user_stack_ceiling(size_t gap)
     return ceiling;
 }
 
-/* Labels the guest stack [stack] in /proc/self/maps, and reports it as the
- * start of the stack in /proc/self/stat, by moving mm->start_stack there.
+/* Points the kernel's view of the process at the guest's stack. Moving
+ * mm->start_stack labels the guest stack [stack] in /proc/self/maps and
+ * reports it in /proc/self/stat. Moving the argument and environment ranges
+ * to the guest's strings makes /proc/PID/cmdline and environ, and so ps,
+ * show the guest's arguments rather than the emulator's, and follow the
+ * guest when it rewrites them in place, as setproctitle does; the strings
+ * are contiguous, so a title may run on into the environment, as natively.
  * Unprivileged PR_SET_MM_MAP replaces all of the mm's layout fields, so it
  * re-supplies the current ones; brk among them, which only a concurrent brk
  * can change, so this runs only while the process has a single thread. The
- * kernel may lack checkpoint/restore support: the label is then missing. */
-static void user_stack_label(uintptr_t start_stack)
+ * kernel may lack checkpoint/restore support: the host's view then stays. */
+static void user_stack_publish(uintptr_t start_stack, uintptr_t arg_start,
+                               uintptr_t arg_end, uintptr_t env_end)
 {
 #ifdef PR_SET_MM_MAP
     char buffer[2048];
@@ -104,16 +110,16 @@ static void user_stack_label(uintptr_t start_stack)
         .start_data = value[45], .end_data = value[46],
         .start_brk = value[47], .brk = (uint64_t)syscall(SYS_brk, 0),
         .start_stack = start_stack,
-        .arg_start = value[48], .arg_end = value[49],
-        .env_start = value[50], .env_end = value[51],
+        .arg_start = arg_start, .arg_end = arg_end,
+        .env_start = arg_end, .env_end = env_end,
         .exe_fd = (uint32_t)-1,
     };
-    if (!map.start_code || !map.end_code || !map.arg_start || !map.env_start) return;
+    if (!map.start_code || !map.end_code) return;
     if (prctl(PR_SET_MM, PR_SET_MM_MAP, (unsigned long)&map, sizeof(map), 0)) {
-        rvvm_info("Cannot label the guest stack: %s", strerror(errno));
+        rvvm_info("Cannot publish the guest stack: %s", strerror(errno));
     }
 #else
-    UNUSED(start_stack);
+    UNUSED(start_stack); UNUSED(arg_start); UNUSED(arg_end); UNUSED(env_end);
 #endif
 }
 

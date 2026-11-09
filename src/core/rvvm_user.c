@@ -2116,6 +2116,12 @@ typedef struct {
     size_t interp_entry; // ELF interpreter entry point
     size_t phdr;         // Address of ELF PHDR section
     size_t phnum;        // Number of PHDRs
+
+    // Set by rvvm_user_init_stack: the argument strings, followed directly
+    // by the environment's, which end at env_end
+    size_t arg_start;
+    size_t arg_end;
+    size_t env_end;
 } exec_desc_t;
 
 /*
@@ -2212,6 +2218,9 @@ static char* rvvm_user_init_stack(void* stack, exec_desc_t* desc)
         stack = stack_put_str(stack, desc->argv[i]);
         string_ptrs[i] = (size_t)stack;
     }
+    desc->arg_start = (size_t)stack;
+    desc->arg_end = envc ? string_ptrs[desc->argc + 1] : (size_t)execfn;
+    desc->env_end = (size_t)execfn;
 
     // 5. random bytes
     char rng_buf[16] = {0};
@@ -2393,7 +2402,7 @@ RVVM_PUBLIC int rvvm_user_linux(int argc, char** argv, char** envp)
     free(elf.phdr_data);
     free(interp.phdr_data);
     void* stack_top = rvvm_user_init_stack(stack_end, &desc);
-    user_stack_label((uintptr_t)stack_top);
+    user_stack_publish((uintptr_t)stack_top, desc.arg_start, desc.arg_end, desc.env_end);
 
     rvvm_info("Stack top at %p", stack_top);
 
