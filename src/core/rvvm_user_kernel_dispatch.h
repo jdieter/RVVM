@@ -360,6 +360,7 @@ static bool user_kernel_dispatch(rvvm_hart_t* cpu, long nr, long a[6], long* res
         case 26: host = SYS_inotify_init1; break;
         case 27: host = SYS_inotify_add_watch; break;
         case 28: host = SYS_inotify_rm_watch; break;
+        case 74: host = SYS_signalfd4; break;
         case 76: host = SYS_splice; break;
         case 71: host = SYS_sendfile; break;
         case 77: host = SYS_tee; break;
@@ -512,8 +513,8 @@ static bool user_kernel_dispatch(rvvm_hart_t* cpu, long nr, long a[6], long* res
     if ((nr == 54 || nr == 55) && fake_root) { *result = 0; return true; }
     if (nr == 5 || nr == 6 || nr == 7)
         a[4] = uapi_translate_flags(a[4], uapi_xattr_flags, STATIC_ARRAY_SIZE(uapi_xattr_flags), true);
-    if (nr == 26 || nr == 85) {
-        unsigned arg = nr == 26 ? 0 : 1;
+    if (nr == 26 || nr == 74 || nr == 85) {
+        unsigned arg = nr == 26 ? 0 : nr == 74 ? 3 : 1;
         a[arg] = uapi_translate_flags(a[arg], uapi_fd_create_flags,
                                       STATIC_ARRAY_SIZE(uapi_fd_create_flags), true);
     }

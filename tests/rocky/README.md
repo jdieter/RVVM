@@ -170,6 +170,13 @@ guest-only test-pidfd-getfd.S checks this policy and the continued operation
 of pidfd_open/pidfd_send_signal; it also checks getfd with NOFILE=0.
 test-kcmp.S covers all object types, malformed arguments and NOFILE=0.
 Both policy tests run in the existing regression suite.
+
+`test-signalfd.S` checks blocked signal delivery, mask replacement, epoll
+readiness, descriptor flags and errors, and inherited signalfds in ordinary
+fork and shared-mm VFORK children. Its optional `exec` argument also checks
+inheritance and CLOEXEC across guest exec; run that mode with the candidate
+registered in a private binfmt namespace so exec uses the same emulator.
+
 test-pidfd-getfd-conformance.c retains the four
 native behavioral oracles for future support; it is not a passing guest
 acceptance suite while the syscall is disabled. See TODO.txt for the reason

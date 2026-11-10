@@ -112,6 +112,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <sys/xattr.h>   // fgetxattr(), fsetxattr()
 #include <sys/inotify.h>
 #include <sys/timerfd.h>
+#include <sys/signalfd.h>
 #include <sys/timex.h>
 
 // Put syscall headers here
@@ -187,6 +188,9 @@ static const struct uapi_flag_map uapi_fd_create_flags[] = {
 /* These interfaces share their Linux ABI on RV64, AArch64 and x86-64. */
 BUILD_ASSERT(IN_NONBLOCK == O_NONBLOCK && IN_CLOEXEC == O_CLOEXEC);
 BUILD_ASSERT(TFD_NONBLOCK == O_NONBLOCK && TFD_CLOEXEC == O_CLOEXEC);
+BUILD_ASSERT(SFD_NONBLOCK == O_NONBLOCK && SFD_CLOEXEC == O_CLOEXEC);
+BUILD_ASSERT(sizeof(struct signalfd_siginfo) == 128
+             && offsetof(struct signalfd_siginfo, ssi_ptr) == 48);
 BUILD_ASSERT(TFD_TIMER_ABSTIME == 1 && TFD_TIMER_CANCEL_ON_SET == 2);
 BUILD_ASSERT(sizeof(struct itimerspec) == 32);
 BUILD_ASSERT(offsetof(struct itimerspec, it_value) == 16);

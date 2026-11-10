@@ -64,7 +64,7 @@ static unsigned user_exe_fd_args(unsigned nr)
         case 35: case 37: case 44: case 46: case 47: case 48: case 50:
         case 52: case 53: case 54: case 55: case 56: case 61: case 62:
         case 63: case 64: case 65: case 66: case 67: case 68: case 69: case 70: case 71:
-        case 75: case 76: case 77: case 78: case 79: case 80: case 82: case 83: case 84:
+        case 74: case 75: case 76: case 77: case 78: case 79: case 80: case 82: case 83: case 84:
         case 86: case 87: case 88: case 182: case 183: case 185: case 200: case 201: case 202: case 203:
         case 204: case 205: case 206: case 207: case 208: case 209:
         case 210: case 211: case 212: case 213: case 223: case 242: case 243: case 264:
@@ -84,7 +84,10 @@ static void user_exe_filter_args(long nr, long a[6])
     unsigned mask = user_exe_fd_args(nr);
     if (nr == 57) mask |= 1;
     for (unsigned i = 0; i < 3; ++i)
-        if ((mask & (1U << i)) && user_private_fd((int)a[i])) a[i] = -1;
+        if ((mask & (1U << i)) && user_private_fd((int)a[i])) {
+            // signalfd4(-1) creates a descriptor rather than rejecting it.
+            a[i] = nr == 74 ? -2 : -1;
+        }
     if (nr == 95 && a[0] == 3 && user_private_fd((int)a[1])) a[1] = -1;
     if (nr == 222 && !(a[3] & 0x20) /* RISC-V MAP_ANONYMOUS */
         && user_private_fd((int)a[4])) a[4] = -1;
