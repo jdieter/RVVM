@@ -1647,6 +1647,7 @@ static void* rvvm_user_thread_wrap(void* arg)
 
     while (running) {
         user_ptrace_checkpoint(cpu);
+        user_ptrace_restart_resume();
         user_ptrace_pending_signal(cpu);
         user_signal_deliver(cpu);
         rvvm_addr_t cause;
@@ -1928,7 +1929,8 @@ static void* rvvm_user_thread_wrap(void* arg)
 #endif
                 default:
 #ifndef __riscv
-                    rvvm_error("Unknown syscall %ld!", a7);
+                    // Unsupported syscall probes return ENOSYS without guest-visible diagnostics.
+                    rvvm_info("Unknown syscall %ld!", a7);
                     a0 = -UAPI_ENOSYS;
 #else
                     a0 = errno_ret(syscall(a7, a0, a1, a2, a3, a4, a5));
@@ -2312,6 +2314,7 @@ RVVM_PUBLIC int rvvm_user_linux(int argc, char** argv, char** envp)
     }
     stacktrace_init();
     user_fault_handler_install();
+    user_ptrace_set_syscall_pc((uintptr_t)user_safe_end);
     user_cpu_init();
     if (!user_exe_init(wrap_path(path_buf, executable))) {
         rvvm_error("Failed to pin guest executable %s", executable);

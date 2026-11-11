@@ -15,7 +15,7 @@ static void user_ptrace_restart_prepare(rvvm_hart_t* cpu)
 {
     unsigned nr = rvvm_read_cpu_reg(cpu, RVVM_REGID_X0 + 17);
     if (nr != 98 && nr != 101 && nr != 115) return;
-    if (!user_ptrace_tracing()) return;
+    if (user_ptrace_detour_active()) return;
     uint64_t args[6];
     for (unsigned i = 0; i < 6; i++) args[i] = rvvm_read_cpu_reg(cpu, RVVM_REGID_X0 + 10 + i);
     bool absolute = false;
@@ -63,6 +63,11 @@ static struct timespec user_ptrace_restart_remaining(void)
         if (remaining.tv_sec < 0) remaining = (struct timespec){0};
     }
     return remaining;
+}
+
+static void user_ptrace_restart_resume(void)
+{
+    if (user_ptrace_restart_requested()) user_ptrace_restart.valid = user_ptrace_restart.prepared;
 }
 
 static rvvm_addr_t user_ptrace_restart_syscall(void)

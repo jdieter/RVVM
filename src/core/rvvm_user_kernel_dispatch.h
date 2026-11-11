@@ -158,6 +158,8 @@ static long user_internal_target(long nr, const long* a)
 
 static bool user_kernel_dispatch(rvvm_hart_t* cpu, long nr, long a[6], long* result)
 {
+    if ((nr == 63 || nr == 65 || nr == 67 || nr == 69 || nr == 286)
+        && user_proc_maps_read(nr, a, result)) return true;
     long host;
     long hidden = user_internal_target(nr, a);
     if (hidden) { *result = hidden; return true; }
@@ -272,6 +274,7 @@ static bool user_kernel_dispatch(rvvm_hart_t* cpu, long nr, long a[6], long* res
             return true;
         }
         case 98: *result = rvvm_sys_futex((void*)a[0], a[1], a[2], a[3], (void*)a[4], a[5]); return true;
+        case 283: host = SYS_membarrier; break;
         case 113: case 114: {
             /* Keep the host vDSO fast path, without letting its direct store
              * turn an invalid guest output pointer into an emulator fault. */

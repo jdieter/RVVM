@@ -16,6 +16,8 @@ struct user_proc_reader {
     int fd;
     int error;
     size_t cursor, available;
+    bool positional;
+    uint64_t offset;
     char bytes[1024];
 };
 
@@ -29,12 +31,17 @@ static inline bool user_proc_byte(struct user_proc_reader* reader, char* byte)
 {
     if (reader->cursor == reader->available) {
         long count;
-        do { count = syscall(SYS_read, reader->fd, reader->bytes, sizeof(reader->bytes)); }
+        do {
+            count = reader->positional
+                ? syscall(SYS_pread64, reader->fd, reader->bytes, sizeof(reader->bytes), reader->offset)
+                : syscall(SYS_read, reader->fd, reader->bytes, sizeof(reader->bytes));
+        }
         while (count < 0 && errno == EINTR);
         if (count <= 0) {
             if (count < 0) reader->error = errno;
             return false;
         }
+        reader->offset += count;
         reader->cursor = 0;
         reader->available = count;
     }

@@ -180,6 +180,93 @@ static long user_cpu_view_write(int fd, const void* data, size_t size)
     return 0;
 }
 
+#include "rvvm_user_proc_maps.h"
+
+struct user_proc_maps_buffer { char* data; size_t size, capacity; };
+
+static long user_proc_maps_append(void* opaque, const char* data, size_t size)
+{
+    struct user_proc_maps_buffer* view = opaque;
+    if (size > SIZE_MAX - view->size) return -EOVERFLOW;
+    if (view->size + size > view->capacity) {
+        size_t next = EVAL_MAX(view->size + size, view->capacity ? view->capacity * 2 : 16384);
+        char* buffer = user_runtime_allocate(next);
+        if (!buffer) return -ENOMEM;
+        if (view->size) memcpy(buffer, view->data, view->size);
+        user_runtime_release(view->data);
+        view->data = buffer; view->capacity = next;
+    }
+    memcpy(view->data + view->size, data, size);
+    view->size += size;
+    return 0;
+}
+
+static bool user_proc_maps_descriptor(int fd)
+{
+    struct stat st;
+    if (fstat(fd, &st) || !S_ISREG(st.st_mode) || !user_cpu_have_proc
+        || st.st_dev != user_cpu_proc_device) return false;
+    char descriptor[64], path[128];
+    snprintf(descriptor, sizeof(descriptor), "/proc/thread-self/fd/%d", fd);
+    ssize_t length = readlink(descriptor, path, sizeof(path) - 1);
+    if (length < 0 || length == sizeof(path) - 1) return false;
+    path[length] = 0;
+    return user_proc_self_maps(path);
+}
+
+/* Keep Linux's real maps descriptor so PROCMAP_QUERY and descriptor operations
+ * retain their kernel semantics. Only text reads need the guest VMA view.
+ * Positional source reads must not consume the guest's (filtered) file offset. */
+static no_inline bool user_proc_maps_read(long nr, long a[6], long* result)
+{
+    user_fd_lock();
+    if (!user_proc_maps_descriptor((int)a[0])) { user_fd_unlock(); return false; }
+    struct iovec single = {(void*)a[1], a[2]}, *vectors = &single;
+    size_t count = 1;
+    bool vector = nr == 65 || nr == 69 || nr == 286;
+    bool positional = nr == 67 || nr == 69 || (nr == 286 && a[3] != -1);
+    struct user_proc_maps_buffer view = {0};
+    long ret = 0;
+    if (vector) {
+        count = (unsigned long)a[2];
+        if (count > 1024) { ret = -EINVAL; goto out; }
+        vectors = user_runtime_allocate((count ? count : 1) * sizeof(*vectors));
+        if (!vectors) { ret = -ENOMEM; goto out; }
+        ret = uapi_extra_copy(vectors, (void*)a[1], count * sizeof(*vectors), false);
+        if (ret) goto out;
+    }
+    /* Do not silently discard preadv2 flags we do not implement. */
+    if (nr == 286 && a[5]) { ret = -EOPNOTSUPP; goto out; }
+    size_t size = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (vectors[i].iov_len > LONG_MAX - size) { ret = -EINVAL; goto out; }
+        size += vectors[i].iov_len;
+    }
+    long offset = positional ? a[3] : syscall(SYS_lseek, (int)a[0], 0, SEEK_CUR);
+    if (offset < 0) { ret = positional ? -EINVAL : -errno; goto out; }
+    int flags = fcntl((int)a[0], F_GETFL);
+    if (flags < 0 || (flags & O_PATH) || (flags & O_ACCMODE) == O_WRONLY) { ret = -EBADF; goto out; }
+    if (!size) goto out;
+    ret = user_proc_maps_emit((int)a[0], user_proc_maps_append, &view);
+    if (ret || (uint64_t)offset >= view.size) goto out;
+    size = EVAL_MIN(size, view.size - offset);
+    size_t remaining = size;
+    for (size_t i = 0; i < count; ++i) {
+        vectors[i].iov_len = EVAL_MIN(vectors[i].iov_len, remaining);
+        remaining -= vectors[i].iov_len;
+    }
+    struct iovec local = {view.data + offset, size};
+    ret = errno_ret(syscall(SYS_process_vm_writev, syscall(SYS_gettid),
+                           &local, 1, vectors, count, 0));
+    if (ret > 0 && !positional) syscall(SYS_lseek, (int)a[0], offset + ret, SEEK_SET);
+out:
+    user_runtime_release(view.data);
+    if (vector) user_runtime_release(vectors == &single ? NULL : vectors);
+    user_fd_unlock();
+    *result = ret;
+    return true;
+}
+
 // Classify the resolved descriptor, after Linux has checked pathname, permissions,
 // symlinks, dirfd and openat2 resolve flags. Native opens in RVVM itself bypass this.
 static long user_cpu_open_special_inner(long fd, unsigned long flags, dev_t device)

@@ -1052,6 +1052,7 @@ static int user_native_child(void* opaque)
             user_fault_address(cpu);
         }
         user_ptrace_checkpoint(cpu);
+        user_ptrace_restart_resume();
         user_ptrace_pending_signal(cpu);
         user_signal_deliver(cpu);
         user_fault_armed = 1;

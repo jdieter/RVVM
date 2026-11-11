@@ -29,6 +29,7 @@
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define BRIDGE_MAGIC UINT64_C(0x5256564d50545203)
@@ -43,6 +44,11 @@
 #define STOP_ENTRY 1
 #define STOP_EXIT 2
 #define STOP_SIGNAL 3
+struct blocked_call {
+    uint64_t pc, resume_pc, sp, arg0;
+    int32_t restart;
+    uint32_t active, rewound;
+};
 struct bridge {
     uint64_t magic, hart;
     uint64_t clone_hart;
@@ -61,6 +67,9 @@ struct bridge {
     struct user_ptrace_syscall_state syscall;
     uint64_t replay_requested, replay_area;
     int32_t replay_error;
+    uint64_t native_syscall_pc;
+    struct blocked_call blocked;
+    uint32_t restart_requested;
 };
 static _Thread_local struct bridge* self;
 static _Thread_local bool stepped;
@@ -69,6 +78,14 @@ static spinlock_t bridge_pool_lock = SPINLOCK_INIT;
 static struct bridge* bridge_pool;
 static unsigned bridge_pool_count;
 static void* bridge_marker;
+static uintptr_t native_syscall_pc;
+
+void user_ptrace_set_syscall_pc(uintptr_t pc) { native_syscall_pc = pc; }
+bool user_ptrace_detour_active(void) { return self && atomic_load_uint32(&self->blocked.active); }
+bool user_ptrace_restart_requested(void)
+{
+    return self && atomic_swap_uint32(&self->restart_requested, 0);
+}
 
 void user_ptrace_context_save(struct user_ptrace_context* context)
 {
@@ -453,6 +470,7 @@ void* user_ptrace_prepare(rvvm_hart_t* cpu, const uint64_t* auxv, size_t size, u
     next->exe_fd_pointer = (uintptr_t)executable_fd;
     next->signal_mask_value = mask;
     next->phase = PHASE_NEW;
+    next->native_syscall_pc = native_syscall_pc;
     if (size <= sizeof(next->auxv)) { memcpy(next->auxv, auxv, size); next->auxv_size = size; }
     if (self) {
         next->options = self->options;
@@ -659,9 +677,10 @@ rvvm_addr_t user_ptrace_run(rvvm_hart_t* cpu)
 
 static void capture_event(pid_t, int, struct user_ptrace_event*);
 
-static int synchronize(pid_t pid, uintptr_t addr, struct bridge* state)
+static int synchronize(pid_t pid, uintptr_t addr, struct bridge* state, bool interrupt_syscall)
 {
-    if (state->stopped || state->phase != PHASE_RUNNING) return 0;
+    if (state->stopped || (state->phase != PHASE_RUNNING
+        && !(interrupt_syscall && state->phase == PHASE_DISPATCH))) return 0;
     siginfo_t info;
     long info_ret = host_ptrace(PTRACE_GETSIGINFO, pid, 0, (uintptr_t)&info);
     uint32_t info_valid = info_ret < 0 ? 2 : 1;
@@ -864,7 +883,7 @@ long user_ptrace_wait(long pid, int* status)
         }
         if ((!kind || (kind == PTRACE_EVENT_STOP && WSTOPSIG(value) == SIGTRAP))
             && state.phase == PHASE_RUNNING && !state.stopped) {
-            int ret = synchronize(pid, bridge, &state);
+            int ret = synchronize(pid, bridge, &state, false);
             if (ret) return ret;
         }
         if (state.stopped && state.stop_type == STOP_SIGNAL) {
@@ -1015,7 +1034,7 @@ static int detach_mailbox(pid_t pid, uintptr_t address, struct bridge* state)
     if (!user_ptrace_replay_pending(pid)) return 0;
     if (!state->stopped) {
         state->phase = PHASE_RUNNING;
-        int ret = synchronize(pid, address, state);
+        int ret = synchronize(pid, address, state, false);
         if (ret) return ret;
         if (!state->stopped) return -EAGAIN;
     }
@@ -1067,6 +1086,39 @@ static siginfo_t resume_info(const struct user_ptrace_stop* stop, unsigned signo
         info.si_pid = getpid(); info.si_uid = geteuid();
     }
     return info;
+}
+
+/* At a ptrace delivery stop inside our syscall entry, Linux exposes a
+ * private restart result. The guest debugger must see that result too. */
+static int blocked_restart(pid_t pid, const struct bridge* state, const uint64_t* guest)
+{
+    uint64_t regs[34];
+    struct iovec vector = {regs, sizeof(regs)};
+    if (!state->native_syscall_pc || host_ptrace(PTRACE_GETREGSET, pid, 1, (uintptr_t)&vector)) return 0;
+#if defined(__aarch64__)
+    if (vector.iov_len < sizeof(regs)) return 0;
+    TRACE("native-call pid=%d pc=%lx expected=%lx result=%ld", pid,
+          (unsigned long)regs[32], (unsigned long)state->native_syscall_pc, (long)regs[0]);
+    uint64_t pc = regs[32];
+    unsigned instruction_size = 4;
+    int64_t result = regs[0];
+#elif defined(__x86_64__)
+    if (vector.iov_len < 27 * 8) return 0;
+    uint64_t pc = regs[16];
+    unsigned instruction_size = 2;
+    int64_t result = regs[10];
+#else
+    return 0;
+#endif
+    if (pc == state->native_syscall_pc)
+        return result == -512 || result == -513 || result == -514 || result == -516 ? result : 0;
+    if (pc != state->native_syscall_pc - instruction_size) return 0;
+    /* Group stops can expose Linux's already rewound entry instead of its
+     * restart result. Keep the guest PC at its ecall in that case. */
+    unsigned nr = guest[17];
+    bool timed = nr == 101 || (nr == 115 && !(guest[11] & TIMER_ABSTIME))
+        || (nr == 98 && guest[13] && ((guest[11] & 127) == 0 || (guest[11] & 127) == 9));
+    return timed ? 516 : 512;
 }
 
 long user_ptrace_request(unsigned long request, pid_t pid, uintptr_t addr, uintptr_t data)
@@ -1206,19 +1258,63 @@ long user_ptrace_request(unsigned long request, pid_t pid, uintptr_t addr, uintp
         if (ret) return ret;
         bool in_host_call = state.phase == PHASE_DISPATCH && !state.stopped;
         if (addr == 1 && in_host_call) {
+            uint64_t resume_pc = regs[0];
             regs[0] += 4;
             if (state.tid != (uint32_t)pid) regs[10] = 0;
+            int restart = blocked_restart(pid, &state, regs);
+            if (restart && !state.blocked.active) {
+                if (restart > 0) regs[0] = resume_pc;
+                state.blocked = (struct blocked_call){.pc = regs[0], .resume_pc = resume_pc,
+                    .sp = regs[2], .arg0 = regs[10], .restart = restart > 0 ? -restart : restart,
+                    .rewound = restart > 0};
+                ret = remote(pid, bridge + offsetof(struct bridge, blocked), &state.blocked,
+                             sizeof(state.blocked), true);
+                if (ret) return ret;
+                if (restart < 0) regs[10] = (uint64_t)(int64_t)restart;
+            }
         }
         if (request == PTRACE_GETREGSET) {
             if (copy_guest(regs, (uintptr_t)iov.iov_base, size, true)) return -EFAULT;
             iov.iov_len = size;
             return copy_guest(&iov, data, sizeof(iov), true);
         }
+        uint64_t original_pc = regs[0];
         if (copy_guest(regs, (uintptr_t)iov.iov_base, size, false)) return -EFAULT;
         if (state.phase == PHASE_EXIT)
             return remote(pid, bridge + (addr == 1 ? offsetof(struct bridge, exit_regs)
                           : offsetof(struct bridge, exit_fp)), regs, size, true);
         if (addr == 1) {
+            TRACE("setregs pid=%d phase=%u stopped=%u pc=%lx -> %lx", pid,
+                  state.phase, state.stopped, (unsigned long)original_pc, (unsigned long)regs[0]);
+            /* A debugger can redirect a thread out of a blocked syscall to
+             * invoke a function. Reach the dispatcher before installing its
+             * new PC; otherwise the host wait keeps running with stale args. */
+            if (in_host_call && regs[0] != original_pc) {
+                if (state.blocked.restart && state.blocked.pc == original_pc) {
+                    state.blocked.active = 1;
+                    ret = remote(pid, bridge + offsetof(struct bridge, blocked), &state.blocked,
+                                 sizeof(state.blocked), true);
+                    if (ret) return ret;
+                }
+                ret = synchronize(pid, bridge, &state, true);
+                if (ret) return ret;
+                in_host_call = false;
+            }
+            if (state.blocked.active && regs[0] == state.blocked.pc && regs[2] == state.blocked.sp
+                && (state.blocked.rewound ? regs[10] == state.blocked.arg0
+                                         : (int64_t)regs[10] == state.blocked.restart)) {
+                /* Restore the interrupted call after vgdb's invoker. Timed
+                 * waits use restart_syscall and the original deadline. */
+                regs[0] = state.blocked.resume_pc;
+                regs[10] = state.blocked.arg0;
+                uint32_t restart = state.blocked.restart == -516;
+                if (restart) regs[17] = 128;
+                ret = remote(pid, bridge + offsetof(struct bridge, restart_requested), &restart, 4, true);
+                memset(&state.blocked, 0, sizeof(state.blocked));
+                if (!ret) ret = remote(pid, bridge + offsetof(struct bridge, blocked), &state.blocked,
+                                       sizeof(state.blocked), true);
+                if (ret) return ret;
+            }
             if (in_host_call) regs[0] -= 4;
             ret = remote(pid, state.hart + offsetof(rvvm_hart_t, registers)
                 + RISCV_REG_PC * sizeof(rvvm_uxlen_t), regs, 8, true);
@@ -1239,7 +1335,7 @@ long user_ptrace_request(unsigned long request, pid_t pid, uintptr_t addr, uintp
             if (ret) return ret;
             data = 0;
         }
-        int ret = synchronize(pid, bridge, &state);
+        int ret = synchronize(pid, bridge, &state, false);
         if (ret) return ret;
         ret = dirty_process(pid);
         if (ret) return ret;

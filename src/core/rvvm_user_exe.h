@@ -119,7 +119,13 @@ static bool user_exe_init(const char* path)
     if (fd < 0) fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return false;
     // Keep the pinned guest inode away from normal guest descriptor allocation.
-    int pin = fcntl(fd, F_DUPFD_CLOEXEC, 1024);
+    struct rlimit limit;
+    int minimum = 1024;
+    // With a small soft limit, keep the pin above the ordinary guest slots
+    // instead of consuming fd 64 when applications lower their limit.
+    if (!getrlimit(RLIMIT_NOFILE, &limit) && limit.rlim_cur && limit.rlim_cur <= 1024)
+        minimum = limit.rlim_cur - 1;
+    int pin = fcntl(fd, F_DUPFD_CLOEXEC, minimum);
     if (pin < 0) pin = fcntl(fd, F_DUPFD_CLOEXEC, 64);
     if (pin < 0) pin = fd;
     else close(fd);
@@ -180,6 +186,8 @@ static user_fd_table_t* user_exe_fd_directory(int fd)
     char name[64], path[128];
     snprintf(name, sizeof(name), "/proc/thread-self/fd/%d", fd);
     ssize_t n = readlink(name, path, sizeof(path) - 2);
+    // fdinfo exposes the same private descriptors as the fd directory.
+    if (n >= 7 && !memcmp(path + n - 7, "/fdinfo", 7)) n -= 4;
     if (n < 3 || memcmp(path + n - 3, "/fd", 3)) return NULL;
     path[n] = 0;
     if (strncmp(path, "/proc/", 6)) return NULL;

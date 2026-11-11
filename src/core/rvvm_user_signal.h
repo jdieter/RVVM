@@ -179,7 +179,13 @@ static long user_safe_syscall(long nr, long a, long b, long c, long d, long e, l
         else if (nr == SYS_pselect6) { select_mask.set = &host_mask; f = (long)&select_mask; }
         else e = (long)&host_mask;
     }
+    /* The new interpreter must inherit the guest mask, including signals
+     * kept unblocked for native fault recovery and NPTL in this runtime. */
+    bool exec = nr == SYS_execve || nr == SYS_execveat;
+    uint64_t exec_mask;
+    if (exec && syscall(SYS_rt_sigprocmask, SIG_SETMASK, &user_sig.mask, &exec_mask, 8)) return -1;
     long ret = user_safe_raw(&user_sig.pending, nr, a, b, c, d, e, f);
+    if (exec) syscall(SYS_rt_sigprocmask, SIG_SETMASK, &exec_mask, NULL, 8);
     if (ret == -512) {
         // No host syscall ran: resume its guest instruction after the handler,
         // regardless of SA_RESTART. Never expose this private result to Linux.
