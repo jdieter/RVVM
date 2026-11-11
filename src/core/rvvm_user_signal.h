@@ -307,7 +307,9 @@ static void user_host_sigfillset(sigset_t* set)
 
 static long user_rt_sigaction(int signo, void* act, void* old, size_t size)
 {
-    if (size != 8 || signo < 1 || signo > 64 || signo == SIGKILL || signo == SIGSTOP) return -EINVAL;
+    // Linux permits querying uncatchable signals; only changes are forbidden.
+    if (size != 8 || signo < 1 || signo > 64
+        || (act && (signo == SIGKILL || signo == SIGSTOP))) return -EINVAL;
     struct user_sigaction next;
     if (act && uapi_extra_copy(&next, act, sizeof(next), false)) return -EFAULT;
     spin_lock(&user_action_lock);
