@@ -207,6 +207,7 @@ static int user_native_cow_child(void* opaque)
      * shared mapping: with CLONE_FILES it is the parent's own, and the
      * worker that holds it releases it there. Never reset it here. */
     user_exec_fork_child();
+    user_aio_fork_child();
     user_observer_fork_child();
     user_exe_process_link_init(false);
     spin_unlock(&mmap_lock);
@@ -445,6 +446,8 @@ static void user_native_mapping_service(struct user_native_vfork* request)
     user_vma_executor = user_native_mapping_kernel;
     long* a = request->mapping_args;
     switch (request->mapping_nr) {
+        case 0: request->mapping_result = user_aio_setup(a[0], (void*)a[1]); break;
+        case 1: request->mapping_result = user_aio_destroy(a[0]); break;
         case 214: request->mapping_result = (long)rvvm_sys_brk((void*)a[0]); break;
         case 215: request->mapping_result = rvvm_sys_munmap((void*)a[0], a[1]); break;
         case 216: request->mapping_result = user_mremap(a[0], a[1], a[2], a[3], a[4]); break;
@@ -1003,7 +1006,7 @@ static long user_native_dispatch(struct user_native_vfork* request, long nr, lon
         atomic_store_uint32(&request->service_state, 0);
         return 0;
     }
-    if (nr == 196 || nr == 197 || nr == 214 || nr == 215 || nr == 216 || nr == 222
+    if (nr == 0 || nr == 1 || nr == 196 || nr == 197 || nr == 214 || nr == 215 || nr == 216 || nr == 222
         || nr == 226 || nr == 233) {
         user_exe_filter_args(nr, a);
         return user_native_mapping(request, nr, a);

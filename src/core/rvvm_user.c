@@ -863,6 +863,7 @@ static void* user_thread_reaper(void* unused)
     }
 }
 #include "rvvm_user_memory.h"
+#include "rvvm_user_aio.h"
 #ifdef __linux__
 static struct uapi_brk_heap brk_heap;
 
@@ -1134,6 +1135,7 @@ static int rvvm_sys_clone_impl(rvvm_user_thread_t* current, uint32_t flags, size
             rvvm_user_fork_child(cpu);
             user_ptrace_fork(cpu);
             user_exec_fork_child();
+            user_aio_fork_child();
             user_observer_fork_child();
             user_exe_process_link_init(false);
         }

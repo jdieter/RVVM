@@ -350,6 +350,7 @@ static void user_exec_move_apply(struct user_exec_move* move, uintptr_t addr, si
     if (!deferred && user_exec_native_readers && !user_exec_publish()) syscall(SYS_exit_group, 127);
 }
 
+static void user_aio_remap(uintptr_t, uintptr_t);
 static rvvm_addr_t user_mremap(uintptr_t addr, size_t oldsize, size_t newsize, int flags, uintptr_t newaddr)
 {
     user_fd_lock();
@@ -363,7 +364,10 @@ static rvvm_addr_t user_mremap(uintptr_t addr, size_t oldsize, size_t newsize, i
     struct user_exec_move move = ZERO_INIT;
     user_exec_move_prepare(&move, addr, oldsize, newsize);
     rvvm_addr_t ret = errno_ret((uintptr_t)user_vma_remap((void*)addr, oldsize, newsize, flags, (void*)newaddr));
-    if (ret < (rvvm_addr_t)-4095) user_exec_move_apply(&move, addr, oldsize, newsize, flags, ret);
+    if (ret < (rvvm_addr_t)-4095) {
+        user_exec_move_apply(&move, addr, oldsize, newsize, flags, ret);
+        user_aio_remap(addr, ret);
+    }
     user_exec_deferred = false;
     if (user_exec_native_readers && !user_exec_publish()) syscall(SYS_exit_group, 127);
     vector_free(move.ranges);

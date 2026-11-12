@@ -156,7 +156,11 @@ static long user_safe_syscall(long nr, long a, long b, long c, long d, long e, l
     }
     if (nr == SYS_ppoll) { set = (void*)d; size = e; }
     if (nr == SYS_epoll_pwait || nr == SYS_epoll_pwait2) { set = (void*)e; size = f; }
-    if (nr == SYS_pselect6 && f) {
+    if (nr == SYS_io_pgetevents && e) {
+        struct timespec timeout;
+        if (uapi_extra_copy(&timeout, (void*)e, sizeof(timeout), false)) { errno = EFAULT; return -1; }
+    }
+    if ((nr == SYS_pselect6 || nr == SYS_io_pgetevents) && f) {
         if (uapi_extra_copy(&select_mask, (void*)f, sizeof(select_mask), false)) { errno = EFAULT; return -1; }
         set = select_mask.set; size = select_mask.size;
     }
@@ -176,7 +180,7 @@ static long user_safe_syscall(long nr, long a, long b, long c, long d, long e, l
         host_mask = temporary | user_sig.deferred_mask;
         if (nr == SYS_rt_sigsuspend) a = (long)&host_mask;
         else if (nr == SYS_ppoll) d = (long)&host_mask;
-        else if (nr == SYS_pselect6) { select_mask.set = &host_mask; f = (long)&select_mask; }
+        else if (nr == SYS_pselect6 || nr == SYS_io_pgetevents) { select_mask.set = &host_mask; f = (long)&select_mask; }
         else e = (long)&host_mask;
     }
     /* The new interpreter must inherit the guest mask, including signals

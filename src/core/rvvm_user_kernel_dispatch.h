@@ -164,6 +164,12 @@ static bool user_kernel_dispatch(rvvm_hart_t* cpu, long nr, long a[6], long* res
     long hidden = user_internal_target(nr, a);
     if (hidden) { *result = hidden; return true; }
     switch (nr) {
+        case 0: *result = user_aio_setup(a[0], (void*)a[1]); return true;
+        case 1: *result = user_aio_destroy(a[0]); return true;
+        case 2: *result = user_aio_submit(a[0], a[1], (void*)a[2]); return true;
+        case 3: host = SYS_io_cancel; break;
+        case 4: host = SYS_io_getevents; break;
+        case 292: host = SYS_io_pgetevents; break;
         case 95: *result = user_waitid(a); return true;
         case 117: *result = user_ptrace_request(a[0], a[1], a[2], a[3]); return true;
         case 138: *result = user_sigqueue(a[0], 0, a[1], (void*)a[2], false); return true;

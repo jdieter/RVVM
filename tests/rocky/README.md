@@ -83,6 +83,37 @@ limit. This change does not implement separate guest resource budgets.
 
 ## Regression checks
 
+### Linux AIO
+
+RVVM forwards `io_setup`, `io_destroy`, `io_submit`, `io_cancel`,
+`io_getevents` and `io_pgetevents` to Linux. The RV64 request, completion
+and signal-mask layouts match the supported LP64 hosts. Requests retain
+their original addresses, including the kernel's `aio_key` writes and
+`io_event.obj` values used for cancellation. Submission checks embedded
+file and eventfd descriptors against RVVM's private executable pin.
+
+Linux creates and services the completion ring. RVVM moves it into the
+guest address range with the kernel's AIO `mremap` callback, which updates
+the context handle. This also supports libaio's direct ring access.
+Ownership follows remapping and destruction. Threads and shared-vfork
+children share the kernel context; ordinary fork drops the contexts and
+prunes ownership for ring pages that Linux didn't copy. Exec cleanup stays
+with the kernel. `io_pgetevents` uses the same temporary signal-mask and
+pending-signal handling as the other atomic waits.
+
+`test-aio.c` runs natively or as a RISC-V libc guest through the candidate's
+private binfmt registration. It covers every supported request operation,
+bulk and partial submission, eventfd notification, direct ring reads,
+cancellation, timeouts, signal interruption and mask restoration, threads,
+fork, shared-vfork, remapping and invalid arguments. Set
+`RVVM_TEST_PRIVATE_FD` to the interpreter's pin descriptor when checking
+private-descriptor rejection under RVVM; omit it for the native control.
+
+```sh
+gcc -O2 -Wall -Wextra -Werror -pthread tests/rocky/test-aio.c -o /tmp/test-aio
+/tmp/test-aio
+```
+
 ### Linux compatibility backlog probes
 
 `test-linux-compat.c` contains 33 independent behavioral cases for the TODO
