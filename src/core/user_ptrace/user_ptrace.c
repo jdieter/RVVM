@@ -33,6 +33,8 @@
 #include <unistd.h>
 
 #define BRIDGE_MAGIC UINT64_C(0x5256564d50545203)
+#define BRIDGE_FORK_FD UINT32_C(0x80000000)
+#define BRIDGE_FORK_SHARED UINT32_MAX
 #define BRIDGE_SYNC 1
 #define BRIDGE_STEP 2
 #define BRIDGE_STEP_CALL 3
@@ -222,7 +224,10 @@ static uintptr_t locate_inner(pid_t pid, struct bridge* state, bool proc)
         if (start
             && !(proc ? remote_read(pid, start, state, sizeof(*state))
                       : remote(pid, start, state, sizeof(*state), false))
-            && state->magic == BRIDGE_MAGIC && state->tid == (uint32_t)pid) {
+            && state->magic == BRIDGE_MAGIC
+            && (state->tid == (uint32_t)pid
+                || (proc && state->tgid != (uint32_t)pid
+                    && state->clone_bridge == start && (state->reserved & BRIDGE_FORK_FD)))) {
             addr = start;
             break;
         }
@@ -528,6 +533,7 @@ void user_ptrace_fork(rvvm_hart_t* cpu)
     self->hart = (uintptr_t)cpu;
     self->command = self->stopped = self->dirty = 0;
     self->syscall.phase = 0;
+    self->reserved = 0;
 }
 
 void user_ptrace_process_init(rvvm_hart_t* cpu, uint64_t* mask,
@@ -560,9 +566,24 @@ void user_ptrace_dispatch(void)
     if (self) atomic_store_uint32(&self->phase, PHASE_DISPATCH);
 }
 
-void user_ptrace_clone(rvvm_hart_t* child)
+void user_ptrace_clone(rvvm_hart_t* child, bool shared_files)
 {
-    if (self) { self->clone_hart = (uintptr_t)child; self->clone_bridge = (uintptr_t)self; }
+    if (self) {
+        self->clone_hart = (uintptr_t)child;
+        self->clone_bridge = (uintptr_t)self;
+        /* The parent may inspect /proc/<child>/exe before the child runs.
+         * Cache the inherited pin in the bridge: its fd-table pointer can
+         * change and be unmapped during child setup. Keep the wire layout. */
+        /* CLONE_FILES keeps the table pointer valid: its live pin must
+         * track relocations by the parent even before the child runs. */
+        self->reserved = shared_files ? BRIDGE_FORK_SHARED
+                                     : atomic_load_uint32(executable_fd) | BRIDGE_FORK_FD;
+    }
+}
+
+void user_ptrace_clone_parent(void)
+{
+    if (self) self->reserved = 0;
 }
 
 void user_ptrace_exit(rvvm_hart_t* cpu)
@@ -1438,8 +1459,13 @@ bool user_ptrace_remote_exe_descriptor(pid_t pid, char* buffer, size_t size)
 {
     struct bridge state;
     uint32_t fd;
-    if (!locate_inner(pid, &state, true)
-        || remote_read(pid, state.exe_fd_pointer, &fd, sizeof(fd)) || (int32_t)fd < 0) return false;
+    uintptr_t bridge = locate_inner(pid, &state, true);
+    if (!bridge) return false;
+    if (state.clone_bridge == bridge && (state.reserved & BRIDGE_FORK_FD)
+        && state.reserved != BRIDGE_FORK_SHARED)
+        fd = state.reserved & ~BRIDGE_FORK_FD;
+    else if (remote_read(pid, state.exe_fd_pointer, &fd, sizeof(fd))) return false;
+    if ((int32_t)fd < 0) return false;
     int len = snprintf(buffer, size, "/proc/%u/fd/%u", pid, fd);
     return len >= 0 && (size_t)len < size;
 }

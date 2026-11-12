@@ -1136,9 +1136,10 @@ static int rvvm_sys_clone_impl(rvvm_user_thread_t* current, uint32_t flags, size
         user_fd_mutex_lock(&user_exe_lock);
         user_fd_mutex_lock(&user_reaper_lock);
         rvvm_user_fork_lock();
-        user_ptrace_clone(cpu);
+        user_ptrace_clone(cpu, shared_files);
         pid_t pid = user_host_fork(flags & 0xff, (shared_files ? CLONE_FILES : 0) | (flags & namespaces));
         int fork_errno = errno;
+        if (pid) user_ptrace_clone_parent();
         user_fork_cache_finish(fork_slot, pid);
         unsigned child_fd_depth = 0;
         if (!pid) {

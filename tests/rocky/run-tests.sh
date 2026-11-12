@@ -44,6 +44,7 @@ for link in -pie -static-pie; do
 done
 if (($#)); then
     "$cc" -O2 "$root/tests/rocky/noclone3.c" -o "$build/noclone3"
+    "$cc" -O2 "$root/tests/rocky/test-proc-exe-race.c" -o "$build/test-proc-exe-race"
     for guest in test-clone-flags test-clone-files test-fork-cache test-clone-thread test-clone-thread-private test-thread-exit test-vfork test-vfork-nofile test-vfork-concurrent test-openat2 test-seccomp test-pidfd-getfd test-kcmp test-jit-limits test-jit-fault-regs test-fpu-tininess test-mmap-huge test-mprotect-errors test-proc-exe test-proc-cmdline test-signalfd test-sigaction-query test-ptrace-redirect test-proc-maps; do
         "${RISCV_CC:-clang}" --target=riscv64-linux-gnu -march=rv64gc -mabi=lp64d \
             -fuse-ld="${RISCV_LD:-lld}" -nostdlib -static -Wl,--build-id=none \
@@ -75,6 +76,26 @@ if (($#)); then
                     (if [[ $nojit = 0 ]]; then unset RVVM_NOJIT; else export RVVM_NOJIT=1; fi
                      timeout 20 "$build/noclone3" "$emulator" "$build/$guest") >"$build/stdout" 2>"$build/stderr"
                     [[ ! -s $build/stdout && ! -s $build/stderr ]]
+                done
+            fi
+            if [[ $guest == test-proc-exe ]]; then
+                for bits in 39 48; do
+                    for nojit in "" 1; do
+                        for sharing in "" shared; do
+                            opts=(-u RVVM_NOJIT RVVM_USER_PREFIX= RVVM_USER_VA_BITS=$bits)
+                            if [[ $nojit ]]; then opts+=(RVVM_NOJIT=1); fi
+                            result=0
+                            env "${opts[@]}" timeout 20 "$build/test-proc-exe-race" \
+                                "$emulator" "$build/$guest" ${sharing:+"$sharing"} \
+                                >"$build/stdout" 2>"$build/stderr" || result=$?
+                            if [[ $result = 77 ]]; then
+                                echo "SKIP proc/exe before child initialization: host ptrace denied"
+                                continue
+                            fi
+                            [[ $result = 0 && ! -s $build/stderr ]]
+                            grep -qx 'PASS proc/exe before child initialization' "$build/stdout"
+                        done
+                    done
                 done
             fi
             echo "PASS $guest: $emulator"

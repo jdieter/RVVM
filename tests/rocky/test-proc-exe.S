@@ -3,6 +3,7 @@
 .section .text
 .global _start
 _start:
+    ld s3, 0(sp)
     li a0, -100
     la a1, self_exe
     la a2, own_path
@@ -17,6 +18,10 @@ _start:
     ecall
     bnez a0, fail
     li a0, 17
+    li t0, 2
+    bleu s3, t0, 6f
+    ori a0, a0, 0x400 /* CLONE_FILES */
+6:
     li a1, 0
     li a2, 0
     li a3, 0
@@ -52,6 +57,18 @@ _start:
     addi t0, t0, 1
     addi t1, t1, 1
     bnez t3, 3b
+    /* The host tracer sets NOFILE=64, placing the hidden pin at fd 63.
+     * Relocate the parent's pin while the child cannot initialize: private
+     * forks retain the old pin, whereas CLONE_FILES must see the new pin. */
+    li t0, 1
+    bleu s3, t0, 7f
+    li a0, 1
+    li a1, 63
+    li a2, 0
+    li a7, 24
+    ecall
+    bltz a0, fail
+7:
     li a0, -100
     la a1, child_exe
     la a2, child_path
@@ -93,6 +110,18 @@ _start:
     mv a0, s2
     li a7, 57
     ecall
+    /* The host regression tracer keeps the child stopped until this byte,
+     * so these proc reads must work before any child-side initialization. */
+    li t0, 1
+    bleu s3, t0, 5f
+    li a0, 1
+    la a1, token
+    li a2, 1
+    li a7, 64
+    ecall
+    li t0, 1
+    bne a0, t0, fail
+5:
     la t0, pipe
     lw a0, 4(t0)
     la a1, token
@@ -114,11 +143,14 @@ _start:
     li a0, 0
     j exit
 child:
+    li t0, 2
+    bgtu s3, t0, 8f
     /* Close the writer so a failing parent cannot leave an orphan waiting. */
     la t0, pipe
     lw a0, 4(t0)
     li a7, 57
     ecall
+8:
     la t0, pipe
     lw a0, 0(t0)
     la a1, token
