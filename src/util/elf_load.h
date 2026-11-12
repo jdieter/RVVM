@@ -31,6 +31,8 @@ typedef struct {
     size_t load_bias;
     /* Optional placement policy for user emulation; objcopy is unaffected. */
     void* (*map)(void* addr, size_t size);
+    /* Map complete read-only file pages into the reserved image, if supported. */
+    bool (*map_file)(rvfile_t* file, void* addr, size_t size, uint64_t offset);
 } elf_desc_t;
 
 bool elf_load_file(rvfile_t* file, elf_desc_t* elf);

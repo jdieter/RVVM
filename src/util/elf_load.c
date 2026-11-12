@@ -45,6 +45,29 @@ PUSH_OPTIMIZATION_SIZE
         return false;                                                                                                  \
     }
 
+static bool elf_load_segment(rvfile_t* file, elf_desc_t* elf, void* addr, size_t size,
+                             uint64_t offset, bool readonly)
+{
+    size_t prefix = size, mapped = 0;
+    if (readonly && elf->map_file) {
+        size_t page = vma_page_size();
+        size_t skip = (-(uintptr_t)addr) & (page - 1);
+        /* Leave partial pages anonymous: another LOAD segment may occupy
+         * their other bytes, or the file tail may be followed by BSS. */
+        if (skip < size && ((offset + skip) & (page - 1)) == 0) {
+            size_t span = (size - skip) & ~(page - 1);
+            if (span && offset <= UINT64_MAX - skip
+                && elf->map_file(file, (char*)addr + skip, span, offset + skip)) {
+                prefix = skip;
+                mapped = span;
+            }
+        }
+    }
+    if (prefix && rvread(file, addr, prefix, offset) != prefix) return false;
+    size_t tail = prefix + mapped;
+    return tail == size || rvread(file, (char*)addr + tail, size - tail, offset + tail) == size - tail;
+}
+
 bool elf_load_file(rvfile_t* file, elf_desc_t* elf)
 {
     uint8_t tmp[64] = {0};
@@ -146,13 +169,15 @@ bool elf_load_file(rvfile_t* file, elf_desc_t* elf)
         uint64_t p_vaddr  = class64 ? read_uint64_le_m(tmp + 16) : read_uint32_le_m(tmp + 8);
         uint64_t p_fsize  = class64 ? read_uint64_le_m(tmp + 32) : read_uint32_le_m(tmp + 16);
         uint64_t p_memsz  = class64 ? read_uint64_le_m(tmp + 40) : read_uint32_le_m(tmp + 20);
-        // uint32_t p_flags = class64 ? read_uint32_le_m(tmp + 4) : read_uint32_le_m(tmp + 24);
+        uint32_t p_flags = class64 ? read_uint32_le_m(tmp + 4) : read_uint32_le_m(tmp + 24);
 
         if (p_type == ELF_PT_LOAD || p_type == ELF_PT_PHDR) {
             // Load ELF program segment or PHDR segment
             void* vaddr = ((uint8_t*)elf->base) + (p_vaddr - elf_loaddr);
             WRAP_ERR(p_vaddr + p_memsz <= elf_loaddr + elf->buf_size, "ELF segment does not fit in memory");
-            WRAP_ERR(rvread(file, vaddr, p_fsize, p_offset) == p_fsize, "Failed to read ELF segment");
+            WRAP_ERR(p_fsize <= p_memsz, "ELF file segment exceeds memory size");
+            WRAP_ERR(elf_load_segment(file, elf, vaddr, p_fsize, p_offset,
+                                     !objcopy && !(p_flags & ELF_PF_W)), "Failed to read ELF segment");
         }
         if (p_type == ELF_PT_INTERP && !objcopy && !elf->interp_path) {
             // Get ELF interpreter path

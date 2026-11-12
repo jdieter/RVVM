@@ -44,7 +44,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 void rvjit_emit_init(rvjit_block_t* block)
 {
 #ifdef RVVM_USER_TEST
-    memset(block->fault_regs, REG_ILL, sizeof(block->fault_regs));
+    memset(block->fault_regs, RVJIT_FAULT_REG_EMPTY, sizeof(block->fault_regs));
 #endif
     block->hreg_mask       = rvjit_native_default_hregmask();
     block->abireclaim_mask = 0;
@@ -95,7 +95,7 @@ static void rvjit_free_reg(rvjit_block_t* block, regid_t reg)
         rvjit_save_reg(block, reg);
         rvjit_free_hreg(block, block->regs[reg].hreg);
 #ifdef RVVM_USER_TEST
-        if (reg < 32) block->fault_regs[block->regs[reg].hreg] = REG_ILL;
+        if (reg < 32) rvjit_fault_reg_set(block->fault_regs, block->regs[reg].hreg, REG_ILL);
 #endif
         block->regs[reg].hreg = REG_ILL;
     }
@@ -185,7 +185,7 @@ static regid_t rvjit_map_reg(rvjit_block_t* block, regid_t greg, regflags_t flag
 
     if (flags & REG_DST) {
 #ifdef RVVM_USER_TEST
-        if (greg < 32 && greg) block->fault_regs[block->regs[greg].hreg] = greg;
+        if (greg < 32 && greg) rvjit_fault_reg_set(block->fault_regs, block->regs[greg].hreg, greg);
 #endif
         block->regs[greg].flags |= REG_DIRTY;
         block->regs[greg].flags &= ~REG_AUIPC;
@@ -935,6 +935,11 @@ static void rvjit_user_fault_sync(rvjit_block_t* block)
 void rvjit_fault_record(rvjit_block_t* block, size_t length)
 {
     if (block->fault_failed) return;
+#ifdef RVJIT_ARM64
+    if (length != 4) { block->fault_failed = true; return; }
+#elif defined(RVJIT_X86)
+    if (length > UINT16_MAX) { block->fault_failed = true; return; }
+#endif
     if (vector_size(block->faults) == vector_capacity(block->faults)) {
         size_t capacity = vector_capacity(block->faults) * 2 + 1;
         void* grown = realloc(block->faults.data, capacity * sizeof(*block->faults.data));
@@ -945,10 +950,14 @@ void rvjit_fault_record(rvjit_block_t* block, size_t length)
     rvjit_fault_t entry;
     entry.guest_pc = block->virt_pc + block->pc_off;
     entry.start = block->size;
+#ifdef RVJIT_X86
+    entry.length = length;
+#elif !defined(RVJIT_ARM64)
     entry.end = block->size + length;
+#endif
     memcpy(entry.regs, block->fault_regs, sizeof(entry.regs));
     if (block->fault_ignore < 32 && block->regs[block->fault_ignore].hreg != REG_ILL)
-        entry.regs[block->regs[block->fault_ignore].hreg] = REG_ILL;
+        rvjit_fault_reg_set(entry.regs, block->regs[block->fault_ignore].hreg, REG_ILL);
     vector_push_back(block->faults, entry);
 }
 #endif
@@ -980,7 +989,12 @@ static inline void rvjit_fault_end(rvjit_block_t* block)
 {
 #ifdef RVVM_USER_TEST
 #ifdef RVJIT_X86
-    if (block->fault_active) vector_at(block->faults, vector_size(block->faults) - 1).end = block->size;
+    if (block->fault_active && !block->fault_failed) {
+        rvjit_fault_t* fault = &vector_at(block->faults, vector_size(block->faults) - 1);
+        size_t length = block->size - fault->start;
+        if (length > UINT16_MAX) block->fault_failed = true;
+        else fault->length = length;
+    }
 #endif
     block->fault_active = false;
 #else

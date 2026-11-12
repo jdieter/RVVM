@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -157,8 +158,64 @@ static void check_metadata_growth(void)
     rvjit_ctx_free(&block);
 }
 
+static void check_fault_registers(void)
+{
+    uint8_t regs[RVJIT_FAULT_REG_BYTES];
+    uint8_t expected[RVJIT_FAULT_REG_COUNT];
+    memset(regs, RVJIT_FAULT_REG_EMPTY, sizeof(regs));
+    for (unsigned host = 0; host < RVJIT_FAULT_REG_COUNT; ++host) {
+        expected[host] = host % 31 + 1;
+        rvjit_fault_reg_set(regs, host, expected[host]);
+    }
+    /* All guest values at every host slot, including packed byte boundaries. */
+    for (unsigned host = 0; host < RVJIT_FAULT_REG_COUNT; ++host) {
+        for (unsigned guest = 1; guest < 32; ++guest) {
+            rvjit_fault_reg_set(regs, host, guest);
+            expected[host] = guest;
+            for (unsigned other = 0; other < RVJIT_FAULT_REG_COUNT; ++other)
+                assert(rvjit_fault_reg_get(regs, other) == expected[other]);
+        }
+        rvjit_fault_reg_set(regs, host, REG_ILL);
+        expected[host] = REG_ILL;
+        assert(rvjit_fault_reg_get(regs, host) == REG_ILL);
+    }
+    rvjit_fault_t fault = {.start = 100};
+#ifdef RVJIT_X86
+    fault.length = 4;
+#elif !defined(RVJIT_ARM64)
+    fault.end = 104;
+#endif
+    assert(rvjit_fault_end_offset(&fault) == 104);
+#ifdef RVJIT_ARM64
+    rvjit_block_t block = {0};
+    rvjit_fault_record(&block, 8);
+    assert(block.fault_failed && !block.faults.count);
+#elif defined(RVJIT_X86)
+    rvjit_block_t block = {0};
+    rvjit_fault_record(&block, (size_t)UINT16_MAX + 1);
+    assert(block.fault_failed && !block.faults.count);
+#endif
+}
+
+static void check_fault_allocation(void)
+{
+    rvjit_block_t block = {0};
+    assert(rvjit_ctx_init(&block, 1U << 20));
+    rvjit_set_rv64(&block, true);
+    assert(rvjit_set_native_ptrs(&block, true));
+    rvjit_block_init(&block);
+    block.phys_pc = block.virt_pc = 0x1000;
+    fail_realloc = true;
+    rvjit64_ld(&block, 1, 2, 0);
+    assert(!fail_realloc && block.fault_failed && !block.faults.count);
+    assert(!rvjit_block_finalize(&block));
+    rvjit_ctx_free(&block);
+}
+
 int main(void)
 {
+    check_fault_registers();
+    check_fault_allocation();
     check_cache(false);
     check_cache(true);
     check_metadata_growth();

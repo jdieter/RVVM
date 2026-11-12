@@ -8,7 +8,7 @@ trap 'rm -rf "$build"' EXIT
 cc=${CC:-cc}
 flags=(-O2 -g -pthread -DRVVM_USER_TEST -ffunction-sections -fdata-sections
        -I"$root/src" -I"$root/src/util" -I"$root/include" -Wl,--gc-sections)
-for name in test-exe-fd test-fd-lock test-fd-limits test-fork-cache test-process-state test-exec-ranges test-replay test-vma-oom test-brk test-proc-maps test-seccomp-filter test-aio; do
+for name in test-exe-fd test-fd-lock test-fd-limits test-fork-cache test-process-state test-exec-ranges test-replay test-vma-oom test-brk test-proc-maps test-seccomp-filter test-aio test-elf-file-pages; do
     extra=()
     if [[ $name == test-replay ]]; then extra=("$root/src/core/user_ptrace/user_ptrace_replay.c"); fi
     "$cc" "${flags[@]}" "$root/tests/rocky/$name.c" "${extra[@]}" "$root"/src/util/*.c \
@@ -44,7 +44,7 @@ for link in -pie -static-pie; do
 done
 if (($#)); then
     "$cc" -O2 "$root/tests/rocky/noclone3.c" -o "$build/noclone3"
-    for guest in test-clone-flags test-clone-files test-fork-cache test-clone-thread test-clone-thread-private test-thread-exit test-vfork test-vfork-nofile test-vfork-concurrent test-openat2 test-seccomp test-pidfd-getfd test-kcmp test-jit-limits test-fpu-tininess test-mmap-huge test-mprotect-errors test-proc-exe test-proc-cmdline test-signalfd test-sigaction-query test-ptrace-redirect test-proc-maps; do
+    for guest in test-clone-flags test-clone-files test-fork-cache test-clone-thread test-clone-thread-private test-thread-exit test-vfork test-vfork-nofile test-vfork-concurrent test-openat2 test-seccomp test-pidfd-getfd test-kcmp test-jit-limits test-jit-fault-regs test-fpu-tininess test-mmap-huge test-mprotect-errors test-proc-exe test-proc-cmdline test-signalfd test-sigaction-query test-ptrace-redirect test-proc-maps; do
         "${RISCV_CC:-clang}" --target=riscv64-linux-gnu -march=rv64gc -mabi=lp64d \
             -fuse-ld="${RISCV_LD:-lld}" -nostdlib -static -Wl,--build-id=none \
             "$root/tests/rocky/$guest.S" -o "$build/$guest"

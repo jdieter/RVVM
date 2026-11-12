@@ -462,17 +462,32 @@ static void* user_elf_map(void* addr, size_t size)
     user_fd_unlock();
     return ret == MAP_FAILED ? NULL : (char*)ret + offset;
 }
+
+static bool user_elf_map_file(rvfile_t* file, void* addr, size_t size, uint64_t offset)
+{
+    uint64_t length = rvfilesize(file);
+    if (offset > length || size > length - offset) return false;
+    user_fd_lock();
+    /* Writable until user_exec_elf applies segment permissions. A later
+     * overlapping segment or PHDR can still write its own bytes via COW. */
+    void* ret = user_vma_map(addr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED,
+                             rvfile_get_posix_fd(file), offset);
+    user_fd_unlock();
+    return ret != MAP_FAILED;
+}
 #endif
 static elf_desc_t elf = {
     .base = NULL,
 #ifdef __linux__
     .map = user_elf_map,
+    .map_file = user_elf_map_file,
 #endif
 };
 static elf_desc_t interp = {
     .base = NULL,
 #ifdef __linux__
     .map = user_elf_map,
+    .map_file = user_elf_map_file,
 #endif
 };
 
@@ -725,9 +740,10 @@ static void user_fault_handler(int sig, siginfo_t* info, void* ucontext)
             REG_R12, REG_R13, REG_R14, REG_R15};
         for (unsigned i = 0; i < 16; ++i) host_regs[i] = uc->uc_mcontext.gregs[indices[i]];
 #endif
-        for (unsigned i = 0; i < sizeof(fault->regs); ++i)
-            if (fault->regs[i] != REG_ILL)
-                fault_cpu->registers[fault->regs[i]] = host_regs[i];
+        for (unsigned i = 0; i < RVJIT_FAULT_REG_COUNT; ++i) {
+            uint8_t guest = rvjit_fault_reg_get(fault->regs, i);
+            if (guest != REG_ILL) fault_cpu->registers[guest] = host_regs[i];
+        }
         fault_cpu->user_fault_pc = fault->guest_pc;
     }
 #endif

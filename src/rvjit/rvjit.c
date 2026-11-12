@@ -550,7 +550,9 @@ rvjit_func_t rvjit_block_finalize(rvjit_block_t* block)
     vector_foreach(block->faults, i) {
         rvjit_fault_t entry = vector_at(block->faults, i);
         entry.start += block->heap.curr;
+#if !defined(RVJIT_ARM64) && !defined(RVJIT_X86)
         entry.end += block->heap.curr;
+#endif
         vector_push_back(block->heap.faults, entry);
     }
 #endif
@@ -697,7 +699,7 @@ const rvjit_fault_t* rvjit_fault_lookup(const rvjit_block_t* block, uintptr_t pc
         size_t mid = low + (high - low) / 2;
         const rvjit_fault_t* entry = &vector_at(block->heap.faults, mid);
         if (offset < entry->start) high = mid;
-        else if (offset >= entry->end) low = mid + 1;
+        else if (offset >= rvjit_fault_end_offset(entry)) low = mid + 1;
         else return entry;
     }
     return NULL;

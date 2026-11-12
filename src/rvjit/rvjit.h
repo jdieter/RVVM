@@ -115,15 +115,73 @@ typedef size_t   rvjit_addr_t;
 
 #ifdef RVVM_USER_TEST
 #define RVJIT_USER_FAULT_CAPACITY (1U << 14)
+#ifdef RVJIT_X86
+#define RVJIT_FAULT_REG_COUNT 16
+#else
+#define RVJIT_FAULT_REG_COUNT 32
+#endif
+#if defined(RVJIT_ARM64) || defined(RVJIT_X86)
+/* Dirty guest registers are x1-x31; zero denotes an absent mapping. */
+#define RVJIT_FAULT_REG_BYTES ((RVJIT_FAULT_REG_COUNT * 5 + 7) / 8)
+#define RVJIT_FAULT_REG_EMPTY 0
+#else
+#define RVJIT_FAULT_REG_BYTES RVJIT_FAULT_REG_COUNT
+#define RVJIT_FAULT_REG_EMPTY REG_ILL
+#endif
+
+static inline uint8_t rvjit_fault_reg_get(const uint8_t* regs, unsigned host)
+{
+#if defined(RVJIT_ARM64) || defined(RVJIT_X86)
+    unsigned bit = host * 5, byte = bit / 8, shift = bit % 8;
+    unsigned value = regs[byte] >> shift;
+    if (shift > 3) value |= (unsigned)regs[byte + 1] << (8 - shift);
+    value &= 31;
+    return value ? value : REG_ILL;
+#else
+    return regs[host];
+#endif
+}
+
+static inline void rvjit_fault_reg_set(uint8_t* regs, unsigned host, uint8_t guest)
+{
+#if defined(RVJIT_ARM64) || defined(RVJIT_X86)
+    unsigned bit = host * 5, byte = bit / 8, shift = bit % 8;
+    unsigned value = guest == REG_ILL ? 0 : guest;
+    regs[byte] = (regs[byte] & ~(31U << shift)) | (value << shift);
+    if (shift > 3)
+        regs[byte + 1] = (regs[byte + 1] & ~(31U >> (8 - shift))) | (value >> (8 - shift));
+#else
+    regs[host] = guest;
+#endif
+}
+
 typedef struct {
     uint64_t guest_pc;
-    uint32_t start, end;
+    uint32_t start;
 #ifdef RVJIT_X86
-    uint8_t regs[16]; // Guest register held by each host register; REG_ILL otherwise.
-#else
-    uint8_t regs[32];
+    uint16_t length;
+#elif !defined(RVJIT_ARM64)
+    uint32_t end;
 #endif
+    uint8_t regs[RVJIT_FAULT_REG_BYTES];
 } rvjit_fault_t;
+
+static inline uint32_t rvjit_fault_end_offset(const rvjit_fault_t* fault)
+{
+#ifdef RVJIT_ARM64
+    /* Every ARM64 fault site is exactly one four-byte instruction. */
+    return fault->start + 4;
+#elif defined(RVJIT_X86)
+    return fault->start + fault->length;
+#else
+    return fault->end;
+#endif
+}
+#ifdef RVJIT_ARM64
+_Static_assert(sizeof(rvjit_fault_t) == 32, "compact ARM64 fault metadata");
+#elif defined(RVJIT_X86)
+_Static_assert(sizeof(rvjit_fault_t) == 24, "compact x86 fault metadata");
+#endif
 #endif
 
 typedef struct {
@@ -179,7 +237,7 @@ typedef struct {
     rvjit_reginfo_t regs[RVJIT_REGISTERS];
 #ifdef RVVM_USER_TEST
     vector_t(rvjit_fault_t) faults;
-    uint8_t fault_regs[32];
+    uint8_t fault_regs[RVJIT_FAULT_REG_BYTES];
     uint8_t fault_ignore;
     bool fault_active;
     bool fault_failed;
