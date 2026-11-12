@@ -344,7 +344,13 @@ static bool user_kernel_dispatch(rvvm_hart_t* cpu, long nr, long a[6], long* res
         case 164:
             user_observer_limit(0, a[0], (void*)a[1]);
             *result = (long)errno_ret(USER_SYSCALL(SYS_prlimit64, 0, a[0], a[1], 0, 0, 0)); return true;
-        case 167: *result = uapi_extra_prctl(a[0], a[1], a[2], a[3], a[4]); return true;
+        case 167:
+            if (a[0] == PR_GET_SECCOMP) *result = user_seccomp ? SECCOMP_MODE_FILTER : SECCOMP_MODE_DISABLED;
+            else if (a[0] == PR_SET_SECCOMP)
+                *result = a[1] == SECCOMP_MODE_FILTER ? user_seccomp_install(0, (void*)a[2]) : -EINVAL;
+            else *result = uapi_extra_prctl(a[0], a[1], a[2], a[3], a[4]);
+            return true;
+        case 277: *result = user_seccomp_call(a[0], a[1], (void*)a[2]); return true;
         case 272: case 438: *result = -ENOSYS; return true;
         case 5: host = SYS_setxattr; break;
         case 6: host = SYS_lsetxattr; break;

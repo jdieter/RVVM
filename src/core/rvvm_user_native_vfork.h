@@ -77,6 +77,7 @@ struct user_native_source {
     user_fd_table_t* table;
     struct user_signal_process* signals;
     bool pidns;
+    struct user_seccomp_filter* seccomp;
 };
 
 struct user_native_vfork {
@@ -879,7 +880,7 @@ static void user_native_descriptor(struct user_native_vfork* request, int fd, bo
     request->marker[n] = 0;
 }
 
-static long user_native_exec(struct user_native_vfork* request, long nr, long a[6])
+static long user_native_exec_inner(struct user_native_vfork* request, long nr, long a[6])
 {
     const char* path = (void*)(nr == 221 ? a[0] : a[1]);
     char** argv = (void*)(nr == 221 ? a[1] : a[2]);
@@ -924,6 +925,21 @@ static long user_native_exec(struct user_native_vfork* request, long nr, long a[
     return ret;
 }
 
+static long user_native_exec(struct user_native_vfork* request, long nr, long a[6])
+{
+    unsigned env_arg = nr == 221 ? 2 : 3;
+    char** next;
+    size_t owned;
+    long result = user_seccomp_environment((char**)a[env_arg], &next, &owned);
+    if (result) return result;
+    long args[6];
+    memcpy(args, a, sizeof(args));
+    args[env_arg] = (long)next;
+    result = user_native_exec_inner(request, nr, args);
+    user_seccomp_environment_free(next, owned);
+    return result;
+}
+
 static long user_native_nested_clone(struct user_native_vfork*, uint32_t, size_t, uint32_t*, size_t, uint32_t*);
 
 #define NATIVE_RAW(n) user_native_raw(SYS_##n, a[0], a[1], a[2], a[3], a[4], a[5])
@@ -966,6 +982,15 @@ static long user_native_close_range(struct user_native_vfork* request, unsigned 
 
 static long user_native_dispatch(struct user_native_vfork* request, long nr, long a[6])
 {
+    if (user_seccomp) {
+        struct seccomp_data data = {
+            .nr = nr, .arch = AUDIT_ARCH_RISCV64,
+            .instruction_pointer = rvvm_read_cpu_reg(request->cpu, RVVM_REGID_PC) + 4,
+        };
+        memcpy(data.args, a, sizeof(data.args));
+        long result = user_seccomp_check(&data);
+        if (result != 1) return result;
+    }
     if (nr == 128) return user_ptrace_restart_syscall();
     if (nr == 259) {
         request->mapping_args[0] = a[0];
@@ -1168,6 +1193,7 @@ static long user_native_vfork_prepare(const struct user_native_source* source, u
             .child_settid = flags & UAPI_CLONE_CHILD_SETTID ? child_tid : NULL,
             .child_cleartid = flags & UAPI_CLONE_CHILD_CLEARTID ? child_tid : NULL,
             .ptrace_state = request->ptrace_context.bridge,
+            .seccomp = source->seccomp,
         };
     }
     request->executable_ready = user_exec_native_enter(&request->exec_reader);
@@ -1325,7 +1351,7 @@ static int user_native_vfork(rvvm_user_thread_t* current, uint32_t flags, size_t
     if (!mode) return -EOPNOTSUPP;
     struct user_native_source source = {
         current->cpu, gettid(), {fake_uid, fake_gid}, user_sig.mask, user_sig.stack,
-        user_fd_table(), user_signal_process_current(), mode == 2,
+        user_fd_table(), user_signal_process_current(), mode == 2, user_seccomp,
     };
     uint64_t all = UINT64_MAX, saved_mask;
     syscall(SYS_rt_sigprocmask, SIG_SETMASK, &all, &saved_mask, 8);
@@ -1352,7 +1378,7 @@ static long user_native_nested_clone(struct user_native_vfork* request, uint32_t
     if (!mode) return -EOPNOTSUPP;
     request->nested_source = (struct user_native_source){
         request->cpu, user_native_internal(SYS_gettid, 0, 0, 0, 0, 0, 0), {fake_uid, fake_gid},
-        user_sig.mask, user_sig.stack, user_fd_current, user_signal_process_current(), mode == 2,
+        user_sig.mask, user_sig.stack, user_fd_current, user_signal_process_current(), mode == 2, user_seccomp,
     };
     user_ptrace_context_save(&request->nested_ptrace);
     request->nested_flags = flags;

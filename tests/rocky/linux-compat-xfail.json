@@ -20,8 +20,6 @@
   "memory-budget": "Native emulator allocations consume the guest address-space budget.",
   "fsuid-change": "setfsuid does not change filesystem credentials.",
   "fsgid-change": "setfsgid does not change filesystem credentials.",
-  "seccomp-syscall": "Guest seccomp filters are not implemented.",
-  "seccomp-prctl": "Guest prctl seccomp filters are not implemented.",
   "landlock-deny": "Guest Landlock is not implemented.",
   "rseq-register": "Guest rseq is not implemented.",
   "io-uring-nop": "Guest io_uring is not implemented.",

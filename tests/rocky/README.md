@@ -47,6 +47,26 @@ clearing after kernel exec/exit cleanup and before restoring the parent view.
 
 ## Supported boundaries
 
+Guest seccomp supports classic BPF policies returning `ALLOW` or `ERRNO`,
+installed through `seccomp` or `prctl`. Filters apply to the original RISC-V
+syscall number, arguments and instruction pointer. Each thread owns its policy;
+new threads, fork and emulated exec inherit it. Exec carries filter snapshots
+in private environment entries that the new emulator consumes before starting
+the guest. This does not constrain native executables or turn RVVM into a
+security sandbox. Other actions, strict mode, TSYNC, register division and
+installing new filters inside a shared-vfork child remain unsupported.
+
+`test-seccomp-inherit.c` checks thread isolation, inherited filters and a
+fork/exec round trip, including failed exec and an empty guest environment.
+Build it with the guest libc compiler and run it under a private binfmt
+registration pointing at the candidate emulator:
+
+```sh
+gcc -O2 -Wall -Wextra -Werror -pthread \
+    tests/rocky/test-seccomp-inherit.c -o /tmp/test-seccomp-inherit
+/tmp/test-seccomp-inherit
+```
+
 This enables spawn-style vfork. General separate-process `CLONE_VM`, `clone3`,
 and additional clone calls from a shared-vfork child remain unsupported.
 Shared-vfork child private futex operations return `ENOSYS`, because its host

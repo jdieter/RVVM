@@ -8,7 +8,7 @@ trap 'rm -rf "$build"' EXIT
 cc=${CC:-cc}
 flags=(-O2 -g -pthread -DRVVM_USER_TEST -ffunction-sections -fdata-sections
        -I"$root/src" -I"$root/src/util" -I"$root/include" -Wl,--gc-sections)
-for name in test-exe-fd test-fd-lock test-fd-limits test-fork-cache test-process-state test-exec-ranges test-replay test-vma-oom test-brk test-proc-maps; do
+for name in test-exe-fd test-fd-lock test-fd-limits test-fork-cache test-process-state test-exec-ranges test-replay test-vma-oom test-brk test-proc-maps test-seccomp-filter; do
     extra=()
     if [[ $name == test-replay ]]; then extra=("$root/src/core/user_ptrace/user_ptrace_replay.c"); fi
     "$cc" "${flags[@]}" "$root/tests/rocky/$name.c" "${extra[@]}" "$root"/src/util/*.c \

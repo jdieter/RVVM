@@ -30,10 +30,10 @@ static long user_exec_environment(char** envp, char* marker, char*** result)
             count++;
         }
     }
-    char** next_env = malloc((count + 2) * sizeof(char*));
+    char** next_env = user_runtime_allocate((count + 2) * sizeof(char*));
     if (!next_env) return -ENOMEM;
     if (count && user_memory_copy(next_env + 1, envp, count * sizeof(char*))) {
-        free(next_env);
+        user_runtime_release(next_env);
         return -EFAULT;
     }
     next_env[0] = marker;
@@ -42,7 +42,91 @@ static long user_exec_environment(char** envp, char* marker, char*** result)
     return 0;
 }
 
-static long user_execve(const char* path, char** argv, char** envp)
+/* Exec replaces the emulator too. Carry immutable filter snapshots as private
+ * environment entries, consumed before building the next guest's stack. Each
+ * entry stays below Linux's per-string exec limit even for 4096 instructions.
+ * RVVM process emulation is not a security boundary against native execution. */
+#define USER_SECCOMP_MARKER "RVVM_USER_SECCOMP="
+#define USER_SECCOMP_END "RVVM_USER_SECCOMP_END=1"
+
+static long user_seccomp_environment(char** envp, char*** result, size_t* owned)
+{
+    *result = envp;
+    *owned = 0;
+    if (!user_seccomp) return 0;
+    char** copy;
+    long ret = user_exec_environment(envp, NULL, &copy);
+    if (ret) return ret;
+    size_t count = 0, filters = 0;
+    while (copy[count + 1]) count++;
+    for (struct user_seccomp_filter* f = user_seccomp; f; f = f->prev) filters++;
+    char** next = user_runtime_allocate((filters + count + 2) * sizeof(*next));
+    if (!next) { user_runtime_release(copy); return -ENOMEM; }
+    memcpy(next + filters + 1, copy + 1, (count + 1) * sizeof(*next));
+    user_runtime_release(copy);
+    next[filters] = USER_SECCOMP_END;
+    static const char hex[] = "0123456789abcdef";
+    size_t slot = filters;
+    for (struct user_seccomp_filter* f = user_seccomp; f; f = f->prev) {
+        size_t bytes = f->count * sizeof(*f->insns), prefix = sizeof(USER_SECCOMP_MARKER) - 1;
+        char* entry = user_runtime_allocate(prefix + bytes * 2 + 1);
+        if (!entry) {
+            for (size_t i = slot; i < filters; i++) user_runtime_release(next[i]);
+            user_runtime_release(next);
+            return -ENOMEM;
+        }
+        memcpy(entry, USER_SECCOMP_MARKER, prefix);
+        const unsigned char* data = (const unsigned char*)f->insns;
+        for (size_t i = 0; i < bytes; i++) {
+            entry[prefix + i * 2] = hex[data[i] >> 4];
+            entry[prefix + i * 2 + 1] = hex[data[i] & 15];
+        }
+        entry[prefix + bytes * 2] = 0;
+        next[--slot] = entry; // Restore oldest first to preserve stacking order.
+    }
+    *result = next;
+    *owned = filters;
+    return 0;
+}
+
+static void user_seccomp_environment_free(char** envp, size_t owned)
+{
+    if (!owned) return;
+    for (size_t i = 0; i < owned; i++) user_runtime_release(envp[i]);
+    user_runtime_release(envp);
+}
+
+static bool user_seccomp_restore(void)
+{
+    extern char** environ;
+    const size_t prefix = sizeof(USER_SECCOMP_MARKER) - 1;
+    if (!environ || !environ[0] || strncmp(environ[0], USER_SECCOMP_MARKER, prefix)) return true;
+    while (environ[0] && !strncmp(environ[0], USER_SECCOMP_MARKER, prefix)) {
+        const char* hex = environ[0] + prefix;
+        size_t length = strlen(hex);
+        if (!length || length % (sizeof(struct sock_filter) * 2)
+            || length > BPF_MAXINSNS * sizeof(struct sock_filter) * 2) return false;
+        struct sock_filter* insns = user_runtime_allocate(length / 2);
+        if (!insns) return false;
+        for (size_t i = 0; i < length; i++) {
+            unsigned value = hex[i] >= '0' && hex[i] <= '9' ? hex[i] - '0'
+                : hex[i] >= 'a' && hex[i] <= 'f' ? hex[i] - 'a' + 10 : 16;
+            if (value == 16) { user_runtime_release(insns); return false; }
+            if (i % 2) ((unsigned char*)insns)[i / 2] |= value;
+            else ((unsigned char*)insns)[i / 2] = value << 4;
+        }
+        struct sock_fprog prog = {length / (2 * sizeof(*insns)), insns};
+        long ret = user_seccomp_install(0, &prog);
+        user_runtime_release(insns);
+        if (ret) return false;
+        environ++;
+    }
+    if (!environ[0] || strcmp(environ[0], USER_SECCOMP_END)) return false;
+    environ++;
+    return true;
+}
+
+static long user_execve_inner(const char* path, char** argv, char** envp)
 {
     user_fd_lock();
     user_fd_mutex_lock(&user_exe_lock);
@@ -68,10 +152,21 @@ static long user_execve(const char* path, char** argv, char** envp)
         fcntl(pin, F_SETFD, FD_CLOEXEC);
     }
     user_fd_table()->exec_owner = 0;
-    free(next_env);
+    user_runtime_release(next_env);
 out:
     user_fd_mutex_unlock(&user_exe_lock);
     user_fd_unlock();
+    return ret;
+}
+
+static long user_execve(const char* path, char** argv, char** envp)
+{
+    char** next;
+    size_t owned;
+    long ret = user_seccomp_environment(envp, &next, &owned);
+    if (ret) return ret;
+    ret = user_execve_inner(path, argv, next);
+    user_seccomp_environment_free(next, owned);
     return ret;
 }
 
@@ -114,7 +209,7 @@ static long user_execveat_inner(int fd, const char* path, char** argv, char** en
         ret = errno_ret(USER_SYSCALL(SYS_execveat, handoff, "", argv, next_env,
                                     flags | AT_EMPTY_PATH, 0));
     }
-    free(next_env);
+    user_runtime_release(next_env);
 out:
     close(handoff);
     user_fd_table()->exec_handoff = -1;
@@ -124,9 +219,14 @@ out:
 
 static long user_execveat(int fd, const char* path, char** argv, char** envp, int flags)
 {
+    char** next;
+    size_t owned;
+    long result = user_seccomp_environment(envp, &next, &owned);
+    if (result) return result;
     user_fd_lock();
-    long result = user_execveat_inner(fd, path, argv, envp, flags);
+    result = user_execveat_inner(fd, path, argv, next, flags);
     user_fd_unlock();
+    user_seccomp_environment_free(next, owned);
     return result;
 }
 

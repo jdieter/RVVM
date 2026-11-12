@@ -591,6 +591,7 @@ static bool user_observer_hidden(pid_t pid, bool reaped);
 #include "rvvm_user_exe.h"
 #include "rvvm_user_allocate.h"
 #include "rvvm_user_host_delegation.h"
+#include "rvvm_user_seccomp.h"
 #include "rvvm_user_exec.h"
 #include "user_ptrace/user_ptrace_proc.h"
 #include "rvvm_user_cpu.h"
@@ -797,6 +798,7 @@ typedef struct rvvm_user_thread {
     void* ptrace_state;
     user_fd_table_t* fd_table;
     struct user_signal_process* signals;
+    struct user_seccomp_filter* seccomp;
     bool inherit_signal_stack;
     struct user_sigstack signal_stack;
     rvvm_thread_t* host_thread;
@@ -1007,9 +1009,11 @@ static int rvvm_sys_clone_impl(rvvm_user_thread_t* current, uint32_t flags, size
         thread->refs = 3; // Parent, child and native-exit reaper.
         thread->signal_mask = user_sig.mask;
         thread->signals = user_signal_process_retain();
+        thread->seccomp = user_seccomp_retain(user_seccomp);
         thread->fd_table = (separate & CLONE_FILES)
             ? user_fd_table_copy(user_fd_table()) : user_fd_table_retain();
         if (!thread->fd_table) {
+            user_seccomp_release(thread->seccomp);
             user_signal_process_release(thread->signals);
             rvvm_free_user_thread(thread->cpu);
             free(thread);
@@ -1025,6 +1029,7 @@ static int rvvm_sys_clone_impl(rvvm_user_thread_t* current, uint32_t flags, size
         rvvm_thread_t* host_thread = rvvm_thread_create_ex(rvvm_user_thread_wrap, thread, 256 * 1024);
         syscall(SYS_rt_sigprocmask, SIG_SETMASK, &saved_mask, NULL, 8);
         if (!host_thread) {
+            user_seccomp_release(thread->seccomp);
             user_fd_mutex_unlock(&user_reaper_lock);
             if (separate) user_fd_unlock();
             atomic_sub_uint64(&user_thread_lifetime, 1);
@@ -1608,6 +1613,7 @@ static void* rvvm_user_thread_wrap(void* arg)
     user_signal_block_all();
     user_host_fork_init();
     rvvm_user_thread_t* thread = arg;
+    user_seccomp = thread->seccomp;
     rvvm_hart_t* cpu = thread->cpu;
     bool running = true;
     int exit_status = 0;
@@ -1685,6 +1691,12 @@ static void* rvvm_user_thread_wrap(void* arg)
             rvvm_addr_t a4 = rvvm_read_cpu_reg(cpu, RVVM_REGID_X0 + 14);
             rvvm_addr_t a5 = rvvm_read_cpu_reg(cpu, RVVM_REGID_X0 + 15);
             rvvm_addr_t a7 = rvvm_read_cpu_reg(cpu, RVVM_REGID_X0 + 17);
+            struct seccomp_data seccomp_data = {
+                .nr = (int)a7, .arch = AUDIT_ARCH_RISCV64,
+                .instruction_pointer = rvvm_read_cpu_reg(cpu, RVVM_REGID_PC) + 4,
+                .args = {a0, a1, a2, a3, a4, a5},
+            };
+            long seccomp_result = user_seccomp ? user_seccomp_check(&seccomp_data) : 1;
             user_exe_relocation_resume();
             long kernel_args[] = {a0, a1, a2, a3, a4, a5};
             user_exe_filter_args(a7, kernel_args);
@@ -1694,7 +1706,8 @@ static void* rvvm_user_thread_wrap(void* arg)
                                 || a7 == 216 || a7 == 222 || a7 == 226 || a7 == 233;
 #ifdef __linux__
             long kernel_result;
-            if (user_kernel_dispatch(cpu, a7, kernel_args, &kernel_result)) a0 = kernel_result;
+            if (seccomp_result != 1) a0 = seccomp_result;
+            else if (user_kernel_dispatch(cpu, a7, kernel_args, &kernel_result)) a0 = kernel_result;
             else
 #endif
             switch (a7) {
@@ -1909,8 +1922,8 @@ static void* rvvm_user_thread_wrap(void* arg)
                     }
                     a0 = 0;
                     break;
-                case 277: // Guest filters cannot safely constrain the emulator's host syscalls.
-                    a0 = -UAPI_ENOSYS;
+                case 277: // seccomp: filter guest calls before ABI translation.
+                    a0 = user_seccomp_call(a0, a1, to_ptr(a2));
                     break;
                 case 425: // io_uring_setup - guest event loop falls back to poll on ENOSYS
                     a0 = -UAPI_ENOSYS;
@@ -2049,6 +2062,8 @@ static void* rvvm_user_thread_wrap(void* arg)
     user_ptrace_destroy();
     user_fd_table_leave();
     user_signal_process_release(thread->signals);
+    user_seccomp_release(user_seccomp);
+    user_seccomp = NULL;
     user_signal_process = NULL;
     rvvm_free_user_thread(cpu);
     rvvm_user_thread_put(thread);
@@ -2097,6 +2112,7 @@ static void jump_start(void* entry, void* stack_top)
     if (!thread->cpu) rvvm_fatal("Cannot allocate initial guest CPU");
     thread->refs = 1;
     thread->process_thread = true;
+    thread->seccomp = user_seccomp;
     syscall(SYS_rt_sigprocmask, SIG_SETMASK, NULL, &thread->signal_mask, 8);
 
     rvvm_write_cpu_reg(thread->cpu, RVVM_REGID_X0 + 2, (size_t)stack_top);
@@ -2342,6 +2358,10 @@ RVVM_PUBLIC int rvvm_user_linux(int argc, char** argv, char** envp)
     bool success = elf_load_file(file, &elf);
     rvclose(file);
     user_exec_handoff_close(executable);
+    if (!user_seccomp_restore()) {
+        rvvm_error("Invalid inherited guest seccomp policy");
+        return -1;
+    }
     if (!success) {
         rvvm_error("Failed to load ELF %s (fixed VMA collision?)", executable);
         // Dump the host memory map to find what occupies the guest region
