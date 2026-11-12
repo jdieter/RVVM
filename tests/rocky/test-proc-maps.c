@@ -16,6 +16,24 @@ static long write_row(void* opaque, const char* data, size_t size)
 
 #include "core/rvvm_user_proc_maps.h"
 
+static void check_heap_labels(int source, uintptr_t start, uintptr_t end,
+                              const char* text, const char* expected)
+{
+    struct user_vma_range range = {0x2000, 0xa000};
+    user_vma_owned = &range;
+    user_vma_owned_count = 1;
+    assert(!ftruncate(source, 0) && !lseek(source, 0, SEEK_SET));
+    assert(write(source, text, strlen(text)) == (ssize_t)strlen(text));
+    int output = memfd_create("heap-maps", MFD_CLOEXEC);
+    assert(output >= 0 && !user_proc_maps_emit(source, write_row, &output, start, end));
+    char actual[1024];
+    ssize_t count = pread(output, actual, sizeof(actual) - 1, 0);
+    assert(count >= 0);
+    actual[count] = 0;
+    assert(!strcmp(actual, expected));
+    close(output);
+}
+
 int main(void)
 {
     /* A kernel VMA can coalesce native and guest ranges. Keep only the
@@ -31,7 +49,7 @@ int main(void)
     assert(source >= 0 && output >= 0);
     assert(write(source, text, sizeof(text) - 1) == sizeof(text) - 1);
     assert(lseek(source, 7, SEEK_SET) == 7);
-    assert(!user_proc_maps_emit(source, write_row, &output));
+    assert(!user_proc_maps_emit(source, write_row, &output, 0, 0));
     assert(lseek(source, 0, SEEK_CUR) == 7);
     assert(!lseek(output, 0, SEEK_SET));
     FILE* view = fdopen(output, "r");
@@ -50,10 +68,32 @@ int main(void)
     fclose(view);
     assert(!ftruncate(source, 0) && !lseek(source, 0, SEEK_SET));
     assert(write(source, "invalid\n", 8) == 8 && !lseek(source, 0, SEEK_SET));
-    assert(user_proc_maps_emit(source, write_row, &output) == -EIO);
+    assert(user_proc_maps_emit(source, write_row, &output, 0, 0) == -EIO);
+    const char anonymous[] = "1000-b000 rw-p 00000000 00:00 0\n";
+    check_heap_labels(source, 0, 0, anonymous,
+                      "2000-a000 rw-p 00000000 00:00 0\n");
+    check_heap_labels(source, 0x4000, 0x8000, anonymous,
+                      "2000-4000 rw-p 00000000 00:00 0\n"
+                      "4000-8000 rw-p 00000000 00:00 0 [heap]\n"
+                      "8000-a000 rw-p 00000000 00:00 0\n");
+    check_heap_labels(source, 0x4000, 0x6000, anonymous,
+                      "2000-4000 rw-p 00000000 00:00 0\n"
+                      "4000-6000 rw-p 00000000 00:00 0 [heap]\n"
+                      "6000-a000 rw-p 00000000 00:00 0\n");
+    check_heap_labels(source, 0x4000, 0x8000,
+                      "1000-6000 rw-p 00000000 00:00 0\n"
+                      "6000-8000 r--p 00000000 00:00 0\n"
+                      "8000-b000 rw-p 00000000 00:00 0\n",
+                      "2000-4000 rw-p 00000000 00:00 0\n"
+                      "4000-6000 rw-p 00000000 00:00 0 [heap]\n"
+                      "6000-8000 r--p 00000000 00:00 0 [heap]\n"
+                      "8000-a000 rw-p 00000000 00:00 0\n");
+    check_heap_labels(source, 0x4000, 0x8000,
+                      "1000-b000 r--p 00002000 08:01 123 /tmp/guest file\n",
+                      "2000-a000 r--p 00003000 08:01 123 /tmp/guest file\n");
     close(source);
     char path[64];
     snprintf(path, sizeof(path), "/proc/%u/maps", (unsigned)getpid());
     assert(user_proc_self_maps(path) && !user_proc_self_maps("/proc/0/maps"));
-    puts("PASS guest maps omit native ranges and preserve clipped file offsets");
+    puts("PASS guest maps preserve ownership, offsets and bounded heap labels");
 }

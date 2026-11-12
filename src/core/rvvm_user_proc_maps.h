@@ -15,7 +15,8 @@ static bool user_proc_self_maps(const char* path)
 
 /* Valgrind compares this view with its guest mapping registry. Native
  * allocator, JIT and worker-stack growth must not appear as guest mappings. */
-static long user_proc_maps_emit(int source, long (*emit)(void*, const char*, size_t), void* output)
+static long user_proc_maps_emit(int source, long (*emit)(void*, const char*, size_t), void* output,
+                                uintptr_t heap_start, uintptr_t heap_end)
 {
     struct user_proc_reader reader = {.fd = source, .positional = true};
     char line[4608], row[4864];
@@ -37,11 +38,24 @@ static long user_proc_maps_emit(int source, long (*emit)(void*, const char*, siz
         for (size_t i = first_owned; i < user_vma_owned_count && user_vma_owned[i].start < last; ++i) {
             uintptr_t start = EVAL_MAX(first, user_vma_owned[i].start);
             uintptr_t end = EVAL_MIN(last, user_vma_owned[i].end);
-            int size = snprintf(row, sizeof(row), "%lx-%lx %s %08lx %s %lu%s\n",
-                                start, end, permissions, offset + (inode ? start - first : 0),
-                                device, inode, line + suffix);
-            if (size < 0 || (size_t)size >= sizeof(row)) { result = -EOVERFLOW; break; }
-            result = emit(output, row, size);
+            while (start < end) {
+                uintptr_t next = end;
+                bool heap = !inode && heap_start < heap_end && start >= heap_start && start < heap_end;
+                /* brk uses guest-owned anonymous mappings. A host VMA may
+                 * also contain adjacent mmap allocations: name only the heap
+                 * pages, retaining file names and protection boundaries. */
+                if (!inode && heap_start < heap_end) {
+                    if (start < heap_start && next > heap_start) next = heap_start;
+                    else if (heap && next > heap_end) next = heap_end;
+                }
+                int size = snprintf(row, sizeof(row), "%lx-%lx %s %08lx %s %lu%s\n",
+                                    start, next, permissions, offset + (inode ? start - first : 0),
+                                    device, inode, heap ? " [heap]" : line + suffix);
+                if (size < 0 || (size_t)size >= sizeof(row)) { result = -EOVERFLOW; break; }
+                result = emit(output, row, size);
+                if (result) break;
+                start = next;
+            }
             if (result) break;
         }
         if (result) break;

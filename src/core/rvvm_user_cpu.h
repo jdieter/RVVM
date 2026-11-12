@@ -181,6 +181,7 @@ static long user_cpu_view_write(int fd, const void* data, size_t size)
 }
 
 #include "rvvm_user_proc_maps.h"
+static void user_proc_heap_bounds(uintptr_t*, uintptr_t*);
 
 struct user_proc_maps_buffer { char* data; size_t size, capacity; };
 
@@ -247,7 +248,9 @@ static no_inline bool user_proc_maps_read(long nr, long a[6], long* result)
     int flags = fcntl((int)a[0], F_GETFL);
     if (flags < 0 || (flags & O_PATH) || (flags & O_ACCMODE) == O_WRONLY) { ret = -EBADF; goto out; }
     if (!size) goto out;
-    ret = user_proc_maps_emit((int)a[0], user_proc_maps_append, &view);
+    uintptr_t heap_start, heap_end;
+    user_proc_heap_bounds(&heap_start, &heap_end);
+    ret = user_proc_maps_emit((int)a[0], user_proc_maps_append, &view, heap_start, heap_end);
     if (ret || (uint64_t)offset >= view.size) goto out;
     size = EVAL_MIN(size, view.size - offset);
     size_t remaining = size;

@@ -867,6 +867,16 @@ static void* user_thread_reaper(void* unused)
 #ifdef __linux__
 static struct uapi_brk_heap brk_heap;
 
+static void user_proc_heap_bounds(uintptr_t* start, uintptr_t* end)
+{
+    /* Snapshot before the maps formatter takes the ownership lock: brk
+     * growth holds brk_lock while changing that same ownership table. */
+    spin_lock(&brk_lock);
+    *start = brk_heap.base;
+    *end = brk_heap.committed;
+    spin_unlock(&brk_lock);
+}
+
 static void* rvvm_sys_brk(void* addr)
 {
     user_fd_lock();
